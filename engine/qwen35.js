@@ -354,7 +354,7 @@ export class Qwen35Engine {
     const bgNorm = (x, w, y) => this._bg(this.pipes.rmsnorm, 1, [x, w.buf, y, this.uDim]);
 
     this.layers = [];
-    for (const L of weights.layers) {
+    const buildLayer = (L) => {
       const R = { isFull: L.isFull };
       R.attnNorm = up(L.attnNorm); R.postNorm = up(L.postNorm);
       R.ffnGate = up(L.ffnGate); R.ffnUp = up(L.ffnUp); R.ffnDown = up(L.ffnDown);
@@ -413,8 +413,9 @@ export class Qwen35Engine {
           { buffer: R.S }, { buffer: this.dOut }, { buffer: this.dnBuf }]);
         R.bgGateNorm = this._bg(this.pipes.dn_gatenorm, 1, [this.dOut, this.z, R.ssmNorm, this.gated, this.dnBuf]);
       }
-      this.layers.push(R);
-    }
+      return R;
+    };
+    for (const L of weights.layers) this.layers.push(buildLayer(L));
 
     if (hasEmbed || hasHead) this.cpuEmbed = weights.embed;
     if (hasHead) {
@@ -435,6 +436,25 @@ export class Qwen35Engine {
       this.bgCommonFor[k2] = this._bg(p, 0, [this.cfgBuf, this.frameBuf]);
     this.bgSilu = this._bg(this.pipes.silu_mul, 1, [this.g, this.u]);
     this.bgAddTmp = this._bg(this.pipes.add_res, 1, [this.x, this.tmpDim]);
+
+    // ---- multi-token prediction (draft) head ----
+    if (weights.mtp && hasHead) {
+      const W = weights.mtp;
+      this.mtpLayer = buildLayer(W.layer);
+      this.mtp = {
+        ehProj: up(W.ehProj), enorm: up(W.enorm), hnorm: up(W.hnorm), headNorm: up(W.sharedHeadNorm),
+        emb: device.createBuffer({ size: dim * 4, usage: S }),
+        ehIn: device.createBuffer({ size: 2 * dim * 4, usage: S }),   // [enorm(e) | hnorm(h)]
+        stats: { drafts: 0, accepted: 0 },
+      };
+      const M2 = this.mtp;
+      M2.bgENorm = this._bg2res(this.pipes.rmsnorm, [{ buffer: M2.emb }, { buffer: M2.enorm.buf },
+        { buffer: M2.ehIn, offset: 0, size: dim * 4 }, { buffer: this.uDim }]);
+      M2.bgHNormX = this._bg2res(this.pipes.rmsnorm, [{ buffer: this.x }, { buffer: M2.hnorm.buf },
+        { buffer: M2.ehIn, offset: dim * 4, size: dim * 4 }, { buffer: this.uDim }]);
+      M2.proj = mv(M2.ehProj, M2.ehIn, this.x, dim, 2 * dim);           // eh_proj -> MTP residual (in x)
+      M2.bgHeadNorm = bgNorm(this.x, M2.headNorm, this.xn);               // shared_head_norm -> xn
+    }
   }
 
   _shape(dOut, dIn) {
@@ -485,9 +505,10 @@ export class Qwen35Engine {
     this.device.queue.writeBuffer(this.frameBuf, 0, new Uint32Array([pos, seqLen]));
   }
 
-  _encodeLayer(enc, i) {
-    const D = this.dims, L = this.layers[i];
-    const seqLen = this.pos + 1;
+  _encodeLayer(enc, i) { this._encodeLayerR(enc, this.layers[i], this.pos); }
+  _encodeLayerR(enc, L, pos) {
+    const D = this.dims;
+    const seqLen = pos + 1;
     if (L.isFull) {
       {
         const p = enc.beginComputePass();
@@ -502,8 +523,8 @@ export class Qwen35Engine {
         this._d(p, "rope_part", L.bgRopeK, D.nKV * D.nRot / 2);
         p.end();
       }
-      enc.copyBufferToBuffer(this.k, 0, L.kCache, this.pos * D.kvDim * 4, D.kvDim * 4);
-      enc.copyBufferToBuffer(this.v, 0, L.vCache, this.pos * D.kvDim * 4, D.kvDim * 4);
+      enc.copyBufferToBuffer(this.k, 0, L.kCache, pos * D.kvDim * 4, D.kvDim * 4);
+      enc.copyBufferToBuffer(this.v, 0, L.vCache, pos * D.kvDim * 4, D.kvDim * 4);
       {
         const p = enc.beginComputePass();
         this._d(p, "attn_scores", L.bgScores, D.nH * seqLen);
@@ -620,6 +641,12 @@ export class Qwen35Engine {
       k: mkB(D.kvDim), v: mkB(D.kvDim), attnOut: mkB(D.qDim),
     };
     this.stageXB = dev.createBuffer({ size: 4 * D.dim * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    // rollback shadows for the recurrent layers (speculative decoding)
+    for (const L of this.layers) if (!L.isFull && !L.S_shadow) {
+      L.S_shadow = [0, 1, 2].map(() => dev.createBuffer({ size: L.S.size, usage: S }));
+      L.conv_shadow = [0, 1, 2].map(() => dev.createBuffer({ size: L.convState.size, usage: S }));
+    }
+    this.stageLogitsN = dev.createBuffer({ size: 4 * D.vocab * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const slice = (b, c) => ({ buffer: b.buf, offset: c * b.stride, size: b.n * 4 });
     const part = (b, c, off, size) => ({ buffer: b.buf, offset: c * b.stride + off, size });
     this.frameBufsB = [0, 1, 2, 3].map(() => dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
@@ -639,6 +666,12 @@ export class Qwen35Engine {
       const bufs = w.kind === "f32" ? [w.buf, xB.buf, yB.buf, shp] : [w.qs, w.sc, xB.buf, yB.buf, shp];
       return { pipe, wgs: Math.ceil(dOut / this.coopRows), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
+    if (this.hasHead) {
+      this.bgFinalNormB = [0, 1, 2, 3].map((c) => this._bg2res(this.pipes.rmsnorm,
+        [slice(B.x, c), { buffer: this.finalNorm.buf }, { buffer: this.xn }, { buffer: this.uDim }]));
+      if (this.mtp) this.mtp.bgHNormB = [0, 1, 2, 3].map((c) => this._bg2res(this.pipes.rmsnorm,
+        [slice(B.x, c), { buffer: this.mtp.hnorm.buf }, { buffer: this.mtp.ehIn, offset: D.dim * 4, size: D.dim * 4 }, { buffer: this.uDim }]));
+    }
     this.layerB = this.layers.map((L) => {
       const bgNormC = (w, c) => this._bg2res(this.pipes.rmsnorm,
         [slice(B.x, c), { buffer: w.buf }, slice(B.xn, c), { buffer: this.uDim }]);
@@ -693,14 +726,18 @@ export class Qwen35Engine {
     });
   }
 
-  _encodeLayerBatch(enc, i, basePos) {
+  // nCols < 4: batched matvecs still compute 4 columns (extra columns are
+  // garbage into scratch), but every stateful per-column op runs only for the
+  // live columns. snapshotDN: copy recurrent state after column 0 so a
+  // rejected speculative column 1 can be rolled back.
+  _encodeLayerBatch(enc, i, basePos, nCols = 4, snapshotDN = false) {
     const D = this.dims, L = this.layers[i], LB = this.layerB[i], B = this.B;
     if (L.isFull) {
       {
         const p = enc.beginComputePass();
-        for (let c = 0; c < 4; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm1, 256, 256);
+        for (let c = 0; c < nCols; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm1, 256, 256);
         for (const op of LB.qkvOps) this._dop(p, op);
-        for (let c = 0; c < 4; c++) {
+        for (let c = 0; c < nCols; c++) {
           const C = LB.cols[c];
           this._dCol(p, "qsplit", c, C.qsplit, D.nH * D.hd);
           this._dCol(p, "head_norm", c, C.qNorm, D.nH, 32);
@@ -710,13 +747,13 @@ export class Qwen35Engine {
         }
         p.end();
       }
-      for (let c = 0; c < 4; c++) {
+      for (let c = 0; c < nCols; c++) {
         enc.copyBufferToBuffer(B.k.buf, c * B.k.stride, L.kCache, (basePos + c) * D.kvDim * 4, D.kvDim * 4);
         enc.copyBufferToBuffer(B.v.buf, c * B.v.stride, L.vCache, (basePos + c) * D.kvDim * 4, D.kvDim * 4);
       }
       {
         const p = enc.beginComputePass();
-        for (let c = 0; c < 4; c++) {
+        for (let c = 0; c < nCols; c++) {
           const C = LB.cols[c];
           this._dCol(p, "attn_scores", c, C.scores, D.nH * (basePos + c + 1));
           this._dCol(p, "attn_softmax", c, C.softmax, D.nH, 1);
@@ -724,36 +761,50 @@ export class Qwen35Engine {
           this._dCol(p, "sigmoid_mul", c, C.sigMul, D.qDim);
         }
         this._dop(p, LB.o);
-        for (let c = 0; c < 4; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
+        for (let c = 0; c < nCols; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
         p.end();
       }
     } else {
-      const p = enc.beginComputePass();
-      for (let c = 0; c < 4; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm1, 256, 256);
-      for (const op of LB.dnOps) this._dop(p, op);
-      for (let c = 0; c < 4; c++) {   // recurrent state: columns strictly in order
+      {
+        const p = enc.beginComputePass();
+        for (let c = 0; c < nCols; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm1, 256, 256);
+        for (const op of LB.dnOps) this._dop(p, op);
+        p.end();
+      }
+      let p = snapshotDN ? null : enc.beginComputePass();
+      for (let c = 0; c < nCols; c++) {   // recurrent state: columns strictly in order
         const C = LB.cols[c];
+        if (snapshotDN) p = enc.beginComputePass();
         this._dCol(p, "dn_gates", c, C.gates, D.nVH);
         this._dCol(p, "dn_conv", c, C.conv, D.convDim);
         this._dCol(p, "dn_l2", c, C.l2q, D.nKH, 32);
         this._dCol(p, "dn_l2", c, C.l2k, D.nKH, 32);
         this._dCol(p, "dn_delta", c, C.delta, D.nVH * 128, 128);
         this._dCol(p, "dn_gatenorm", c, C.gatenorm, D.nVH * 128, 128);
+        if (snapshotDN) p.end();
+        if (snapshotDN && c < nCols - 1) {
+          enc.copyBufferToBuffer(L.S, 0, L.S_shadow[c], 0, L.S.size);
+          enc.copyBufferToBuffer(L.convState, 0, L.conv_shadow[c], 0, L.convState.size);
+        }
       }
-      this._dop(p, LB.out);
-      for (let c = 0; c < 4; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
-      p.end();
+      if (!snapshotDN) p.end();
+      {
+        const p = enc.beginComputePass();
+        this._dop(p, LB.out);
+        for (let c = 0; c < nCols; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
+        p.end();
+      }
     }
     {
       const p = enc.beginComputePass();
-      for (let c = 0; c < 4; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm2, 256, 256);
+      for (let c = 0; c < nCols; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm2, 256, 256);
       if (LB.gu) this._dop(p, LB.gu);
       else {
         for (const op of LB.gateUp) this._dop(p, op);
-        for (let c = 0; c < 4; c++) this._dCol(p, "silu_mul", c, LB.cols[c].silu, D.inter);
+        for (let c = 0; c < nCols; c++) this._dCol(p, "silu_mul", c, LB.cols[c].silu, D.inter);
       }
       this._dop(p, LB.down);
-      for (let c = 0; c < 4; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
+      for (let c = 0; c < nCols; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
       p.end();
     }
   }
@@ -790,6 +841,107 @@ export class Qwen35Engine {
     return this._runBatchAndRead(basePos);
   }
 
+  // ---- speculative decoding with the MTP head ----
+  // Run the draft block for the token `tNext` (at position `pos`) given the
+  // trunk hidden of the previous position: srcCol === null reads this.x,
+  // otherwise batch column srcCol. Appends to the MTP layer's own KV cache.
+  // wantLogits -> returns draft logits (argmax = drafted token).
+  async mtpRun(srcCol, tNext, pos, wantLogits) {
+    const M2 = this.mtp, { dim, vocab } = this.dims;
+    this.device.queue.writeBuffer(M2.emb, 0, this._embedRowF32(tNext));
+    this._setFrame(pos, pos + 1);
+    const enc = this.device.createCommandEncoder();
+    {
+      const p = enc.beginComputePass();
+      this._d(p, "rmsnorm", M2.bgENorm, 256, 256);
+      this._d(p, "rmsnorm", srcCol === null ? M2.bgHNormX : M2.bgHNormB[srcCol], 256, 256);
+      this._dop(p, M2.proj);
+      p.end();
+    }
+    this._encodeLayerR(enc, this.mtpLayer, pos);
+    if (wantLogits) {
+      const p = enc.beginComputePass();
+      this._d(p, "rmsnorm", M2.bgHeadNorm, 256, 256);
+      this._dop(p, this.headOp);
+      p.end();
+    }
+    this.device.queue.submit([enc.finish()]);
+    if (!wantLogits) return null;
+    return await this._readback(this.logits, this.stageLogits, vocab);
+  }
+
+  // batched verify: tokens[k] at position pos+k (2..4 tokens) -> logits for
+  // every column, one readback. DeltaNet state is snapshotted after each
+  // non-final column so any rejected suffix can be undone.
+  async verifyN(tokens, pos) {
+    if (!this.B) this._initBatch();
+    const { vocab } = this.dims, n = tokens.length;
+    for (let c = 0; c < n; c++) {
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([pos + c, pos + c + 1]));
+      this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(tokens[c]));
+    }
+    const enc = this.device.createCommandEncoder();
+    for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, pos, n, true);
+    for (let c = 0; c < n; c++) {
+      const p = enc.beginComputePass();
+      this._d(p, "rmsnorm", this.bgFinalNormB[c], 256, 256);
+      this._dop(p, this.headOp);
+      p.end();
+      enc.copyBufferToBuffer(this.logits, 0, this.stageLogitsN, c * vocab * 4, vocab * 4);
+    }
+    this.device.queue.submit([enc.finish()]);
+    await this.stageLogitsN.mapAsync(GPUMapMode.READ, 0, n * vocab * 4);
+    const all = new Float32Array(this.stageLogitsN.getMappedRange(0, n * vocab * 4)).slice();
+    this.stageLogitsN.unmap();
+    const out = [];
+    for (let c = 0; c < n; c++) out.push(all.subarray(c * vocab, (c + 1) * vocab));
+    return out;
+  }
+  _restoreDN(k) {   // recurrent state as it was after verify column k
+    const enc = this.device.createCommandEncoder();
+    for (const L of this.layers) if (!L.isFull) {
+      enc.copyBufferToBuffer(L.S_shadow[k], 0, L.S, 0, L.S.size);
+      enc.copyBufferToBuffer(L.conv_shadow[k], 0, L.convState, 0, L.convState.size);
+    }
+    this.device.queue.submit([enc.finish()]);
+  }
+  _adoptHidden(col) {   // batch column -> this.x (the hidden the next draft reads)
+    const enc = this.device.createCommandEncoder();
+    enc.copyBufferToBuffer(this.B.x.buf, col * this.B.x.stride, this.x, 0, this.dims.dim * 4);
+    this.device.queue.submit([enc.finish()]);
+  }
+
+  // One speculative step with K chained drafts (K <= 3). Precondition: this.x
+  // holds the trunk hidden of the previous position and `tNext` is the
+  // already-sampled token for this.pos. Returns 1..K+1 new tokens.
+  async specStep(tNext, sample, K = 3) {
+    const pos = this.pos, M2 = this.mtp;
+    K = Math.max(1, Math.min(3, K));
+    const drafts = [];
+    for (let k = 0; k < K; k++) {
+      // after the first call this.x holds the MTP block's own output hidden,
+      // which is what chained drafting feeds back in
+      const lg = await this.mtpRun(null, k === 0 ? tNext : drafts[k - 1], pos + k, true);
+      let d = 0; for (let i = 1; i < lg.length; i++) if (lg[i] > lg[d]) d = i;
+      drafts.push(d);
+    }
+    const lgs = await this.verifyN([tNext, ...drafts], pos);
+    const out = [];
+    let a = 0;   // accepted drafts
+    for (let k = 0; k <= K; k++) {
+      const t = sample(lgs[k]);
+      out.push(t);
+      if (k < K && t === drafts[k]) a++; else break;
+    }
+    M2.stats.drafts += K; M2.stats.accepted += a;
+    if (a < K) this._restoreDN(a);
+    // re-fill the draft cache for the accepted positions with exact trunk hiddens
+    for (let j = 1; j <= a; j++) await this.mtpRun(j - 1, out[j - 1], pos + j, false);
+    this._adoptHidden(a);
+    this.pos = pos + a + 1;
+    return out;
+  }
+
   async prefillTokens(ids) {
     if (!this.B) this._initBatch();
     let i = 0, sinceSync = 0;
@@ -803,12 +955,15 @@ export class Qwen35Engine {
       for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos);
       enc.copyBufferToBuffer(this.B.x.buf, 3 * this.B.x.stride, this.x, 0, this.dims.dim * 4);
       this.device.queue.submit([enc.finish()]);
+      if (this.mtp && this.mtpFill !== false)
+        for (let c = 0; c < 4; c++) if (i + c + 1 < ids.length) await this.mtpRun(c, ids[i + c + 1], basePos + c + 1, false);
       this.pos += 4;
       i += 4;
       if (++sinceSync >= 4) { await this.device.queue.onSubmittedWorkDone(); sinceSync = 0; }
     }
     for (; i < ids.length; i++) {
       await this.prefillToken(ids[i]);
+      if (this.mtp && this.mtpFill !== false && i + 1 < ids.length) await this.mtpRun(null, ids[i + 1], i + 1, false);
       if (i % 8 === 7) await this.device.queue.onSubmittedWorkDone();
     }
     await this.device.queue.onSubmittedWorkDone();

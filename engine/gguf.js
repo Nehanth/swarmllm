@@ -419,9 +419,9 @@ export function quantizeQ8(data) {
 
 
 // ---------- qwen3.5/3.8 (hybrid delta-net) shard loader ----------
-export function qwen35LayerNames(i) {
+export function qwen35LayerNames(i, forceFull = false) {
   const p = `blk.${i}.`;
-  const isFull = i % 4 === 3;
+  const isFull = forceFull || i % 4 === 3;
   const shared = {
     attnNorm: p + "attn_norm.weight",
     postNorm: p + "post_attention_norm.weight",
@@ -439,16 +439,15 @@ export function qwen35LayerNames(i) {
     wOut: p + "ssm_out.weight" };
 }
 
-export async function qwen35Weights(G, bytesOf, { lo, hi, hasEmbed, hasHead }, onProgress = () => {}, onEntry = null) {
+export async function qwen35Weights(G, bytesOf, { lo, hi, hasEmbed, hasHead, mtp = false }, onProgress = () => {}, onEntry = null) {
   let fetched = 0;
   const entry = async (name, optional) => {
     const e = await ggufEntry(G, bytesOf, name, optional, (b) => { fetched += b; onProgress(fetched); });
     if (e && onEntry) onEntry(e, name);
     return e;
   };
-  const layers = [];
-  for (let i = lo; i < hi; i++) {
-    const N = qwen35LayerNames(i);
+  const loadLayer = async (i, forceFull = false) => {
+    const N = qwen35LayerNames(i, forceFull);
     const L = { isFull: N.isFull,
       attnNorm: await entry(N.attnNorm), postNorm: await entry(N.postNorm),
       ffnGate: await entry(N.ffnGate), ffnUp: await entry(N.ffnUp), ffnDown: await entry(N.ffnDown) };
@@ -463,14 +462,31 @@ export async function qwen35Weights(G, bytesOf, { lo, hi, hasEmbed, hasHead }, o
       L.conv = await entry(N.conv); L.ssmNorm = await entry(N.ssmNorm);
       L.wOut = await entry(N.wOut);
     }
-    layers.push(L);
-  }
+    return L;
+  };
+  const layers = [];
+  for (let i = lo; i < hi; i++) layers.push(await loadLayer(i));
   const out = { layers };
   if (hasEmbed) out.embed = await entry(GGML_EMBED);
   if (hasHead) {
     if (!out.embed) out.embed = await entry(GGML_EMBED);
     out.finalNorm = await entry(GGML_FINAL_NORM);
     out.head = await entry(GGML_OUTPUT, true);
+  }
+  // multi-token-prediction block (the "nextn" layer after the trunk): a normal
+  // full-attention layer plus eh_proj / enorm / hnorm / shared_head_norm.
+  if (mtp && hasHead) {
+    const N = G.meta["qwen35.block_count"] - 1;
+    const p = `blk.${N}.nextn.`;
+    if (G.tensors[p + "eh_proj.weight"]) {
+      out.mtp = {
+        layer: await loadLayer(N, true),
+        ehProj: await entry(p + "eh_proj.weight"),
+        enorm: await entry(p + "enorm.weight"),
+        hnorm: await entry(p + "hnorm.weight"),
+        sharedHeadNorm: await entry(p + "shared_head_norm.weight"),
+      };
+    }
   }
   return out;
 }
