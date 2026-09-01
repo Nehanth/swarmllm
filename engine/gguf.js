@@ -491,12 +491,24 @@ export async function qwen35Weights(G, bytesOf, { lo, hi, hasEmbed, hasHead, mtp
   return out;
 }
 
-export function qwen35ShardBytes(G, { lo, hi, hasEmbed, hasHead }) {
+export function qwen35ShardBytes(G, { lo, hi, hasEmbed, hasHead, mtp = false }) {
   let total = 0;
   const add = (n) => { if (G.tensors[n]) total += G.tensors[n].byteLength; };
   for (let i = lo; i < hi; i++) Object.values(qwen35LayerNames(i)).forEach((v) => { if (typeof v === "string") add(v); });
   if (hasEmbed || hasHead) add(GGML_EMBED);
   if (hasHead) { add(GGML_FINAL_NORM); add(GGML_OUTPUT); }
+  if (mtp && hasHead) total += qwen35MtpBytes(G);
+  return total;
+}
+// bytes of the multi-token-prediction block (host only)
+export function qwen35MtpBytes(G) {
+  const N = G.meta["qwen35.block_count"] - 1;
+  const p = `blk.${N}.nextn.`;
+  if (!G.tensors[p + "eh_proj.weight"]) return 0;
+  let total = 0;
+  const add = (n) => { if (G.tensors[n]) total += G.tensors[n].byteLength; };
+  Object.values(qwen35LayerNames(N, true)).forEach((v) => { if (typeof v === "string") add(v); });
+  ["eh_proj", "enorm", "hnorm", "shared_head_norm"].forEach((n) => add(p + n + ".weight"));
   return total;
 }
 

@@ -919,6 +919,8 @@ export class Qwen35Engine {
       return { pipe, wgs: Math.ceil(dOut / this.coopRows), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
     if (this.hasHead) {
+      B.logits = mkB(D.vocab);
+      this.headB = mvB(this.headEntry, B.xn, B.logits, D.vocab, D.dim);
       this.bgFinalNormB = [0, 1, 2, 3].map((c) => this._bg2res(this.pipes.rmsnorm,
         [slice(B.x, c), { buffer: this.finalNorm.buf }, { buffer: this.xn }, { buffer: this.uDim }]));
       if (this.mtp) this.mtp.bgHNormB = [0, 1, 2, 3].map((c) => this._bg2res(this.pipes.rmsnorm,
@@ -932,6 +934,8 @@ export class Qwen35Engine {
     const st = (b) => b.stride / 4;   // column stride in floats
     const whole = (b) => ({ buffer: b.buf });
     const dn = { buffer: this.dnBuf };
+    if (this.hasHead) this.bgFinalNormMC = this._bg2res(this.pipes.rmsnorm_mc,
+      [whole(B.x), { buffer: this.finalNorm.buf }, whole(B.xn), mcU(D.dim, st(B.x), st(B.xn))]);
     this.layerB = this.layers.map((L) => {
       const bgNormC = (w, c) => this._bg2res(this.pipes.rmsnorm,
         [slice(B.x, c), { buffer: w.buf }, slice(B.xn, c), { buffer: this.uDim }]);
@@ -1074,36 +1078,65 @@ export class Qwen35Engine {
     }
   }
 
-  async _runBatchAndRead(basePos) {
+  async _runBatchAndRead(basePos, n = 4) {
     const { dim } = this.dims;
     const enc = this.device.createCommandEncoder();
-    for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos);
-    for (let c = 0; c < 4; c++) enc.copyBufferToBuffer(this.B.x.buf, c * this.B.x.stride, this.stageXB, c * dim * 4, dim * 4);
+    for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos, n);
+    for (let c = 0; c < n; c++) enc.copyBufferToBuffer(this.B.x.buf, c * this.B.x.stride, this.stageXB, c * dim * 4, dim * 4);
     this.device.queue.submit([enc.finish()]);
-    await this.stageXB.mapAsync(GPUMapMode.READ);
-    const out = Float32Array.from(new Float32Array(this.stageXB.getMappedRange(), 0, 4 * dim));
+    await this.stageXB.mapAsync(GPUMapMode.READ, 0, n * dim * 4);
+    const out = Float32Array.from(new Float32Array(this.stageXB.getMappedRange(0, n * dim * 4), 0, n * dim));
     this.stageXB.unmap();
-    this.pos = basePos + 4;
+    this.pos = basePos + n;
     return out;
   }
-  async embedRunBatch(ids, basePos) {
+  // ids.length columns (1..4). snapshot: save recurrent state after every
+  // non-final column so restoreDN(k) can undo a rejected speculative suffix.
+  async embedRunBatch(ids, basePos, snapshot = false) {
     if (!this.B) this._initBatch();
+    const n = ids.length;
     this.pos = basePos;
-    for (let c = 0; c < 4; c++) {
-      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, 4, 0]));
+    for (let c = 0; c < n; c++) {
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, n, snapshot ? 1 : 0]));
       this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(ids[c]));
     }
-    return this._runBatchAndRead(basePos);
+    return this._runBatchAndRead(basePos, n);
   }
-  async runHiddenBatch(xs, basePos) {
+  async runHiddenBatch(xs, basePos, snapshot = false) {
     if (!this.B) this._initBatch();
     const { dim } = this.dims;
+    const n = xs.length / dim;
     this.pos = basePos;
-    for (let c = 0; c < 4; c++) {
-      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, 4, 0]));
+    for (let c = 0; c < n; c++) {
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, n, snapshot ? 1 : 0]));
       this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, xs.subarray(c * dim, (c + 1) * dim));
     }
-    return this._runBatchAndRead(basePos);
+    return this._runBatchAndRead(basePos, n);
+  }
+  restoreDN(k) { this._restoreDN(k); }
+  setHidden(h) { this.device.queue.writeBuffer(this.x, 0, h); }   // final trunk hidden (chain host) for the draft head
+
+  // final norm + LM head for n hidden states (n*dim floats, or null to use the
+  // columns already in B.x) -> array of n logits vectors. Leaves the hiddens
+  // in B.x so the draft head can read them by column.
+  async headBatch(hs, n = hs ? hs.length / this.dims.dim : 4) {
+    if (!this.B) this._initBatch();
+    const { dim, vocab } = this.dims;
+    if (hs) for (let c = 0; c < n; c++) this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, hs.subarray(c * dim, (c + 1) * dim));
+    this.device.queue.writeBuffer(this.frameBufsB[0], 0, new Uint32Array([this.pos, this.pos + 1, n, 0]));
+    const enc = this.device.createCommandEncoder();
+    const p = enc.beginComputePass();
+    this._dMC(p, "rmsnorm_mc", this.bgFinalNormMC, 256, 256, n);
+    this._dop(p, this.headB);
+    p.end();
+    for (let c = 0; c < n; c++) enc.copyBufferToBuffer(this.B.logits.buf, c * this.B.logits.stride, this.stageLogitsN, c * vocab * 4, vocab * 4);
+    this.device.queue.submit([enc.finish()]);
+    await this.stageLogitsN.mapAsync(GPUMapMode.READ, 0, n * vocab * 4);
+    const all = new Float32Array(this.stageLogitsN.getMappedRange(0, n * vocab * 4)).slice();
+    this.stageLogitsN.unmap();
+    const out = [];
+    for (let c = 0; c < n; c++) out.push(all.subarray(c * vocab, (c + 1) * vocab));
+    return out;
   }
 
   // ---- speculative decoding with the MTP head ----
@@ -1135,32 +1168,12 @@ export class Qwen35Engine {
     return await this._readback(this.logits, this.stageLogits, vocab);
   }
 
-  // batched verify: tokens[k] at position pos+k (2..4 tokens) -> logits for
-  // every column, one readback. DeltaNet state is snapshotted after each
-  // non-final column so any rejected suffix can be undone.
-  async verifyN(tokens, pos) {
-    if (!this.B) this._initBatch();
-    const { vocab } = this.dims, n = tokens.length;
-    for (let c = 0; c < n; c++) {
-      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([pos + c, pos + c + 1, n, 1]));
-      this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(tokens[c]));
-    }
-    const enc = this.device.createCommandEncoder();
-    for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, pos, n, true);
-    for (let c = 0; c < n; c++) {
-      const p = enc.beginComputePass();
-      this._d(p, "rmsnorm", this.bgFinalNormB[c], 256, 256);
-      this._dop(p, this.headOp);
-      p.end();
-      enc.copyBufferToBuffer(this.logits, 0, this.stageLogitsN, c * vocab * 4, vocab * 4);
-    }
-    this.device.queue.submit([enc.finish()]);
-    await this.stageLogitsN.mapAsync(GPUMapMode.READ, 0, n * vocab * 4);
-    const all = new Float32Array(this.stageLogitsN.getMappedRange(0, n * vocab * 4)).slice();
-    this.stageLogitsN.unmap();
-    const out = [];
-    for (let c = 0; c < n; c++) out.push(all.subarray(c * vocab, (c + 1) * vocab));
-    return out;
+  // verify tokens[k] at positions pos+k (2..4 tokens): trunk (local batched
+  // pass with DeltaNet snapshots, or a caller-supplied runTrunk for a device
+  // chain) then one batched head pass -> logits per column.
+  async verifyN(tokens, pos, runTrunk = null) {
+    const hs = runTrunk ? await runTrunk(tokens, pos) : await this.embedRunBatch(tokens, pos, true);
+    return this.headBatch(hs, tokens.length);
   }
   _restoreDN(k) {   // recurrent state as it was after verify column k
     const enc = this.device.createCommandEncoder();
@@ -1179,7 +1192,10 @@ export class Qwen35Engine {
   // One speculative step with K chained drafts (K <= 3). Precondition: this.x
   // holds the trunk hidden of the previous position and `tNext` is the
   // already-sampled token for this.pos. Returns 1..K+1 new tokens.
-  async specStep(tNext, sample, K = 3) {
+  // runTrunk(tokens, pos) -> hidden states for all columns (chain mode);
+  // onReject(k) tells the other devices to roll their recurrent state back
+  // to what it was after column k.
+  async specStep(tNext, sample, K = 3, { runTrunk = null, onReject = null } = {}) {
     const pos = this.pos, M2 = this.mtp;
     K = Math.max(1, Math.min(3, K));
     const drafts = [];
@@ -1190,7 +1206,7 @@ export class Qwen35Engine {
       let d = 0; for (let i = 1; i < lg.length; i++) if (lg[i] > lg[d]) d = i;
       drafts.push(d);
     }
-    const lgs = await this.verifyN([tNext, ...drafts], pos);
+    const lgs = await this.verifyN([tNext, ...drafts], pos, runTrunk);
     const out = [];
     let a = 0;   // accepted drafts
     for (let k = 0; k <= K; k++) {
@@ -1199,7 +1215,7 @@ export class Qwen35Engine {
       if (k < K && t === drafts[k]) a++; else break;
     }
     M2.stats.drafts += K; M2.stats.accepted += a;
-    if (a < K) this._restoreDN(a);
+    if (a < K) { this._restoreDN(a); if (onReject) await onReject(a); }
     // re-fill the draft cache for the accepted positions with exact trunk hiddens
     for (let j = 1; j <= a; j++) await this.mtpRun(j - 1, out[j - 1], pos + j, false);
     this._adoptHidden(a);

@@ -70,3 +70,31 @@
 - **Duplicated boundary layers as latency-hiding** — can't remove a hop while every device stays in the chain; keep only as the decode-time bypass placement policy (item 6.4).
 
 **Suggested order**: 0 → 1 → 2 → 3 (Metal fusion) in the pre-demo window; 4 (MTP) staged behind its verify-cost gate; 6 alongside for the mesh story; 5 and 7 as fill. Items 1+2+3 alone plausibly compound to ~1.3–1.8x Mac decode before speculation lands.
+## Results: MTP speculative decoding (2026-09-01)
+
+Implemented. The model's own `nextn` block (blk.64: a full-attention layer plus
+`eh_proj`, `enorm`, `hnorm`, `shared_head_norm`; math per llama.cpp's MTP graph)
+drafts K=3 tokens per step; one 4-column batched trunk pass verifies them.
+DeltaNet state is snapshotted per column inside the recurrent kernels so a
+rejected suffix rolls back exactly. Output is bit-identical to plain decoding
+(`test_mtp_deno.js`, `test_mtp_split_deno.js`).
+
+GB10, 27B Q4_0:
+
+| path | before | after |
+|---|---|---|
+| solo decode | 9.1 tok/s | **16.0 tok/s** (85% acceptance) |
+| two-device chain decode | 6.5 tok/s | **16.5 tok/s** |
+| prefill | 15 tok/s | **24 tok/s** |
+| batched 4-column pass | 203 ms | 131 ms (single pass: 110 ms) |
+
+What made the batched pass cheap: every per-column op became one multi-column
+dispatch (`*_mc` kernels), and the batched matvecs (`_coop_b`, `_gu_b`) now load
+and decode each weight word once for all 4 columns with workgroup 64 (their own
+size, `WGB`). The old fused gate/up batched kernel re-read the weights per column.
+
+Measurement lesson: GPUs ramp clocks under sustained load. Micro-benchmarks
+need >=250 ms of warm-up or they measure the ramp (the autotuner now warms up).
+
+Parked: 16-byte weight loads in the single-column kernel (+12% on the large
+matrices, neutral on square ones) — worth a look after launch.
