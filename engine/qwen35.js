@@ -260,15 +260,17 @@ export class Qwen35Engine {
     };
     const bufType = { u: "uniform", ro: "read-only-storage", rw: "storage" };
     this.pipes = {};
-    for (const [name, spec] of Object.entries(G1)) {
+    // compile every pipeline in parallel (async): overlaps shader compilation
+    // with the rest of setup instead of serializing 20+ compiles
+    await Promise.all(Object.entries(G1).map(async ([name, spec]) => {
       const layout1 = device.createBindGroupLayout({
         entries: spec.map((t, i) => ({ binding: i, visibility: C, buffer: { type: bufType[t] } })),
       });
-      this.pipes[name] = device.createComputePipeline({
+      this.pipes[name] = await device.createComputePipelineAsync({
         layout: device.createPipelineLayout({ bindGroupLayouts: [layout0, layout1] }),
         compute: { module: mod, entryPoint: name },
       });
-    }
+    }));
 
     // ---- uniforms ----
     const cfgData = new ArrayBuffer(48);

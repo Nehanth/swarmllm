@@ -1002,6 +1002,16 @@ function f32ToB64(f) {
   for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
   return btoa(s);
 }
+function asF32(x) {
+  if (typeof x === "string") return b64ToF32(x);
+  if (x instanceof Float32Array) return x;
+  if (x instanceof ArrayBuffer) return new Float32Array(x);
+  if (ArrayBuffer.isView(x)) {
+    const u = new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
+    return new Float32Array(u.slice().buffer);   // copy: alignment-safe
+  }
+  throw new Error("unrecognized hidden-state payload");
+}
 function b64ToF32(b) {
   const s = atob(b);
   const u = new Uint8Array(s.length);
@@ -1304,7 +1314,7 @@ async function aiPipeToken(id, needLogits = true) {
       ai.waiters.set(pos, res);
       setTimeout(() => { ai.waiters.delete(pos); rej(new Error("pipeline timeout (peer gone?)")); }, 30000);
     });
-    sendTo(ai.chain[0], { t: "ai-hidden", pos, data: f32ToB64(h) });
+    sendTo(ai.chain[0], { t: "ai-hidden", pos, data: h });
     h = await returned;
     if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos}) — check peer status lines`);
   } // solo mode: engine holds every layer, embedRun already produced the final hidden
@@ -1384,7 +1394,7 @@ async function aiGenerate(textArg, who) {
             ai.waiters.set("b" + basePos, res);
             setTimeout(() => { ai.waiters.delete("b" + basePos); rej(new Error("pipeline timeout (batch prefill)")); }, 60000);
           });
-          sendTo(ai.chain[0], { t: "ai-hidden-b", basePos, data: f32ToB64(hb) });
+          sendTo(ai.chain[0], { t: "ai-hidden-b", basePos, data: hb });
           await returned;
         }
         ai.pos = basePos + 4;
@@ -1477,27 +1487,27 @@ async function aiOnData(from, d) {
     case "ai-hidden-b": {
       // worker: 4 hiddens in, my layers (batched), 4 hiddens on
       if (!ai.engine) return;
-      const xs = b64ToF32(d.data);
+      const xs = asF32(d.data);
       const hb = await ai.engine.runHiddenBatch(xs, d.basePos);
       if (badF32(hb)) { aiStatus(`\u26a0 NaN in batched prefill on this device`); sendTo(ai.hostId, { t: "ai-error", message: "NaN in batched prefill" }); }
-      const bmsg = { basePos: d.basePos, data: f32ToB64(hb) };
+      const bmsg = { basePos: d.basePos, data: hb };
       if (ai.next === "host") sendTo(ai.hostId, { t: "ai-hiddenret-b", ...bmsg });
       else sendTo(ai.next, { t: "ai-hidden-b", ...bmsg });
       break;
     }
     case "ai-hiddenret-b": {
       const w = ai.waiters.get("b" + d.basePos);
-      if (w) { ai.waiters.delete("b" + d.basePos); w(b64ToF32(d.data)); }
+      if (w) { ai.waiters.delete("b" + d.basePos); w(asF32(d.data)); }
       break;
     }
     case "ai-hidden": {
       // worker: run my layers, forward along the chain
       if (!ai.engine) return;
-      const hin = b64ToF32(d.data);
+      const hin = asF32(d.data);
       if (badF32(hin)) { aiStatus(`\u26a0 NaN ARRIVED at this device (pos ${d.pos}) — upstream peer broken`); }
       const h = await ai.engine.runHidden(hin, d.pos);
       if (badF32(h)) { aiStatus(`\u26a0 NaN PRODUCED by this device (pos ${d.pos}, layers ${ai.range[0]}\u2013${ai.range[1] - 1}) — GPU kernel issue here`); sendTo(ai.hostId, { t: "ai-error", message: `NaN produced on worker layers ${ai.range[0]}\u2013${ai.range[1] - 1}` }); }
-      const msg = { pos: d.pos, data: f32ToB64(h) };
+      const msg = { pos: d.pos, data: h };
       if (ai.next === "host") sendTo(ai.hostId, { t: "ai-hiddenret", ...msg });
       else sendTo(ai.next, { t: "ai-hidden", ...msg });
       if (d.pos % 8 === 0) aiStatus(`serving layers ${ai.range[0]}–${ai.range[1] - 1} — pos ${d.pos}`);
@@ -1506,7 +1516,7 @@ async function aiOnData(from, d) {
     case "ai-hiddenret": {
       // host: pipeline round-trip complete
       const w = ai.waiters.get(d.pos);
-      if (w) { ai.waiters.delete(d.pos); w(b64ToF32(d.data)); }
+      if (w) { ai.waiters.delete(d.pos); w(asF32(d.data)); }
       break;
     }
     case "ai-genstart":
