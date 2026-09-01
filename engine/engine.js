@@ -996,6 +996,7 @@ export class BelloEngine {
       x: mkB(dim), xn: mkB(dim), q: mkB(qDim), k: mkB(kvDim), v: mkB(kvDim),
       attnOut: mkB(qDim), tmpDim: mkB(dim), g: mkB(inter), u: mkB(inter),
     };
+    this.stageXB = dev.createBuffer({ size: 4 * dim * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const slice = (b, c) => ({ buffer: b.buf, offset: c * b.stride, size: b.n * 4 });
     this._bslice = slice;
     // per-column frame uniforms + per-column group0 for the per-token kernels
@@ -1097,6 +1098,45 @@ export class BelloEngine {
       for (let c = 0; c < 4; c++) this._dCol(pass, "add_res", c, LB.cols[c].addTmp, dim);
       pass.end();
     }
+  }
+
+  _stageEmbedBatchCol(enc, id, c) {
+    const { dim } = this.dims;
+    if (this.embedGPU) enc.copyBufferToBuffer(this.embedGPU, id * dim * 4, this.B.x.buf, c * this.B.x.stride, dim * 4);
+    else this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(id));
+  }
+  async _runBatchAndRead(basePos) {
+    const { dim } = this.dims;
+    const enc = this.device.createCommandEncoder();
+    if (this._pendingEmbeds) { for (const [id, c] of this._pendingEmbeds) this._stageEmbedBatchCol(enc, id, c); this._pendingEmbeds = null; }
+    for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos);
+    for (let c = 0; c < 4; c++) enc.copyBufferToBuffer(this.B.x.buf, c * this.B.x.stride, this.stageXB, c * dim * 4, dim * 4);
+    this.device.queue.submit([enc.finish()]);
+    await this.stageXB.mapAsync(GPUMapMode.READ);
+    const out = Float32Array.from(new Float32Array(this.stageXB.getMappedRange(), 0, 4 * dim));
+    this.stageXB.unmap();
+    this.pos = basePos + 4;
+    return out;
+  }
+  // host, split mode: 4 prompt tokens -> 4 hiddens for the next peer
+  async embedRunBatch(ids, basePos) {
+    if (!this.B) this._initBatch();
+    this.pos = basePos;
+    this._pendingEmbeds = ids.map((id, c) => [id, c]);
+    for (let c = 0; c < 4; c++)
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1]));
+    return this._runBatchAndRead(basePos);
+  }
+  // worker, split mode: 4 hiddens in, my layers, 4 hiddens out
+  async runHiddenBatch(xs, basePos) {
+    if (!this.B) this._initBatch();
+    const { dim } = this.dims;
+    this.pos = basePos;
+    for (let c = 0; c < 4; c++) {
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1]));
+      this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, xs.subarray(c * dim, (c + 1) * dim));
+    }
+    return this._runBatchAndRead(basePos);
   }
 
   // consume prompt tokens (no logits): chunks of 4 through the batched path,

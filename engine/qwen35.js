@@ -599,6 +599,7 @@ export class Qwen35Engine {
       qFull: mkB(D.nH * D.hd * 2), q: mkB(D.qDim), gAttn: mkB(D.qDim),
       k: mkB(D.kvDim), v: mkB(D.kvDim), attnOut: mkB(D.qDim),
     };
+    this.stageXB = dev.createBuffer({ size: 4 * D.dim * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const slice = (b, c) => ({ buffer: b.buf, offset: c * b.stride, size: b.n * 4 });
     const part = (b, c, off, size) => ({ buffer: b.buf, offset: c * b.stride + off, size });
     this.frameBufsB = [0, 1, 2, 3].map(() => dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
@@ -731,6 +732,38 @@ export class Qwen35Engine {
       for (let c = 0; c < 4; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
       p.end();
     }
+  }
+
+  async _runBatchAndRead(basePos) {
+    const { dim } = this.dims;
+    const enc = this.device.createCommandEncoder();
+    for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos);
+    for (let c = 0; c < 4; c++) enc.copyBufferToBuffer(this.B.x.buf, c * this.B.x.stride, this.stageXB, c * dim * 4, dim * 4);
+    this.device.queue.submit([enc.finish()]);
+    await this.stageXB.mapAsync(GPUMapMode.READ);
+    const out = Float32Array.from(new Float32Array(this.stageXB.getMappedRange(), 0, 4 * dim));
+    this.stageXB.unmap();
+    this.pos = basePos + 4;
+    return out;
+  }
+  async embedRunBatch(ids, basePos) {
+    if (!this.B) this._initBatch();
+    this.pos = basePos;
+    for (let c = 0; c < 4; c++) {
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1]));
+      this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(ids[c]));
+    }
+    return this._runBatchAndRead(basePos);
+  }
+  async runHiddenBatch(xs, basePos) {
+    if (!this.B) this._initBatch();
+    const { dim } = this.dims;
+    this.pos = basePos;
+    for (let c = 0; c < 4; c++) {
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1]));
+      this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, xs.subarray(c * dim, (c + 1) * dim));
+    }
+    return this._runBatchAndRead(basePos);
   }
 
   async prefillTokens(ids) {

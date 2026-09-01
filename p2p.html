@@ -1372,6 +1372,26 @@ async function aiGenerate(textArg, who) {
       await ai.engine.prefillTokens(ids.slice(0, -1));
       ai.pos = ai.engine.pos;
       logits = await aiPipeToken(ids[ids.length - 1]);
+    } else if (ai.engine.embedRunBatch && ids.length > 5) {
+      // split: 4 prompt tokens per network round instead of one
+      let i = 0;
+      while (ids.length - 1 - i >= 4) {
+        const basePos = ai.pos;
+        const hb = await ai.engine.embedRunBatch(ids.slice(i, i + 4), basePos);
+        if (badF32(hb)) throw new Error(`NaN in batched prefill (pos ${basePos})`);
+        if (ai.chain.length) {
+          const returned = new Promise((res, rej) => {
+            ai.waiters.set("b" + basePos, res);
+            setTimeout(() => { ai.waiters.delete("b" + basePos); rej(new Error("pipeline timeout (batch prefill)")); }, 60000);
+          });
+          sendTo(ai.chain[0], { t: "ai-hidden-b", basePos, data: f32ToB64(hb) });
+          await returned;
+        }
+        ai.pos = basePos + 4;
+        i += 4;
+        aiStatus(`prefill: ${i}/${ids.length} tokens\u2026`);
+      }
+      for (; i < ids.length; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);
     } else {
       for (let i = 0; i < ids.length; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);
     }
@@ -1454,6 +1474,22 @@ async function aiOnData(from, d) {
     case "ai-error":
       aiStatus(`peer ${e?.name || from} failed: ${d.message}`);
       break;
+    case "ai-hidden-b": {
+      // worker: 4 hiddens in, my layers (batched), 4 hiddens on
+      if (!ai.engine) return;
+      const xs = b64ToF32(d.data);
+      const hb = await ai.engine.runHiddenBatch(xs, d.basePos);
+      if (badF32(hb)) { aiStatus(`\u26a0 NaN in batched prefill on this device`); sendTo(ai.hostId, { t: "ai-error", message: "NaN in batched prefill" }); }
+      const bmsg = { basePos: d.basePos, data: f32ToB64(hb) };
+      if (ai.next === "host") sendTo(ai.hostId, { t: "ai-hiddenret-b", ...bmsg });
+      else sendTo(ai.next, { t: "ai-hidden-b", ...bmsg });
+      break;
+    }
+    case "ai-hiddenret-b": {
+      const w = ai.waiters.get("b" + d.basePos);
+      if (w) { ai.waiters.delete("b" + d.basePos); w(b64ToF32(d.data)); }
+      break;
+    }
     case "ai-hidden": {
       // worker: run my layers, forward along the chain
       if (!ai.engine) return;
