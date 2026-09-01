@@ -55,16 +55,13 @@ if (MODEL === "q38") {
 }
 console.log(`load: ${((performance.now() - t0) / 1000).toFixed(1)}s  model=${MODEL} variant=${VARIANT}`);
 
-promptIds = tok.encode("The quick brown fox jumps over the lazy dog. In a distant future, ");
-// prefill: layers-only fast path for all but the last prompt token
+const REP = +(Deno.env.get("REP") || 1);
+promptIds = tok.encode("The quick brown fox jumps over the lazy dog. ".repeat(REP) + "In a distant future, ");
+// prefill: batched (4 tokens/pass) for all but the last prompt token
 const tp0 = performance.now();
 let logits = null;
-for (let i = 0; i < promptIds.length; i++) {
-  if (i < promptIds.length - 1) {
-    await eng.prefillToken(promptIds[i]);
-    if (i % 8 === 7) await device.queue.onSubmittedWorkDone();   // bounded queue depth
-  } else logits = await eng.forwardToken(promptIds[i]);
-}
+await eng.prefillTokens(promptIds.slice(0, -1));
+logits = await eng.forwardToken(promptIds[promptIds.length - 1]);
 const tp1 = performance.now();
 // decode
 let next = argmax(logits), bad = 0, text = "";

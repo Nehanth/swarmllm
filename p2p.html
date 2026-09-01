@@ -1366,7 +1366,15 @@ async function aiGenerate(textArg, who) {
   try {
     let logits = null;
     const tPre = performance.now();
-    for (let i = 0; i < ids.length; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);
+    if (!ai.chain.length && ai.engine.prefillTokens && ids.length > 1) {
+      // solo: batched prefill, 4 prompt tokens per GPU pass
+      ai.engine.pos = ai.pos;
+      await ai.engine.prefillTokens(ids.slice(0, -1));
+      ai.pos = ai.engine.pos;
+      logits = await aiPipeToken(ids[ids.length - 1]);
+    } else {
+      for (let i = 0; i < ids.length; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);
+    }
     const t0 = performance.now();
     let count = 0, reply = "";
     for (let i = 0; i < 400; i++) {
