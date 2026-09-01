@@ -180,6 +180,242 @@ fn sigmoid_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
   let g = sm_g[i];
   sm_a[i] = sm_a[i] * (1.0 / (1.0 + exp(-g)));
 }
+// ================= multi-column variants (batched prefill / verify) =================
+// One dispatch covers every live column: y = column for the parallel ops; the
+// recurrent ops (conv, delta rule) loop over columns inside the kernel and
+// write rollback snapshots when frame.snap is set. Math is identical to the
+// single-column kernels above (same operation order).
+struct MC { n: u32, s0: u32, s1: u32, s2: u32 };
+
+@group(1) @binding(0) var<storage, read> rnm_x: array<f32>;
+@group(1) @binding(1) var<storage, read> rnm_w: array<f32>;
+@group(1) @binding(2) var<storage, read_write> rnm_y: array<f32>;
+@group(1) @binding(3) var<uniform> rnm_mc: MC;          // n, x stride, y stride
+var<workgroup> rnm_partial: array<f32, 256>;
+@compute @workgroup_size(256)
+fn rmsnorm_mc(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x; let n = rnm_mc.n;
+  let xo = wg.y * rnm_mc.s0; let yo = wg.y * rnm_mc.s1;
+  var ss: f32 = 0.0;
+  for (var i: u32 = t; i < n; i += 256u) { let v = rnm_x[xo + i]; ss += v * v; }
+  rnm_partial[t] = ss;
+  workgroupBarrier();
+  var stride: u32 = 128u;
+  while (stride > 0u) {
+    if (t < stride) { rnm_partial[t] += rnm_partial[t + stride]; }
+    workgroupBarrier();
+    stride = stride / 2u;
+  }
+  let inv = inverseSqrt(rnm_partial[0] / f32(n) + cfg.eps);
+  for (var i: u32 = t; i < n; i += 256u) { rnm_y[yo + i] = rnm_x[xo + i] * inv * rnm_w[i]; }
+}
+
+@group(1) @binding(0) var<storage, read_write> adm_a: array<f32>;
+@group(1) @binding(1) var<storage, read> adm_b: array<f32>;
+@group(1) @binding(2) var<uniform> adm_mc: MC;          // n, a stride, b stride
+@compute @workgroup_size(64)
+fn add_res_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= adm_mc.n) { return; }
+  adm_a[gid.y * adm_mc.s0 + i] += adm_b[gid.y * adm_mc.s1 + i];
+}
+
+@group(1) @binding(0) var<storage, read> gtm_alpha: array<f32>;
+@group(1) @binding(1) var<storage, read> gtm_beta: array<f32>;
+@group(1) @binding(2) var<storage, read> gtm_dt: array<f32>;
+@group(1) @binding(3) var<storage, read> gtm_a: array<f32>;
+@group(1) @binding(4) var<storage, read_write> gtm_bout: array<f32>;
+@group(1) @binding(5) var<storage, read_write> gtm_dout: array<f32>;
+@group(1) @binding(6) var<uniform> gtm_mc: MC;          // n = heads, s0 = column stride (all four)
+@compute @workgroup_size(64)
+fn dn_gates_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let h = gid.x;
+  if (h >= gtm_mc.n) { return; }
+  let o = gid.y * gtm_mc.s0;
+  gtm_bout[o + h] = 1.0 / (1.0 + exp(-gtm_beta[o + h]));
+  let av = gtm_alpha[o + h] + gtm_dt[h];
+  var sp: f32;
+  if (av > 20.0) { sp = av; } else { sp = log(1.0 + exp(av)); }
+  gtm_dout[o + h] = exp(sp * gtm_a[h]);
+}
+
+@group(1) @binding(0) var<storage, read> cvm_x: array<f32>;
+@group(1) @binding(1) var<storage, read> cvm_w: array<f32>;
+@group(1) @binding(2) var<storage, read_write> cvm_st: array<f32>;
+@group(1) @binding(3) var<storage, read_write> cvm_y: array<f32>;
+@group(1) @binding(4) var<uniform> cvm_mc: MC;          // n = convDim, x stride, y stride
+@group(1) @binding(5) var<storage, read_write> cvm_shadow: array<f32>;   // [3][convDim*3]
+@compute @workgroup_size(64)
+fn dn_conv_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let c = gid.x; let n = cvm_mc.n;
+  if (c >= n) { return; }
+  let w0 = cvm_w[c * 4u]; let w1 = cvm_w[c * 4u + 1u]; let w2 = cvm_w[c * 4u + 2u]; let w3 = cvm_w[c * 4u + 3u];
+  var s0 = cvm_st[c * 3u]; var s1 = cvm_st[c * 3u + 1u]; var s2 = cvm_st[c * 3u + 2u];
+  let nCols = max(frame.nCols, 1u);
+  for (var col: u32 = 0u; col < nCols; col++) {
+    let x = cvm_x[col * cvm_mc.s0 + c];
+    var acc = w3 * x;
+    acc += w0 * s0;
+    acc += w1 * s1;
+    acc += w2 * s2;
+    cvm_y[col * cvm_mc.s1 + c] = acc / (1.0 + exp(-acc));
+    s0 = s1; s1 = s2; s2 = x;
+    if (frame.snap != 0u && col + 1u < nCols) {
+      let so = col * n * 3u + c * 3u;
+      cvm_shadow[so] = s0; cvm_shadow[so + 1u] = s1; cvm_shadow[so + 2u] = s2;
+    }
+  }
+  cvm_st[c * 3u] = s0; cvm_st[c * 3u + 1u] = s1; cvm_st[c * 3u + 2u] = s2;
+}
+
+@group(1) @binding(0) var<storage, read_write> l2m_v: array<f32>;
+@group(1) @binding(1) var<uniform> l2m_mc: MC;          // n = heads, s0 = column stride, s1 = part offset (z = 1 -> k)
+@group(1) @binding(2) var<uniform> l2m_dn: DN;
+@compute @workgroup_size(32)
+fn dn_l2_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let h = gid.x;
+  if (h >= l2m_mc.n) { return; }
+  let off = gid.y * l2m_mc.s0 + gid.z * l2m_mc.s1 + h * l2m_dn.dState;
+  var ss: f32 = 0.0;
+  for (var i: u32 = 0u; i < l2m_dn.dState; i++) { let v = l2m_v[off + i]; ss += v * v; }
+  let inv = 1.0 / max(sqrt(ss), l2m_dn.eps2);
+  for (var i: u32 = 0u; i < l2m_dn.dState; i++) { l2m_v[off + i] *= inv; }
+}
+
+@group(1) @binding(0) var<storage, read> dlm_c: array<f32>;      // conv output columns: [q | k | v]
+@group(1) @binding(1) var<storage, read> dlm_beta: array<f32>;
+@group(1) @binding(2) var<storage, read> dlm_decay: array<f32>;
+@group(1) @binding(3) var<storage, read_write> dlm_s: array<f32>;
+@group(1) @binding(4) var<storage, read_write> dlm_o: array<f32>;
+@group(1) @binding(5) var<uniform> dlm_mc: MC;          // s0 conv stride, s1 gate stride, s2 out stride
+@group(1) @binding(6) var<uniform> dlm_dn: DN;
+@group(1) @binding(7) var<storage, read_write> dlm_shadow: array<f32>;   // [3][nVH*dState*dState]
+@compute @workgroup_size(128)
+fn dn_delta_mc(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wg.x; let j = lid.x; let dS = dlm_dn.dState;
+  if (h >= dlm_dn.nVH || j >= dS) { return; }
+  let kh = h % dlm_dn.nKH;
+  let kOff = kh * dS; let vOff = h * dS; let Sb = h * dS * dS;
+  let scale = inverseSqrt(f32(dS));
+  let nCols = max(frame.nCols, 1u);
+  let sSize = dlm_dn.nVH * dS * dS;
+  for (var col: u32 = 0u; col < nCols; col++) {
+    let qo = col * dlm_mc.s0 + kOff;
+    let ko = col * dlm_mc.s0 + dlm_dn.keyDim + kOff;
+    let vo = col * dlm_mc.s0 + 2u * dlm_dn.keyDim + vOff;
+    let decay = dlm_decay[col * dlm_mc.s1 + h];
+    var vhat: f32 = 0.0;
+    var sq: f32 = 0.0;
+    var kq: f32 = 0.0;
+    for (var i: u32 = 0u; i < dS; i++) {
+      let idx = Sb + i * dS + j;
+      let sdec = dlm_s[idx] * decay;
+      dlm_s[idx] = sdec;
+      let ki = dlm_c[ko + i];
+      let qi = dlm_c[qo + i];
+      vhat += sdec * ki;
+      sq += sdec * qi;
+      kq += ki * qi;
+    }
+    let d = (dlm_c[vo + j] - vhat) * dlm_beta[col * dlm_mc.s1 + h];
+    for (var i: u32 = 0u; i < dS; i++) {
+      let idx = Sb + i * dS + j;
+      dlm_s[idx] += dlm_c[ko + i] * d;
+    }
+    dlm_o[col * dlm_mc.s2 + vOff + j] = (sq + d * kq) * scale;
+    if (frame.snap != 0u && col + 1u < nCols) {
+      for (var i: u32 = 0u; i < dS; i++) { dlm_shadow[col * sSize + Sb + i * dS + j] = dlm_s[Sb + i * dS + j]; }
+    }
+  }
+}
+
+@group(1) @binding(0) var<storage, read> gnm_x: array<f32>;
+@group(1) @binding(1) var<storage, read> gnm_z: array<f32>;
+@group(1) @binding(2) var<storage, read> gnm_w: array<f32>;
+@group(1) @binding(3) var<storage, read_write> gnm_y: array<f32>;
+@group(1) @binding(4) var<uniform> gnm_mc: MC;          // s0 x stride, s1 z stride, s2 y stride
+@group(1) @binding(5) var<uniform> gnm_dn: DN;
+var<workgroup> gnm_partial: array<f32, 128>;
+@compute @workgroup_size(128)
+fn dn_gatenorm_mc(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wg.x; let j = lid.x;
+  let off = h * gnm_dn.dState;
+  let xo = wg.y * gnm_mc.s0 + off; let zo = wg.y * gnm_mc.s1 + off; let yo = wg.y * gnm_mc.s2 + off;
+  let v = gnm_x[xo + j];
+  gnm_partial[j] = v * v;
+  workgroupBarrier();
+  var stride: u32 = 64u;
+  while (stride > 0u) {
+    if (j < stride) { gnm_partial[j] += gnm_partial[j + stride]; }
+    workgroupBarrier();
+    stride = stride / 2u;
+  }
+  let inv = inverseSqrt(gnm_partial[0] / f32(gnm_dn.dState) + cfg.eps);
+  let z = gnm_z[zo + j];
+  gnm_y[yo + j] = gnm_x[xo + j] * inv * gnm_w[j] * (z / (1.0 + exp(-z)));
+}
+
+@group(1) @binding(0) var<storage, read> qsm_full: array<f32>;
+@group(1) @binding(1) var<storage, read_write> qsm_q: array<f32>;
+@group(1) @binding(2) var<storage, read_write> qsm_g: array<f32>;
+@group(1) @binding(3) var<uniform> qsm_mc: MC;          // s0 full stride, s1 q stride, s2 g stride
+@group(1) @binding(4) var<uniform> qsm_dn: DN;
+@compute @workgroup_size(64)
+fn qsplit_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  let total = cfg.nH * qsm_dn.hd;
+  if (idx >= total) { return; }
+  let h = idx / qsm_dn.hd;
+  let i = idx % qsm_dn.hd;
+  let fo = gid.y * qsm_mc.s0 + h * 2u * qsm_dn.hd;
+  qsm_q[gid.y * qsm_mc.s1 + idx] = qsm_full[fo + i];
+  qsm_g[gid.y * qsm_mc.s2 + idx] = qsm_full[fo + qsm_dn.hd + i];
+}
+
+@group(1) @binding(0) var<storage, read_write> hnm_v: array<f32>;
+@group(1) @binding(1) var<storage, read> hnm_w: array<f32>;
+@group(1) @binding(2) var<uniform> hnm_mc: MC;          // n = heads, s0 = column stride
+@compute @workgroup_size(32)
+fn head_norm_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let h = gid.x;
+  if (h >= hnm_mc.n) { return; }
+  let off = gid.y * hnm_mc.s0 + h * cfg.headDim;
+  var ss: f32 = 0.0;
+  for (var i: u32 = 0u; i < cfg.headDim; i++) { let v = hnm_v[off + i]; ss += v * v; }
+  let inv = inverseSqrt(ss / f32(cfg.headDim) + cfg.eps);
+  for (var i: u32 = 0u; i < cfg.headDim; i++) { hnm_v[off + i] *= inv * hnm_w[i]; }
+}
+
+@group(1) @binding(0) var<storage, read_write> rpm_v: array<f32>;
+@group(1) @binding(1) var<uniform> rpm_mc: MC;          // n = heads, s0 = column stride
+@group(1) @binding(2) var<uniform> rpm_dn: DN;
+@compute @workgroup_size(64)
+fn rope_part_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let half = rpm_dn.nRot / 2u;
+  let total = rpm_mc.n * half;
+  let idx = gid.x;
+  if (idx >= total) { return; }
+  let h = idx / half;
+  let i = idx % half;
+  let off = gid.y * rpm_mc.s0 + h * rpm_dn.hd;
+  let ang = f32(frame.pos + gid.y) * pow(rpm_dn.ropeTheta, -f32(2u * i) / f32(rpm_dn.nRot));
+  let c = cos(ang); let s = sin(ang);
+  let a = rpm_v[off + i]; let b = rpm_v[off + i + half];
+  rpm_v[off + i] = a * c - b * s;
+  rpm_v[off + i + half] = b * c + a * s;
+}
+
+@group(1) @binding(0) var<storage, read_write> smm_a: array<f32>;
+@group(1) @binding(1) var<storage, read> smm_g: array<f32>;
+@group(1) @binding(2) var<uniform> smm_mc: MC;          // n, a stride, g stride
+@compute @workgroup_size(64)
+fn sigmoid_mul_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= smm_mc.n) { return; }
+  let g = smm_g[gid.y * smm_mc.s1 + i];
+  let ai = gid.y * smm_mc.s0 + i;
+  smm_a[ai] = smm_a[ai] * (1.0 / (1.0 + exp(-g)));
+}
 `;
 
 export class Qwen35Engine {
@@ -261,6 +497,11 @@ export class Qwen35Engine {
       qsplit: ["ro", "rw", "rw", "u"],
       rope_part: ["rw", "u", "u"],
       sigmoid_mul: ["rw", "ro", "u"],
+      rmsnorm_mc: ["ro", "ro", "rw", "u"], add_res_mc: ["rw", "ro", "u"],
+      dn_gates_mc: ["ro", "ro", "ro", "ro", "rw", "rw", "u"], dn_conv_mc: ["ro", "ro", "rw", "rw", "u", "rw"],
+      dn_l2_mc: ["rw", "u", "u"], dn_delta_mc: ["ro", "ro", "ro", "rw", "rw", "u", "u", "rw"],
+      dn_gatenorm_mc: ["ro", "ro", "ro", "rw", "u", "u"], qsplit_mc: ["ro", "rw", "rw", "u", "u"],
+      head_norm_mc: ["rw", "ro", "u"], rope_part_mc: ["rw", "u", "u"], sigmoid_mul_mc: ["rw", "ro", "u"],
     };
     const bufType = { u: "uniform", ro: "read-only-storage", rw: "storage" };
     this.pipes = {};
@@ -496,6 +737,7 @@ export class Qwen35Engine {
     pass.dispatchWorkgroups(Math.ceil(threads / wg));
   }
   _dop(pass, op) {
+    if (this.skip && this.skip.has(op.pipe)) return;
     pass.setPipeline(this.pipes[op.pipe]);
     pass.setBindGroup(0, this.bgCommonFor[op.pipe]);
     pass.setBindGroup(1, op.bg);
@@ -619,7 +861,15 @@ export class Qwen35Engine {
       entries: resources.map((r, i) => ({ binding: i, resource: r })),
     });
   }
+  _dMC(pass, name, bg, threads, wg, ny, nz = 1) {
+    if (this.skip && this.skip.has(name)) return;   // profiling aid (bench_breakdown)
+    pass.setPipeline(this.pipes[name]);
+    pass.setBindGroup(0, this.bgCommonB[0][name]);
+    pass.setBindGroup(1, bg);
+    pass.dispatchWorkgroups(Math.ceil(threads / wg), ny, nz);
+  }
   _dCol(pass, name, col, bg, threads, wg = 64) {
+    if (this.skip && this.skip.has(name)) return;
     pass.setPipeline(this.pipes[name]);
     pass.setBindGroup(0, this.bgCommonB[col][name] || this.bgCommonFor[name]);
     pass.setBindGroup(1, bg);
@@ -643,8 +893,8 @@ export class Qwen35Engine {
     this.stageXB = dev.createBuffer({ size: 4 * D.dim * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     // rollback shadows for the recurrent layers (speculative decoding)
     for (const L of this.layers) if (!L.isFull && !L.S_shadow) {
-      L.S_shadow = [0, 1, 2].map(() => dev.createBuffer({ size: L.S.size, usage: S }));
-      L.conv_shadow = [0, 1, 2].map(() => dev.createBuffer({ size: L.convState.size, usage: S }));
+      L.S_shadow = dev.createBuffer({ size: 3 * L.S.size, usage: S });
+      L.conv_shadow = dev.createBuffer({ size: 3 * L.convState.size, usage: S });
     }
     this.stageLogitsN = dev.createBuffer({ size: 4 * D.vocab * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const slice = (b, c) => ({ buffer: b.buf, offset: c * b.stride, size: b.n * 4 });
@@ -652,7 +902,9 @@ export class Qwen35Engine {
     this.frameBufsB = [0, 1, 2, 3].map(() => dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
     const colPipes = ["rmsnorm", "head_norm", "attn_scores", "attn_softmax", "attn_out",
       "silu_mul", "add_res", "rope_part", "qsplit", "sigmoid_mul",
-      "dn_gates", "dn_conv", "dn_l2", "dn_delta", "dn_gatenorm"];
+      "dn_gates", "dn_conv", "dn_l2", "dn_delta", "dn_gatenorm",
+      "rmsnorm_mc", "add_res_mc", "dn_gates_mc", "dn_conv_mc", "dn_l2_mc", "dn_delta_mc", "dn_gatenorm_mc",
+      "qsplit_mc", "head_norm_mc", "rope_part_mc", "sigmoid_mul_mc"];
     this.bgCommonB = [0, 1, 2, 3].map((c) => {
       const m = {};
       for (const name of colPipes)
@@ -672,10 +924,43 @@ export class Qwen35Engine {
       if (this.mtp) this.mtp.bgHNormB = [0, 1, 2, 3].map((c) => this._bg2res(this.pipes.rmsnorm,
         [slice(B.x, c), { buffer: this.mtp.hnorm.buf }, { buffer: this.mtp.ehIn, offset: D.dim * 4, size: D.dim * 4 }, { buffer: this.uDim }]));
     }
+    this._mcU = this._mcU || {};
+    const mcU = (n, s0 = 0, s1 = 0, s2 = 0) => {
+      const k = n + "," + s0 + "," + s1 + "," + s2;
+      return this._mcU[k] || (this._mcU[k] = { buffer: this._buf(new Uint32Array([n, s0, s1, s2]), GPUBufferUsage.UNIFORM) });
+    };
+    const st = (b) => b.stride / 4;   // column stride in floats
+    const whole = (b) => ({ buffer: b.buf });
+    const dn = { buffer: this.dnBuf };
     this.layerB = this.layers.map((L) => {
       const bgNormC = (w, c) => this._bg2res(this.pipes.rmsnorm,
         [slice(B.x, c), { buffer: w.buf }, slice(B.xn, c), { buffer: this.uDim }]);
+      const mc = {
+        norm1: this._bg2res(this.pipes.rmsnorm_mc, [whole(B.x), { buffer: L.attnNorm.buf }, whole(B.xn), mcU(D.dim, st(B.x), st(B.xn))]),
+        norm2: this._bg2res(this.pipes.rmsnorm_mc, [whole(B.x), { buffer: L.postNorm.buf }, whole(B.xn), mcU(D.dim, st(B.x), st(B.xn))]),
+        addTmp: this._bg2res(this.pipes.add_res_mc, [whole(B.x), whole(B.tmpDim), mcU(D.dim, st(B.x), st(B.tmpDim))]),
+      };
+      if (L.isFull) Object.assign(mc, {
+        qsplit: this._bg2res(this.pipes.qsplit_mc, [whole(B.qFull), whole(B.q), whole(B.gAttn), mcU(0, st(B.qFull), st(B.q), st(B.gAttn)), dn]),
+        qNorm: this._bg2res(this.pipes.head_norm_mc, [whole(B.q), { buffer: L.qNorm.buf }, mcU(D.nH, st(B.q))]),
+        kNorm: this._bg2res(this.pipes.head_norm_mc, [whole(B.k), { buffer: L.kNorm.buf }, mcU(D.nKV, st(B.k))]),
+        ropeQ: this._bg2res(this.pipes.rope_part_mc, [whole(B.q), mcU(D.nH, st(B.q)), dn]),
+        ropeK: this._bg2res(this.pipes.rope_part_mc, [whole(B.k), mcU(D.nKV, st(B.k)), dn]),
+        sigMul: this._bg2res(this.pipes.sigmoid_mul_mc, [whole(B.attnOut), whole(B.gAttn), mcU(D.qDim, st(B.attnOut), st(B.gAttn))]),
+      });
+      else Object.assign(mc, {
+        gates: this._bg2res(this.pipes.dn_gates_mc, [whole(B.alpha), whole(B.betaRaw), { buffer: L.dtBias }, { buffer: L.ssmA },
+          whole(B.beta), whole(B.decay), mcU(D.nVH, st(B.alpha))]),
+        conv: this._bg2res(this.pipes.dn_conv_mc, [whole(B.qkv), { buffer: L.convW }, { buffer: L.convState }, whole(B.convOut),
+          mcU(D.convDim, st(B.qkv), st(B.convOut)), { buffer: L.conv_shadow }]),
+        l2: this._bg2res(this.pipes.dn_l2_mc, [whole(B.convOut), mcU(D.nKH, st(B.convOut), D.keyDim), dn]),
+        delta: this._bg2res(this.pipes.dn_delta_mc, [whole(B.convOut), whole(B.beta), whole(B.decay), { buffer: L.S }, whole(B.dOut),
+          mcU(0, st(B.convOut), st(B.beta), st(B.dOut)), dn, { buffer: L.S_shadow }]),
+        gatenorm: this._bg2res(this.pipes.dn_gatenorm_mc, [whole(B.dOut), whole(B.z), { buffer: L.ssmNorm }, whole(B.gated),
+          mcU(0, st(B.dOut), st(B.z), st(B.gated)), dn]),
+      });
       const R = {
+        mc,
         gateUp: [mvB(L.ffnGate, B.xn, B.g, D.inter, D.dim), mvB(L.ffnUp, B.xn, B.u, D.inter, D.dim)],
         gu: this._guOp(L.ffnGate, L.ffnUp, B.xn.buf, B.g.buf, D.inter, D.dim, B.xn, B.g),
         down: mvB(L.ffnDown, B.g, B.tmpDim, D.dim, D.inter),
@@ -727,24 +1012,22 @@ export class Qwen35Engine {
   }
 
   // nCols < 4: batched matvecs still compute 4 columns (extra columns are
-  // garbage into scratch), but every stateful per-column op runs only for the
-  // live columns. snapshotDN: copy recurrent state after column 0 so a
-  // rejected speculative column 1 can be rolled back.
+  // garbage into scratch); every per-column op runs as ONE multi-column
+  // dispatch over the live columns. snapshotDN (set through frame.snap) makes
+  // the recurrent kernels save their state after each non-final column so a
+  // rejected speculative suffix can be rolled back.
   _encodeLayerBatch(enc, i, basePos, nCols = 4, snapshotDN = false) {
-    const D = this.dims, L = this.layers[i], LB = this.layerB[i], B = this.B;
+    const D = this.dims, L = this.layers[i], LB = this.layerB[i], B = this.B, M = LB.mc;
     if (L.isFull) {
       {
         const p = enc.beginComputePass();
-        for (let c = 0; c < nCols; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm1, 256, 256);
+        this._dMC(p, "rmsnorm_mc", M.norm1, 256, 256, nCols);
         for (const op of LB.qkvOps) this._dop(p, op);
-        for (let c = 0; c < nCols; c++) {
-          const C = LB.cols[c];
-          this._dCol(p, "qsplit", c, C.qsplit, D.nH * D.hd);
-          this._dCol(p, "head_norm", c, C.qNorm, D.nH, 32);
-          this._dCol(p, "head_norm", c, C.kNorm, D.nKV, 32);
-          this._dCol(p, "rope_part", c, C.ropeQ, D.nH * D.nRot / 2);
-          this._dCol(p, "rope_part", c, C.ropeK, D.nKV * D.nRot / 2);
-        }
+        this._dMC(p, "qsplit_mc", M.qsplit, D.nH * D.hd, 64, nCols);
+        this._dMC(p, "head_norm_mc", M.qNorm, D.nH, 32, nCols);
+        this._dMC(p, "head_norm_mc", M.kNorm, D.nKV, 32, nCols);
+        this._dMC(p, "rope_part_mc", M.ropeQ, D.nH * D.nRot / 2, 64, nCols);
+        this._dMC(p, "rope_part_mc", M.ropeK, D.nKV * D.nRot / 2, 64, nCols);
         p.end();
       }
       for (let c = 0; c < nCols; c++) {
@@ -753,58 +1036,40 @@ export class Qwen35Engine {
       }
       {
         const p = enc.beginComputePass();
-        for (let c = 0; c < nCols; c++) {
+        for (let c = 0; c < nCols; c++) {   // shared score scratch: columns in turn
           const C = LB.cols[c];
           this._dCol(p, "attn_scores", c, C.scores, D.nH * (basePos + c + 1));
           this._dCol(p, "attn_softmax", c, C.softmax, D.nH, 1);
           this._dCol(p, "attn_out", c, C.attnOut, D.qDim);
-          this._dCol(p, "sigmoid_mul", c, C.sigMul, D.qDim);
         }
+        this._dMC(p, "sigmoid_mul_mc", M.sigMul, D.qDim, 64, nCols);
         this._dop(p, LB.o);
-        for (let c = 0; c < nCols; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
+        this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
         p.end();
       }
     } else {
-      {
-        const p = enc.beginComputePass();
-        for (let c = 0; c < nCols; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm1, 256, 256);
-        for (const op of LB.dnOps) this._dop(p, op);
-        p.end();
-      }
-      let p = snapshotDN ? null : enc.beginComputePass();
-      for (let c = 0; c < nCols; c++) {   // recurrent state: columns strictly in order
-        const C = LB.cols[c];
-        if (snapshotDN) p = enc.beginComputePass();
-        this._dCol(p, "dn_gates", c, C.gates, D.nVH);
-        this._dCol(p, "dn_conv", c, C.conv, D.convDim);
-        this._dCol(p, "dn_l2", c, C.l2q, D.nKH, 32);
-        this._dCol(p, "dn_l2", c, C.l2k, D.nKH, 32);
-        this._dCol(p, "dn_delta", c, C.delta, D.nVH * 128, 128);
-        this._dCol(p, "dn_gatenorm", c, C.gatenorm, D.nVH * 128, 128);
-        if (snapshotDN) p.end();
-        if (snapshotDN && c < nCols - 1) {
-          enc.copyBufferToBuffer(L.S, 0, L.S_shadow[c], 0, L.S.size);
-          enc.copyBufferToBuffer(L.convState, 0, L.conv_shadow[c], 0, L.convState.size);
-        }
-      }
-      if (!snapshotDN) p.end();
-      {
-        const p = enc.beginComputePass();
-        this._dop(p, LB.out);
-        for (let c = 0; c < nCols; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
-        p.end();
-      }
+      const p = enc.beginComputePass();
+      this._dMC(p, "rmsnorm_mc", M.norm1, 256, 256, nCols);
+      for (const op of LB.dnOps) this._dop(p, op);
+      this._dMC(p, "dn_gates_mc", M.gates, D.nVH, 64, nCols);
+      this._dMC(p, "dn_conv_mc", M.conv, D.convDim, 64, 1);           // loops over columns
+      this._dMC(p, "dn_l2_mc", M.l2, D.nKH, 32, nCols, 2);            // z: q part, k part
+      this._dMC(p, "dn_delta_mc", M.delta, D.nVH * 128, 128, 1);     // loops over columns
+      this._dMC(p, "dn_gatenorm_mc", M.gatenorm, D.nVH * 128, 128, nCols);
+      this._dop(p, LB.out);
+      this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
+      p.end();
     }
     {
       const p = enc.beginComputePass();
-      for (let c = 0; c < nCols; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm2, 256, 256);
+      this._dMC(p, "rmsnorm_mc", M.norm2, 256, 256, nCols);
       if (LB.gu) this._dop(p, LB.gu);
       else {
         for (const op of LB.gateUp) this._dop(p, op);
         for (let c = 0; c < nCols; c++) this._dCol(p, "silu_mul", c, LB.cols[c].silu, D.inter);
       }
       this._dop(p, LB.down);
-      for (let c = 0; c < nCols; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
+      this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
       p.end();
     }
   }
@@ -825,7 +1090,7 @@ export class Qwen35Engine {
     if (!this.B) this._initBatch();
     this.pos = basePos;
     for (let c = 0; c < 4; c++) {
-      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1]));
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, 4, 0]));
       this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(ids[c]));
     }
     return this._runBatchAndRead(basePos);
@@ -835,7 +1100,7 @@ export class Qwen35Engine {
     const { dim } = this.dims;
     this.pos = basePos;
     for (let c = 0; c < 4; c++) {
-      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1]));
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, 4, 0]));
       this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, xs.subarray(c * dim, (c + 1) * dim));
     }
     return this._runBatchAndRead(basePos);
@@ -877,7 +1142,7 @@ export class Qwen35Engine {
     if (!this.B) this._initBatch();
     const { vocab } = this.dims, n = tokens.length;
     for (let c = 0; c < n; c++) {
-      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([pos + c, pos + c + 1]));
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([pos + c, pos + c + 1, n, 1]));
       this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(tokens[c]));
     }
     const enc = this.device.createCommandEncoder();
@@ -900,8 +1165,8 @@ export class Qwen35Engine {
   _restoreDN(k) {   // recurrent state as it was after verify column k
     const enc = this.device.createCommandEncoder();
     for (const L of this.layers) if (!L.isFull) {
-      enc.copyBufferToBuffer(L.S_shadow[k], 0, L.S, 0, L.S.size);
-      enc.copyBufferToBuffer(L.conv_shadow[k], 0, L.convState, 0, L.convState.size);
+      enc.copyBufferToBuffer(L.S_shadow, k * L.S.size, L.S, 0, L.S.size);
+      enc.copyBufferToBuffer(L.conv_shadow, k * L.convState.size, L.convState, 0, L.convState.size);
     }
     this.device.queue.submit([enc.finish()]);
   }
@@ -948,7 +1213,7 @@ export class Qwen35Engine {
     while (ids.length - i >= 4) {
       const basePos = this.pos;
       for (let c = 0; c < 4; c++) {
-        this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1]));
+        this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, 4, 0]));
         this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(ids[i + c]));
       }
       const enc = this.device.createCommandEncoder();

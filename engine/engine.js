@@ -165,7 +165,7 @@ struct Config {
   headDim: u32, inter: u32, vocab: u32, maxSeq: u32,
   eps: f32, theta: f32, qDim: u32,
 };
-struct Frame { pos: u32, seqLen: u32 };
+struct Frame { pos: u32, seqLen: u32, nCols: u32, snap: u32 };
 struct Shape { dOut: u32, dIn: u32 };
 
 @group(0) @binding(0) var<uniform> cfg: Config;
@@ -408,8 +408,9 @@ fn add_res(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Scalar accumulators only: a dynamically-indexed local array spills to
 // scratch memory and ran 3x slower. Reduction is a portable shared-memory
 // halving tree (no subgroups: absent from shipping Safari 26).
-export function coopWGSL(WG = 256, ROWS = 4) {
-  const LANES = WG / 4;                  // 32-elem blocks in flight per iteration
+export function coopWGSL(WG = 256, ROWS = 4, WGB = 64) {
+  const LANES = WG / 4;
+  const LANESB = WGB / 4;   // batched kernels: smaller workgroups amortize the reductions                  // 32-elem blocks in flight per iteration
   const accDecl = Array.from({ length: ROWS }, (_, r) => `var acc${r} = 0.0;`).join(" ");
   const fullBody = (term) => Array.from({ length: ROWS }, (_, r) => `      acc${r} += ${term(r)};`).join("\n");
   const tailBody = (term, dOut) => Array.from({ length: ROWS - 1 }, (_, r) =>
@@ -534,10 +535,95 @@ fn matvec${kind === "f32" ? "" : "_" + kind}_gu${batched ? "_b" : ""}(@builtin(w
 ${batched ? [0, 1, 2, 3].map(colBody).join("\n") : colBody(0)}
 }`;
   };
+  // batched gate/up: ONE pass over the weights; each g/u word is loaded and
+  // decoded once and applied to all 4 columns (2*ROWS*4 accumulators), then
+  // one reduction round per column.
+  const guKernelB = (kind) => {
+    const P = kind === "f32" ? "guf" : kind === "q8" ? "gu8" : "gu4";
+    const shape = `${P}_shape`;
+    const cols = [0, 1, 2, 3], rows = Array.from({ length: ROWS }, (_, r) => r);
+    const xLoads = kind === "q4"
+      ? cols.map((m) => `let xa${m} = ${P}_x[${m}u * xs4 + b * 8u + qt]; let xb${m} = ${P}_x[${m}u * xs4 + b * 8u + qt + 4u];`).join("\n      ")
+      : cols.map((m) => `let xa${m} = ${P}_x[${m}u * xs4 + b * 8u + qt * 2u]; let xb${m} = ${P}_x[${m}u * xs4 + b * 8u + qt * 2u + 1u];`).join("\n      ");
+    const idx = kind === "q4" ? `let wIdx = row0 * rowWords + b * 4u + qt; let scBase = row0 * nb + b;`
+      : kind === "q8" ? `let wBase = row0 * rowWords + b * 8u + qt * 2u; let scBase = row0 * nb + b;`
+      : `let off4 = row0 * dIn4 + b * 8u + qt * 2u;`;
+    const nib = (w, v) => `let ${v}lo = vec4<f32>(f32(${w} & 0xFu), f32((${w} >> 8u) & 0xFu), f32((${w} >> 16u) & 0xFu), f32((${w} >> 24u) & 0xFu)) - vec4<f32>(8.0);
+        let ${v}hi = vec4<f32>(f32((${w} >> 4u) & 0xFu), f32((${w} >> 12u) & 0xFu), f32((${w} >> 20u) & 0xFu), f32((${w} >> 28u) & 0xFu)) - vec4<f32>(8.0);`;
+    const sx = (w, v) => `let ${v} = vec4<f32>(f32((${w} << 24u) >> 24u), f32((${w} << 16u) >> 24u), f32((${w} << 8u) >> 24u), f32(${w} >> 24u));`;
+    const rowBlock = (r) => {
+      const acc = (ga, gb, ua, ub, gs, us) => cols.map((m) =>
+        `ag${r}_${m} += ${gs}(dot(${ga}, xa${m}) + dot(${gb}, xb${m})); au${r}_${m} += ${us}(dot(${ua}, xa${m}) + dot(${ub}, xb${m}));`).join(" ");
+      if (kind === "f32") return `if (full || row0 + ${r}u < dOut) {
+        let ga = ${P}_gw[off4 + ${r}u * dIn4]; let gb = ${P}_gw[off4 + ${r}u * dIn4 + 1u];
+        let ua = ${P}_uw[off4 + ${r}u * dIn4]; let ub = ${P}_uw[off4 + ${r}u * dIn4 + 1u];
+        ${acc("ga", "gb", "ua", "ub", "", "")}
+      }`;
+      if (kind === "q8") return `if (full || row0 + ${r}u < dOut) {
+        let si = scBase + ${r}u * nb;
+        let gs = unpack2x16float(${P}_gsc[si >> 1u])[si & 1u]; let us = unpack2x16float(${P}_usc[si >> 1u])[si & 1u];
+        let g0 = bitcast<i32>(${P}_gqs[wBase + ${r}u * rowWords]); let g1 = bitcast<i32>(${P}_gqs[wBase + ${r}u * rowWords + 1u]);
+        let u0 = bitcast<i32>(${P}_uqs[wBase + ${r}u * rowWords]); let u1 = bitcast<i32>(${P}_uqs[wBase + ${r}u * rowWords + 1u]);
+        ${sx("g0", "gd0")} ${sx("g1", "gd1")} ${sx("u0", "ud0")} ${sx("u1", "ud1")}
+        ${acc("gd0", "gd1", "ud0", "ud1", "gs * ", "us * ")}
+      }`;
+      return `if (full || row0 + ${r}u < dOut) {
+        let si = scBase + ${r}u * nb;
+        let gs = unpack2x16float(${P}_gsc[si >> 1u])[si & 1u]; let us = unpack2x16float(${P}_usc[si >> 1u])[si & 1u];
+        let gw = ${P}_gqs[wIdx + ${r}u * rowWords]; let uw = ${P}_uqs[wIdx + ${r}u * rowWords];
+        ${nib("gw", "g")}
+        ${nib("uw", "u")}
+        ${acc("glo", "ghi", "ulo", "uhi", "gs * ", "us * ")}
+      }`;
+    };
+    const K2 = 2 * ROWS;
+    return `
+@compute @workgroup_size(${WGB})
+fn matvec${kind === "f32" ? "" : "_" + kind}_gu_b(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x;
+  let qt = t & 3u;
+  let bl = t >> 2u;
+  let dIn = ${shape}.dIn;
+  let dOut = ${shape}.dOut;
+  let xs4 = ${shape}.xs4;
+  let ys = ${shape}.ys;
+  let nb = dIn / 32u;
+  let dIn4 = dIn / 4u;
+  let rowWords = ${kind === "q4" ? "dIn / 8u" : "dIn / 4u"};
+  let row0 = wg.x * ${ROWS}u;
+  let full = row0 + ${ROWS - 1}u < dOut;
+  ${rows.map((r) => cols.map((m) => `var ag${r}_${m} = 0.0; var au${r}_${m} = 0.0;`).join(" ")).join("\n  ")}
+  for (var b: u32 = bl; b < nb; b += ${LANESB}u) {
+      ${xLoads}
+      ${idx}
+      ${rows.map(rowBlock).join("\n      ")}
+  }
+${cols.map((m) => `
+  ${rows.map((r) => `gub_part[${r * WGB}u + t] = ag${r}_${m}; gub_part[${(ROWS + r) * WGB}u + t] = au${r}_${m};`).join(" ")}
+  workgroupBarrier();
+  {
+    var stride: u32 = ${WGB / 2}u;
+    while (stride > 0u) {
+      if (t < stride) { ${Array.from({ length: K2 }, (_, k) => `gub_part[${k * WGB}u + t] += gub_part[${k * WGB}u + t + stride];`).join(" ")} }
+      workgroupBarrier();
+      stride = stride >> 1u;
+    }
+  }
+  if (t < ${ROWS}u) {
+    let row = row0 + t;
+    if (row < dOut) {
+      let g = gub_part[t * ${WGB}u];
+      ${P}_y[${m}u * ys + row] = (g / (1.0 + exp(-g))) * gub_part[(${ROWS}u + t) * ${WGB}u];
+    }
+  }
+  workgroupBarrier();`).join("\n")}
+}`;
+  };
   const guAll = `
 var<workgroup> gu_res: array<f32, ${ROWS}>;
+var<workgroup> gub_part: array<f32, ${2 * ROWS * WGB}>;
 ` + ["f32", "q8", "q4"].map((k) => guKernel(k, false)).join("\n")
-    + ["f32", "q8", "q4"].map((k) => guKernel(k, true)).join("\n");
+    + ["f32", "q8", "q4"].map((k) => guKernelB(k)).join("\n");
   return /* wgsl */ `
 var<workgroup> mvc_part: array<f32, ${WG * ROWS}>;   // [${ROWS} rows][${WG} threads]
 
@@ -659,80 +745,82 @@ ${reduce}
   }
 }
 
-// ---- batched (4-column) variants for prefill: each loaded weight word is
-// reused across 4 prompt tokens, so prefill reads the weights once per 4
-// tokens instead of once per token. x is [4][xs4] vec4s, y is [4][ys] f32s
-// (strides carried in BShape; slices are 256-byte aligned by the engine).
-// Column accumulation reuses the same 4-row register set per column and the
-// same shared-memory tree, one column at a time (keeps workgroup storage at
-// the portable minimum).
+// ---- batched (4-column) variants for prefill / verify: each weight word is
+// loaded and decoded once and applied to 4 token columns. x is [4][xs4] vec4s,
+// y is [4][ys] f32s (strides in BShape; slices are 256-byte aligned by the
+// engine). Workgroup ${WGB}: more loop work per thread, cheaper reductions.
 struct BShape { dOut: u32, dIn: u32, xs4: u32, ys: u32 };
 @group(1) @binding(3) var<uniform> mvb_shape: BShape;
 @group(1) @binding(4) var<uniform> qb_shape: BShape;
-
-${["", "_q8", "_q4"].map((kind) => `
-@compute @workgroup_size(${WG})
+var<workgroup> mvb_part: array<f32, ${2 * ROWS * WGB}>;
+${["", "_q8", "_q4"].map((kind) => {
+  const shp = kind === "" ? "mvb_shape" : "qb_shape";
+  const xbuf = kind === "" ? "mv_x4" : kind === "_q8" ? "q8_x4" : "q4_x4";
+  const ybuf = kind === "" ? "mv_y" : kind === "_q8" ? "q8_y" : "q4_y";
+  const cols = [0, 1, 2, 3], rows = Array.from({ length: ROWS }, (_, r) => r);
+  const xLoads = kind === "_q4"
+    ? cols.map((m) => `let xa${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt]; let xb${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt + 4u];`).join("\n    ")
+    : cols.map((m) => `let xa${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt * 2u]; let xb${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt * 2u + 1u];`).join("\n    ");
+  const idx = kind === "_q4" ? "let wIdx = row0 * rowWords + b * 4u + qt; let scBase = row0 * nb + b;"
+    : kind === "_q8" ? "let wBase = row0 * rowWords + b * 8u + qt * 2u; let scBase = row0 * nb + b;"
+    : "let off4 = row0 * rowWords + b * 8u + qt * 2u;";
+  const rowBlock = (r) => kind === "_q4" ? `if (full || row0 + ${r}u < dOut) {
+      let word = q4_qs[wIdx + ${r}u * rowWords];
+      let lo = vec4<f32>(f32(word & 0xFu), f32((word >> 8u) & 0xFu), f32((word >> 16u) & 0xFu), f32((word >> 24u) & 0xFu)) - vec4<f32>(8.0);
+      let hi = vec4<f32>(f32((word >> 4u) & 0xFu), f32((word >> 12u) & 0xFu), f32((word >> 20u) & 0xFu), f32((word >> 28u) & 0xFu)) - vec4<f32>(8.0);
+      let s = q4s(scBase + ${r}u * nb);
+      ${cols.map((m) => `a${r}_${m} += s * (dot(lo, xa${m}) + dot(hi, xb${m}));`).join(" ")}
+    }` : kind === "_q8" ? `if (full || row0 + ${r}u < dOut) {
+      let w0 = bitcast<i32>(q8_qs[wBase + ${r}u * rowWords]);
+      let w1 = bitcast<i32>(q8_qs[wBase + ${r}u * rowWords + 1u]);
+      let d0 = vec4<f32>(f32((w0 << 24u) >> 24u), f32((w0 << 16u) >> 24u), f32((w0 << 8u) >> 24u), f32(w0 >> 24u));
+      let d1 = vec4<f32>(f32((w1 << 24u) >> 24u), f32((w1 << 16u) >> 24u), f32((w1 << 8u) >> 24u), f32(w1 >> 24u));
+      let s = q8s(scBase + ${r}u * nb);
+      ${cols.map((m) => `a${r}_${m} += s * (dot(d0, xa${m}) + dot(d1, xb${m}));`).join(" ")}
+    }` : `if (full || row0 + ${r}u < dOut) {
+      let wa = mv_w4[off4 + ${r}u * rowWords]; let wb = mv_w4[off4 + ${r}u * rowWords + 1u];
+      ${cols.map((m) => `a${r}_${m} += dot(wa, xa${m}) + dot(wb, xb${m});`).join(" ")}
+    }`;
+  return `
+@compute @workgroup_size(${WGB})
 fn matvec${kind}_coop_b(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let t = lid.x;
   let qt = t & 3u;
   let bl = t >> 2u;
-  let dIn = ${kind === "" ? "mvb_shape" : "qb_shape"}.dIn;
-  let dOut = ${kind === "" ? "mvb_shape" : "qb_shape"}.dOut;
-  let xs4 = ${kind === "" ? "mvb_shape" : "qb_shape"}.xs4;
-  let ys = ${kind === "" ? "mvb_shape" : "qb_shape"}.ys;
+  let dIn = ${shp}.dIn;
+  let dOut = ${shp}.dOut;
+  let xs4 = ${shp}.xs4;
+  let ys = ${shp}.ys;
   let nb = dIn / 32u;
+  let rowWords = ${kind === "_q4" ? "dIn / 8u" : "dIn / 4u"};
   let row0 = wg.x * ${ROWS}u;
   let full = row0 + ${ROWS - 1}u < dOut;
-${Array.from({ length: 4 }, (_, m) => `  ${accDecl.replace(/acc(\d)/g, `acc$1_${m}`)}`).join("\n")}
-  for (var b: u32 = bl; b < nb; b += ${LANES}u) {
-${kind === "_q4" ? `    let wIdx0 = row0 * (dIn / 8u) + b * 4u + qt;
-    let scBase = row0 * nb + b;` : kind === "_q8" ? `    let wBase0 = row0 * (dIn / 4u) + b * 8u + qt * 2u;
-    let scBase = row0 * nb + b;` : `    let off40 = row0 * (dIn / 4u) + b * 8u + qt * 2u;`}
-${Array.from({ length: 4 }, (_, m) => kind === "_q4" ? `    {
-      let xlo = q4_x4[${m}u * xs4 + b * 8u + qt];
-      let xhi = q4_x4[${m}u * xs4 + b * 8u + qt + 4u];
-      if (full) {
-${Array.from({ length: ROWS }, (_, r) => `        acc${r}_${m} += q4_row(wIdx0 + ${r}u * (dIn / 8u), q4s(scBase + ${r}u * nb), xlo, xhi);`).join("\n")}
-      } else {
-${Array.from({ length: ROWS - 1 }, (_, r) => `        if (row0 + ${r}u < dOut) { acc${r}_${m} += q4_row(wIdx0 + ${r}u * (dIn / 8u), q4s(scBase + ${r}u * nb), xlo, xhi); }`).join("\n")}
-      }
-    }` : kind === "_q8" ? `    {
-      let xa = q8_x4[${m}u * xs4 + b * 8u + qt * 2u];
-      let xb = q8_x4[${m}u * xs4 + b * 8u + qt * 2u + 1u];
-      if (full) {
-${Array.from({ length: ROWS }, (_, r) => `        acc${r}_${m} += q8_row(wBase0 + ${r}u * (dIn / 4u), q8s(scBase + ${r}u * nb), xa, xb);`).join("\n")}
-      } else {
-${Array.from({ length: ROWS - 1 }, (_, r) => `        if (row0 + ${r}u < dOut) { acc${r}_${m} += q8_row(wBase0 + ${r}u * (dIn / 4u), q8s(scBase + ${r}u * nb), xa, xb); }`).join("\n")}
-      }
-    }` : `    {
-      let xa = mv_x4[${m}u * xs4 + b * 8u + qt * 2u];
-      let xb = mv_x4[${m}u * xs4 + b * 8u + qt * 2u + 1u];
-      if (full) {
-${Array.from({ length: ROWS }, (_, r) => `        acc${r}_${m} += mvf_row(off40 + ${r}u * (dIn / 4u), xa, xb);`).join("\n")}
-      } else {
-${Array.from({ length: ROWS - 1 }, (_, r) => `        if (row0 + ${r}u < dOut) { acc${r}_${m} += mvf_row(off40 + ${r}u * (dIn / 4u), xa, xb); }`).join("\n")}
-      }
-    }`).join("\n")}
+  ${rows.map((r) => cols.map((m) => `var a${r}_${m} = 0.0;`).join(" ")).join("\n  ")}
+  for (var b: u32 = bl; b < nb; b += ${LANESB}u) {
+    ${xLoads}
+    ${idx}
+    ${rows.map(rowBlock).join("\n    ")}
   }
-${Array.from({ length: 4 }, (_, m) => `
-${Array.from({ length: ROWS }, (_, r) => `  mvc_part[${r * WG}u + t] = acc${r}_${m};`).join("\n")}
+${[0, 1].map((h) => `
+  ${rows.map((r) => `mvb_part[${r * WGB}u + t] = a${r}_${2 * h}; mvb_part[${(ROWS + r) * WGB}u + t] = a${r}_${2 * h + 1};`).join(" ")}
   workgroupBarrier();
   {
-    var stride: u32 = ${WG / 2}u;
+    var stride: u32 = ${WGB / 2}u;
     while (stride > 0u) {
-      if (t < stride) {
-${Array.from({ length: ROWS }, (_, r) => `        mvc_part[${r * WG}u + t] += mvc_part[${r * WG}u + t + stride];`).join("\n")}
-      }
+      if (t < stride) { ${Array.from({ length: 2 * ROWS }, (_, k) => `mvb_part[${k * WGB}u + t] += mvb_part[${k * WGB}u + t + stride];`).join(" ")} }
       workgroupBarrier();
       stride = stride >> 1u;
     }
   }
-  if (t < ${ROWS}u) {
-    let row = row0 + t;
-    if (row < dOut) { ${kind === "" ? "mv_y" : kind === "_q8" ? "q8_y" : "q4_y"}[${m}u * ys + row] = mvc_part[t * ${WG}u]; }
+  if (t < ${2 * ROWS}u) {
+    let r = t % ${ROWS}u;
+    let m = ${2 * h}u + t / ${ROWS}u;
+    let row = row0 + r;
+    if (row < dOut) { ${ybuf}[m * ys + row] = mvb_part[t * ${WGB}u]; }
   }
-  workgroupBarrier();`).join("\n")}
-}`).join("\n")}
+  workgroupBarrier();`).join("")}
+}`;
+}).join("\n")}
 ${guAll}
 `;
 }
@@ -1404,10 +1492,12 @@ export async function autotuneCoop(device, { dIn = 5120, dOut = 17408, kind = "q
         device.queue.submit([enc.finish()]);
         return device.queue.onSubmittedWorkDone();
       };
-      await run(3);                       // warm up + compile
+      // warm up: GPUs ramp clocks under sustained load; short bursts measure the ramp
+      const tw = performance.now();
+      while (performance.now() - tw < (results.length ? 40 : 250)) await run(20);
       const t0 = performance.now();
-      await run(20);
-      results.push({ wg, rows, ms: (performance.now() - t0) / 20 });
+      await run(100);
+      results.push({ wg, rows, ms: (performance.now() - t0) / 100 });
     } catch { /* config not supported on this device; skip */ }
   }
   for (const b of [qs, sc, x, y]) b.destroy();
