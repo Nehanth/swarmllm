@@ -244,6 +244,8 @@ export class Qwen35Engine {
       matvec_q4: ["ro", "ro", "ro", "rw", "u"],
       matvec_coop: ["ro", "ro", "rw", "u"], matvec_q8_coop: ["ro", "ro", "ro", "rw", "u"],
       matvec_q4_coop: ["ro", "ro", "ro", "rw", "u"],
+      matvec_coop_b: ["ro", "ro", "rw", "u"], matvec_q8_coop_b: ["ro", "ro", "ro", "rw", "u"],
+      matvec_q4_coop_b: ["ro", "ro", "ro", "rw", "u"],
       rmsnorm: ["ro", "ro", "rw", "u"], head_norm: ["rw", "ro", "u"],
       attn_scores: ["ro", "ro", "rw"], attn_softmax: ["rw"],
       attn_out: ["ro", "ro", "rw"], silu_mul: ["rw", "ro"], add_res: ["rw", "ro"],
@@ -425,6 +427,12 @@ export class Qwen35Engine {
       this._shapes[key] = this._buf(new Uint32Array([dOut, dIn, 0, 0]), GPUBufferUsage.UNIFORM);
     return this._shapes[key];
   }
+  _shapeB(dOut, dIn, xs4, ys) {
+    const key = "b" + dOut + "," + dIn + "," + xs4 + "," + ys;
+    if (!this._shapes[key])
+      this._shapes[key] = this._buf(new Uint32Array([dOut, dIn, xs4, ys]), GPUBufferUsage.UNIFORM);
+    return this._shapes[key];
+  }
   _buf(data, usage) {
     const src = ArrayBuffer.isView(data) ? data : new Uint8Array(data);
     const size = Math.ceil(src.byteLength / 4) * 4;
@@ -555,6 +563,198 @@ export class Qwen35Engine {
     const out = Float32Array.from(new Float32Array(stageBuf.getMappedRange(), 0, n));
     stageBuf.unmap();
     return out;
+  }
+
+  // ---- batched prefill (4 prompt tokens per pass) ----
+  _bg2g0(pipe, resources) {
+    return this.device.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
+      entries: resources.map((r, i) => ({ binding: i, resource: r })),
+    });
+  }
+  _bg2res(pipe, resources) {
+    return this.device.createBindGroup({
+      layout: pipe.getBindGroupLayout(1),
+      entries: resources.map((r, i) => ({ binding: i, resource: r })),
+    });
+  }
+  _dCol(pass, name, col, bg, threads, wg = 64) {
+    pass.setPipeline(this.pipes[name]);
+    pass.setBindGroup(0, this.bgCommonB[col][name] || this.bgCommonFor[name]);
+    pass.setBindGroup(1, bg);
+    pass.dispatchWorkgroups(Math.ceil(threads / wg));
+  }
+
+  _initBatch() {
+    const D = this.dims;
+    const dev = this.device;
+    const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+    const al = (n) => Math.ceil(n * 4 / 256) * 256;
+    const mkB = (n) => ({ buf: dev.createBuffer({ size: 4 * al(n), usage: S }), stride: al(n), n });
+    const B = this.B = {
+      x: mkB(D.dim), xn: mkB(D.dim), tmpDim: mkB(D.dim), g: mkB(D.inter), u: mkB(D.inter),
+      qkv: mkB(D.convDim), convOut: mkB(D.convDim), z: mkB(D.dInner),
+      alpha: mkB(D.nVH), betaRaw: mkB(D.nVH), beta: mkB(D.nVH), decay: mkB(D.nVH),
+      dOut: mkB(D.dInner), gated: mkB(D.dInner),
+      qFull: mkB(D.nH * D.hd * 2), q: mkB(D.qDim), gAttn: mkB(D.qDim),
+      k: mkB(D.kvDim), v: mkB(D.kvDim), attnOut: mkB(D.qDim),
+    };
+    const slice = (b, c) => ({ buffer: b.buf, offset: c * b.stride, size: b.n * 4 });
+    const part = (b, c, off, size) => ({ buffer: b.buf, offset: c * b.stride + off, size });
+    this.frameBufsB = [0, 1, 2, 3].map(() => dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
+    const colPipes = ["rmsnorm", "head_norm", "attn_scores", "attn_softmax", "attn_out",
+      "silu_mul", "add_res", "rope_part", "qsplit", "sigmoid_mul",
+      "dn_gates", "dn_conv", "dn_l2", "dn_delta", "dn_gatenorm"];
+    this.bgCommonB = [0, 1, 2, 3].map((c) => {
+      const m = {};
+      for (const name of colPipes)
+        m[name] = this._bg2g0(this.pipes[name], [{ buffer: this.cfgBuf }, { buffer: this.frameBufsB[c] }]);
+      return m;
+    });
+    const mvB = (w, xB, yB, dOut, dIn) => {
+      const base = w.kind === "q8" ? "matvec_q8" : w.kind === "q4" ? "matvec_q4" : "matvec";
+      const pipe = base + "_coop_b";
+      const shp = this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4);
+      const bufs = w.kind === "f32" ? [w.buf, xB.buf, yB.buf, shp] : [w.qs, w.sc, xB.buf, yB.buf, shp];
+      return { pipe, wgs: Math.ceil(dOut / this.coopRows), bg: this._bg(this.pipes[pipe], 1, bufs) };
+    };
+    this.layerB = this.layers.map((L) => {
+      const bgNormC = (w, c) => this._bg2res(this.pipes.rmsnorm,
+        [slice(B.x, c), { buffer: w.buf }, slice(B.xn, c), { buffer: this.uDim }]);
+      const R = {
+        gateUp: [mvB(L.ffnGate, B.xn, B.g, D.inter, D.dim), mvB(L.ffnUp, B.xn, B.u, D.inter, D.dim)],
+        down: mvB(L.ffnDown, B.g, B.tmpDim, D.dim, D.inter),
+        cols: [0, 1, 2, 3].map((c) => ({
+          norm1: bgNormC(L.attnNorm, c),
+          norm2: bgNormC(L.postNorm, c),
+          addTmp: this._bg2res(this.pipes.add_res, [slice(B.x, c), slice(B.tmpDim, c)]),
+          silu: this._bg2res(this.pipes.silu_mul, [slice(B.g, c), slice(B.u, c)]),
+        })),
+      };
+      if (L.isFull) {
+        R.qkvOps = [mvB(L.wq, B.xn, B.qFull, D.nH * D.hd * 2, D.dim),
+          mvB(L.wk, B.xn, B.k, D.kvDim, D.dim), mvB(L.wv, B.xn, B.v, D.kvDim, D.dim)];
+        R.o = mvB(L.wo, B.attnOut, B.tmpDim, D.dim, D.qDim);
+        for (let c = 0; c < 4; c++) Object.assign(R.cols[c], {
+          qsplit: this._bg2res(this.pipes.qsplit, [slice(B.qFull, c), slice(B.q, c), slice(B.gAttn, c), { buffer: this.dnBuf }]),
+          qNorm: this._bg2res(this.pipes.head_norm, [slice(B.q, c), { buffer: L.qNorm.buf }, { buffer: this.uNH }]),
+          kNorm: this._bg2res(this.pipes.head_norm, [slice(B.k, c), { buffer: L.kNorm.buf }, { buffer: this.uNKV }]),
+          ropeQ: this._bg2res(this.pipes.rope_part, [slice(B.q, c), { buffer: this.uNH }, { buffer: this.dnBuf }]),
+          ropeK: this._bg2res(this.pipes.rope_part, [slice(B.k, c), { buffer: this.uNKV }, { buffer: this.dnBuf }]),
+          scores: this._bg2res(this.pipes.attn_scores, [slice(B.q, c), { buffer: L.kCache }, { buffer: this.scores }]),
+          softmax: this._bg2res(this.pipes.attn_softmax, [{ buffer: this.scores }]),
+          attnOut: this._bg2res(this.pipes.attn_out, [{ buffer: this.scores }, { buffer: L.vCache }, slice(B.attnOut, c)]),
+          sigMul: this._bg2res(this.pipes.sigmoid_mul, [slice(B.attnOut, c), slice(B.gAttn, c), { buffer: this.uQDim }]),
+        });
+      } else {
+        R.dnOps = [mvB(L.wqkv, B.xn, B.qkv, D.convDim, D.dim), mvB(L.wz, B.xn, B.z, D.dInner, D.dim),
+          mvB(L.wBeta, B.xn, B.betaRaw, D.nVH, D.dim), mvB(L.wAlpha, B.xn, B.alpha, D.nVH, D.dim)];
+        R.out = mvB(L.wOut, B.gated, B.tmpDim, D.dim, D.dInner);
+        for (let c = 0; c < 4; c++) Object.assign(R.cols[c], {
+          gates: this._bg2res(this.pipes.dn_gates, [slice(B.alpha, c), slice(B.betaRaw, c),
+            { buffer: L.dtBias }, { buffer: L.ssmA }, slice(B.beta, c), slice(B.decay, c), { buffer: this.dnBuf }]),
+          conv: this._bg2res(this.pipes.dn_conv, [slice(B.qkv, c), { buffer: L.convW },
+            { buffer: L.convState }, slice(B.convOut, c), { buffer: this.dnBuf }]),
+          l2q: this._bg2res(this.pipes.dn_l2, [part(B.convOut, c, 0, D.keyDim * 4),
+            { buffer: this.uNKH }, { buffer: this.dnBuf }]),
+          l2k: this._bg2res(this.pipes.dn_l2, [part(B.convOut, c, D.keyDim * 4, D.keyDim * 4),
+            { buffer: this.uNKH }, { buffer: this.dnBuf }]),
+          delta: this._bg2res(this.pipes.dn_delta, [part(B.convOut, c, 0, D.keyDim * 4),
+            part(B.convOut, c, D.keyDim * 4, D.keyDim * 4),
+            part(B.convOut, c, D.keyDim * 2 * 4, D.dInner * 4),
+            slice(B.beta, c), slice(B.decay, c), { buffer: L.S }, slice(B.dOut, c), { buffer: this.dnBuf }]),
+          gatenorm: this._bg2res(this.pipes.dn_gatenorm, [slice(B.dOut, c), slice(B.z, c),
+            { buffer: L.ssmNorm }, slice(B.gated, c), { buffer: this.dnBuf }]),
+        });
+      }
+      return R;
+    });
+  }
+
+  _encodeLayerBatch(enc, i, basePos) {
+    const D = this.dims, L = this.layers[i], LB = this.layerB[i], B = this.B;
+    if (L.isFull) {
+      {
+        const p = enc.beginComputePass();
+        for (let c = 0; c < 4; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm1, 256, 256);
+        for (const op of LB.qkvOps) this._dop(p, op);
+        for (let c = 0; c < 4; c++) {
+          const C = LB.cols[c];
+          this._dCol(p, "qsplit", c, C.qsplit, D.nH * D.hd);
+          this._dCol(p, "head_norm", c, C.qNorm, D.nH, 32);
+          this._dCol(p, "head_norm", c, C.kNorm, D.nKV, 32);
+          this._dCol(p, "rope_part", c, C.ropeQ, D.nH * D.nRot / 2);
+          this._dCol(p, "rope_part", c, C.ropeK, D.nKV * D.nRot / 2);
+        }
+        p.end();
+      }
+      for (let c = 0; c < 4; c++) {
+        enc.copyBufferToBuffer(B.k.buf, c * B.k.stride, L.kCache, (basePos + c) * D.kvDim * 4, D.kvDim * 4);
+        enc.copyBufferToBuffer(B.v.buf, c * B.v.stride, L.vCache, (basePos + c) * D.kvDim * 4, D.kvDim * 4);
+      }
+      {
+        const p = enc.beginComputePass();
+        for (let c = 0; c < 4; c++) {
+          const C = LB.cols[c];
+          this._dCol(p, "attn_scores", c, C.scores, D.nH * (basePos + c + 1));
+          this._dCol(p, "attn_softmax", c, C.softmax, D.nH, 1);
+          this._dCol(p, "attn_out", c, C.attnOut, D.qDim);
+          this._dCol(p, "sigmoid_mul", c, C.sigMul, D.qDim);
+        }
+        this._dop(p, LB.o);
+        for (let c = 0; c < 4; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
+        p.end();
+      }
+    } else {
+      const p = enc.beginComputePass();
+      for (let c = 0; c < 4; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm1, 256, 256);
+      for (const op of LB.dnOps) this._dop(p, op);
+      for (let c = 0; c < 4; c++) {   // recurrent state: columns strictly in order
+        const C = LB.cols[c];
+        this._dCol(p, "dn_gates", c, C.gates, D.nVH);
+        this._dCol(p, "dn_conv", c, C.conv, D.convDim);
+        this._dCol(p, "dn_l2", c, C.l2q, D.nKH, 32);
+        this._dCol(p, "dn_l2", c, C.l2k, D.nKH, 32);
+        this._dCol(p, "dn_delta", c, C.delta, D.nVH * 128, 128);
+        this._dCol(p, "dn_gatenorm", c, C.gatenorm, D.nVH * 128, 128);
+      }
+      this._dop(p, LB.out);
+      for (let c = 0; c < 4; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
+      p.end();
+    }
+    {
+      const p = enc.beginComputePass();
+      for (let c = 0; c < 4; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm2, 256, 256);
+      for (const op of LB.gateUp) this._dop(p, op);
+      for (let c = 0; c < 4; c++) this._dCol(p, "silu_mul", c, LB.cols[c].silu, D.inter);
+      this._dop(p, LB.down);
+      for (let c = 0; c < 4; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
+      p.end();
+    }
+  }
+
+  async prefillTokens(ids) {
+    if (!this.B) this._initBatch();
+    let i = 0, sinceSync = 0;
+    while (ids.length - i >= 4) {
+      const basePos = this.pos;
+      for (let c = 0; c < 4; c++) {
+        this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1]));
+        this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(ids[i + c]));
+      }
+      const enc = this.device.createCommandEncoder();
+      for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos);
+      enc.copyBufferToBuffer(this.B.x.buf, 3 * this.B.x.stride, this.x, 0, this.dims.dim * 4);
+      this.device.queue.submit([enc.finish()]);
+      this.pos += 4;
+      i += 4;
+      if (++sinceSync >= 4) { await this.device.queue.onSubmittedWorkDone(); sinceSync = 0; }
+    }
+    for (; i < ids.length; i++) {
+      await this.prefillToken(ids[i]);
+      if (i % 8 === 7) await this.device.queue.onSubmittedWorkDone();
+    }
+    await this.device.queue.onSubmittedWorkDone();
   }
 
   // prefill fast path: layers only, no head, no readback
