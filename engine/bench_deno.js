@@ -12,6 +12,8 @@ import { parseGGUFHeader, ggufWeights, qwen35Weights, tokenizerFromGGUF } from "
 const MODEL = Deno.env.get("MODEL") || "qwen";
 const TOKENS = +(Deno.env.get("TOKENS") || 32);
 const VARIANT = Deno.env.get("VARIANT") || "coop";
+const WG = +(Deno.env.get("WG") || 256);
+const ROWS = +(Deno.env.get("ROWS") || 4);
 
 const openFile = async (path) => {
   const fh = await Deno.open(path);
@@ -39,7 +41,7 @@ if (MODEL === "q38") {
   const weights = await qwen35Weights(G, (i) => readAt(i.byteOffset, i.byteLength),
     { lo: 0, hi: L, hasEmbed: true, hasHead: true });
   eng = await Qwen35Engine.create({ device, meta: G.meta, weights, layerRange: [0, L],
-    hasEmbed: true, hasHead: true, maxSeq: 512, matvecVariant: VARIANT });
+    hasEmbed: true, hasHead: true, maxSeq: 512, matvecVariant: VARIANT, coopWG: WG, coopRows: ROWS });
 } else {
   const readAt = await openFile(Deno.env.get("GGUF") || "qwen/model.gguf");
   const G = parseGGUFHeader((await readAt(0, 64 << 20)).buffer, { skipTokenizer: true });
@@ -49,7 +51,7 @@ if (MODEL === "q38") {
   const weights = await ggufWeights(G, (i) => readAt(i.byteOffset, i.byteLength),
     { lo: 0, hi: L, hasEmbed: true, hasHead: true });
   eng = await BelloEngine.create({ device, cfg, weights, layerRange: [0, L],
-    hasEmbed: true, hasHead: true, maxSeq: 512, matvecVariant: VARIANT });
+    hasEmbed: true, hasHead: true, maxSeq: 512, matvecVariant: VARIANT, coopWG: WG, coopRows: ROWS });
 }
 console.log(`load: ${((performance.now() - t0) / 1000).toFixed(1)}s  model=${MODEL} variant=${VARIANT}`);
 

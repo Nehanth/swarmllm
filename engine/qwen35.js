@@ -1,7 +1,7 @@
 // bello Qwen3.5/3.8 engine — hybrid Gated-DeltaNet + gated-attention WebGPU
 // inference, layer-shardable like BelloEngine. Golden reference: ref_q38.mjs
 // (validated line-by-line against llama.cpp eval-callback dumps).
-import { WGSL } from "./engine.js";
+import { WGSL, coopWGSL } from "./engine.js";
 
 const WGSL2 = /* wgsl */ `
 struct DN {
@@ -201,9 +201,10 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop" }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4 }) {
     this.device = device;
     this.mvVariant = matvecVariant;
+    this.coopWG = coopWG; this.coopRows = coopRows;
     const M = meta;
     const dim = M["qwen35.embedding_length"];
     const nH = M["qwen35.attention.head_count"];
@@ -230,7 +231,7 @@ export class Qwen35Engine {
     this.pos = 0;
 
     // ---- pipelines with explicit layouts ----
-    const mod = device.createShaderModule({ code: WGSL + WGSL2 });
+    const mod = device.createShaderModule({ code: WGSL + coopWGSL(coopWG, coopRows) + WGSL2 });
     const C = GPUShaderStage.COMPUTE;
     const layout0 = device.createBindGroupLayout({
       entries: [
@@ -330,7 +331,7 @@ export class Qwen35Engine {
       const base = w.kind === "q8" ? "matvec_q8" : w.kind === "q4" ? "matvec_q4" : "matvec";
       const pipe = coop ? base + "_coop" : base;
       const bufs = w.kind === "f32" ? [w.buf, x, y, this._shape(dOut, dIn)] : [w.qs, w.sc, x, y, this._shape(dOut, dIn)];
-      return { pipe, wgs: coop ? Math.ceil(dOut / 4) : Math.ceil(dOut / 64), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      return { pipe, wgs: coop ? Math.ceil(dOut / this.coopRows) : Math.ceil(dOut / 64), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
     this._mv = mv;
     const bgNorm = (x, w, y) => this._bg(this.pipes.rmsnorm, 1, [x, w.buf, y, this.uDim]);
