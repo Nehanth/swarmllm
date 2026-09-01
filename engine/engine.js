@@ -885,26 +885,35 @@ export class BelloEngine {
     return out;
   }
 
-  // host peer: full forward for one token -> logits
+  // host peer: full forward for one token -> logits.
+  // Whole token (all layers + head) is recorded into ONE command encoder and
+  // submitted once: per-submit validation/IPC used to cost ~67 submits/token.
   async forwardToken(tokenId, debugCapture) {
     const { dim, vocab } = this.dims;
     this._setFrame(this.pos, this.pos + 1);
     this._stageEmbed(tokenId);
-    for (let i = 0; i < this.layers.length; i++) {
-      const e2 = this.device.createCommandEncoder();
-      this._encodeLayer(e2, i);
-      this.device.queue.submit([e2.finish()]);
-      if (debugCapture)
+    if (debugCapture) {           // slow path: per-layer readback for tests
+      for (let i = 0; i < this.layers.length; i++) {
+        const e2 = this.device.createCommandEncoder();
+        this._encodeLayer(e2, i);
+        this.device.queue.submit([e2.finish()]);
         debugCapture[this.lo + i] = (await this._readback(this.x, this.stageX, dim)).slice(0, 8);
-    }
-    const e3 = this.device.createCommandEncoder();
-    {
+      }
+      const e3 = this.device.createCommandEncoder();
       const pass = e3.beginComputePass();
       this._dispatch(pass, "rmsnorm", this.bgFinalNorm, 256, 256);
       this._dispatchOp(pass, this.headOp);
       pass.end();
+      this.device.queue.submit([e3.finish()]);
+    } else {
+      const enc = this.device.createCommandEncoder();
+      for (let i = 0; i < this.layers.length; i++) this._encodeLayer(enc, i);
+      const pass = enc.beginComputePass();
+      this._dispatch(pass, "rmsnorm", this.bgFinalNorm, 256, 256);
+      this._dispatchOp(pass, this.headOp);
+      pass.end();
+      this.device.queue.submit([enc.finish()]);
     }
-    this.device.queue.submit([e3.finish()]);
     const logits = await this._readback(this.logits, this.stageLogits, vocab);
     this.pos++;
     return logits;

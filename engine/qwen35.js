@@ -592,9 +592,22 @@ export class Qwen35Engine {
     return await this._readback(this.logits, this.stageLogits, vocab);
   }
 
+  // Whole token in one encoder + one submit; no hidden-state readback between
+  // the last layer and the head (that round trip cost a full pipeline drain).
   async forwardToken(tokenId) {
-    const h = await this.embedRun(tokenId, this.pos);
-    const logits = await this.headFromHidden(h);
+    const { vocab } = this.dims;
+    this._setFrame(this.pos, this.pos + 1);
+    this.device.queue.writeBuffer(this.x, 0, this._embedRowF32(tokenId));
+    const enc = this.device.createCommandEncoder();
+    for (let i = 0; i < this.layers.length; i++) this._encodeLayer(enc, i);
+    {
+      const p = enc.beginComputePass();
+      this._d(p, "rmsnorm", this.bgFinalNorm, 256, 256);
+      this._dop(p, this.headOp);
+      p.end();
+    }
+    this.device.queue.submit([enc.finish()]);
+    const logits = await this._readback(this.logits, this.stageLogits, vocab);
     this.pos++;
     return logits;
   }
