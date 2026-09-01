@@ -546,6 +546,81 @@ ${reduce}
     if (row < q4_shape.dOut) { q4_y[row] = mvc_part[t * ${WG}u]; }
   }
 }
+
+// ---- batched (4-column) variants for prefill: each loaded weight word is
+// reused across 4 prompt tokens, so prefill reads the weights once per 4
+// tokens instead of once per token. x is [4][xs4] vec4s, y is [4][ys] f32s
+// (strides carried in BShape; slices are 256-byte aligned by the engine).
+// Column accumulation reuses the same 4-row register set per column and the
+// same shared-memory tree, one column at a time (keeps workgroup storage at
+// the portable minimum).
+struct BShape { dOut: u32, dIn: u32, xs4: u32, ys: u32 };
+@group(1) @binding(3) var<uniform> mvb_shape: BShape;
+@group(1) @binding(4) var<uniform> qb_shape: BShape;
+
+${["", "_q8", "_q4"].map((kind) => `
+@compute @workgroup_size(${WG})
+fn matvec${kind}_coop_b(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x;
+  let qt = t & 3u;
+  let bl = t >> 2u;
+  let dIn = ${kind === "" ? "mvb_shape" : "qb_shape"}.dIn;
+  let dOut = ${kind === "" ? "mvb_shape" : "qb_shape"}.dOut;
+  let xs4 = ${kind === "" ? "mvb_shape" : "qb_shape"}.xs4;
+  let ys = ${kind === "" ? "mvb_shape" : "qb_shape"}.ys;
+  let nb = dIn / 32u;
+  let row0 = wg.x * ${ROWS}u;
+  let full = row0 + ${ROWS - 1}u < dOut;
+${Array.from({ length: 4 }, (_, m) => `  ${accDecl.replace(/acc(\d)/g, `acc$1_${m}`)}`).join("\n")}
+  for (var b: u32 = bl; b < nb; b += ${LANES}u) {
+${kind === "_q4" ? `    let wIdx0 = row0 * (dIn / 8u) + b * 4u + qt;
+    let scBase = row0 * nb + b;` : kind === "_q8" ? `    let wBase0 = row0 * (dIn / 4u) + b * 8u + qt * 2u;
+    let scBase = row0 * nb + b;` : `    let off40 = row0 * (dIn / 4u) + b * 8u + qt * 2u;`}
+${Array.from({ length: 4 }, (_, m) => kind === "_q4" ? `    {
+      let xlo = q4_x4[${m}u * xs4 + b * 8u + qt];
+      let xhi = q4_x4[${m}u * xs4 + b * 8u + qt + 4u];
+      if (full) {
+${Array.from({ length: ROWS }, (_, r) => `        acc${r}_${m} += q4_row(wIdx0 + ${r}u * (dIn / 8u), q4_sc[scBase + ${r}u * nb], xlo, xhi);`).join("\n")}
+      } else {
+${Array.from({ length: ROWS - 1 }, (_, r) => `        if (row0 + ${r}u < dOut) { acc${r}_${m} += q4_row(wIdx0 + ${r}u * (dIn / 8u), q4_sc[scBase + ${r}u * nb], xlo, xhi); }`).join("\n")}
+      }
+    }` : kind === "_q8" ? `    {
+      let xa = q8_x4[${m}u * xs4 + b * 8u + qt * 2u];
+      let xb = q8_x4[${m}u * xs4 + b * 8u + qt * 2u + 1u];
+      if (full) {
+${Array.from({ length: ROWS }, (_, r) => `        acc${r}_${m} += q8_row(wBase0 + ${r}u * (dIn / 4u), q8_sc[scBase + ${r}u * nb], xa, xb);`).join("\n")}
+      } else {
+${Array.from({ length: ROWS - 1 }, (_, r) => `        if (row0 + ${r}u < dOut) { acc${r}_${m} += q8_row(wBase0 + ${r}u * (dIn / 4u), q8_sc[scBase + ${r}u * nb], xa, xb); }`).join("\n")}
+      }
+    }` : `    {
+      let xa = mv_x4[${m}u * xs4 + b * 8u + qt * 2u];
+      let xb = mv_x4[${m}u * xs4 + b * 8u + qt * 2u + 1u];
+      if (full) {
+${Array.from({ length: ROWS }, (_, r) => `        acc${r}_${m} += mvf_row(off40 + ${r}u * (dIn / 4u), xa, xb);`).join("\n")}
+      } else {
+${Array.from({ length: ROWS - 1 }, (_, r) => `        if (row0 + ${r}u < dOut) { acc${r}_${m} += mvf_row(off40 + ${r}u * (dIn / 4u), xa, xb); }`).join("\n")}
+      }
+    }`).join("\n")}
+  }
+${Array.from({ length: 4 }, (_, m) => `
+${Array.from({ length: ROWS }, (_, r) => `  mvc_part[${r * WG}u + t] = acc${r}_${m};`).join("\n")}
+  workgroupBarrier();
+  {
+    var stride: u32 = ${WG / 2}u;
+    while (stride > 0u) {
+      if (t < stride) {
+${Array.from({ length: ROWS }, (_, r) => `        mvc_part[${r * WG}u + t] += mvc_part[${r * WG}u + t + stride];`).join("\n")}
+      }
+      workgroupBarrier();
+      stride = stride >> 1u;
+    }
+  }
+  if (t < ${ROWS}u) {
+    let row = row0 + t;
+    if (row < dOut) { ${kind === "" ? "mv_y" : kind === "_q8" ? "q8_y" : "q4_y"}[${m}u * ys + row] = mvc_part[t * ${WG}u]; }
+  }
+  workgroupBarrier();`).join("\n")}
+}`).join("\n")}
 `;
 }
 
@@ -624,6 +699,8 @@ export class BelloEngine {
       matvec_q4: ["ro", "ro", "ro", "rw", "u"],
       matvec_coop: ["ro", "ro", "rw", "u"], matvec_q8_coop: ["ro", "ro", "ro", "rw", "u"],
       matvec_q4_coop: ["ro", "ro", "ro", "rw", "u"],
+      matvec_coop_b: ["ro", "ro", "rw", "u"], matvec_q8_coop_b: ["ro", "ro", "ro", "rw", "u"],
+      matvec_q4_coop_b: ["ro", "ro", "ro", "rw", "u"],
       rmsnorm: ["ro", "ro", "rw", "u"], head_norm: ["rw", "ro", "u"],
       rope: ["rw", "u"], attn_scores: ["ro", "ro", "rw"], attn_softmax: ["rw"],
       attn_out: ["ro", "ro", "rw"], silu_mul: ["rw", "ro"], add_res: ["rw", "ro"],
@@ -746,6 +823,13 @@ export class BelloEngine {
     const key = dOut + "," + dIn;
     if (!this._shapes[key])
       this._shapes[key] = this._buf(new Uint32Array([dOut, dIn, 0, 0]), GPUBufferUsage.UNIFORM);
+    return this._shapes[key];
+  }
+
+  _shapeB(dOut, dIn, xs4, ys) {
+    const key = "b" + dOut + "," + dIn + "," + xs4 + "," + ys;
+    if (!this._shapes[key])
+      this._shapes[key] = this._buf(new Uint32Array([dOut, dIn, xs4, ys]), GPUBufferUsage.UNIFORM);
     return this._shapes[key];
   }
 
@@ -899,6 +983,154 @@ export class BelloEngine {
     const logits = await this._readback(this.logits, this.stageLogits, vocab);
     this.pos++;
     return logits;
+  }
+
+  // ---- batched prefill (4 prompt tokens per pass; weights read once per 4) ----
+  _initBatch() {
+    const { dim, qDim, kvDim, inter, nH, nKV } = this.dims;
+    const dev = this.device;
+    const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+    const al = (n) => Math.ceil(n * 4 / 256) * 256;         // 256-aligned slice stride, bytes
+    const mkB = (n) => ({ buf: dev.createBuffer({ size: 4 * al(n), usage: S }), stride: al(n), n });
+    const B = this.B = {
+      x: mkB(dim), xn: mkB(dim), q: mkB(qDim), k: mkB(kvDim), v: mkB(kvDim),
+      attnOut: mkB(qDim), tmpDim: mkB(dim), g: mkB(inter), u: mkB(inter),
+    };
+    const slice = (b, c) => ({ buffer: b.buf, offset: c * b.stride, size: b.n * 4 });
+    this._bslice = slice;
+    // per-column frame uniforms + per-column group0 for the per-token kernels
+    this.frameBufsB = [0, 1, 2, 3].map(() => dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
+    const colPipes = ["rmsnorm", "head_norm", "rope", "attn_scores", "attn_softmax", "attn_out", "silu_mul", "add_res"];
+    this.bgCommonB = [0, 1, 2, 3].map((c) => {
+      const m = {};
+      for (const name of colPipes)
+        m[name] = this._bg2g0(this.pipes[name], [{ buffer: this.cfgBuf }, { buffer: this.frameBufsB[c] }]);
+      return m;
+    });
+    // batched matvec op builder: whole B-buffers bound, strides in the uniform
+    const mvB = (w, xB, yB, dOut, dIn) => {
+      const base = w.kind === "q8" ? "matvec_q8" : w.kind === "q4" ? "matvec_q4" : "matvec";
+      const pipe = base + "_coop_b";
+      const shp = this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4);
+      const bufs = w.kind === "f32" ? [w.buf, xB.buf, yB.buf, shp] : [w.qs, w.sc, xB.buf, yB.buf, shp];
+      return { pipe, wgs: Math.ceil(dOut / this.coopRows), bg: this._bg(this.pipes[pipe], 1, bufs) };
+    };
+    // per-layer batched resources
+    this.layerB = this.layers.map((L) => {
+      const bgNormC = (xB, w, yB, c) => this._bg2res(this.pipes.rmsnorm,
+        [slice(xB, c), { buffer: w.buf }, slice(yB, c), { buffer: this.nBufDim }]);
+      return {
+        qkv: [mvB(L.wq, B.xn, B.q, qDim, dim), mvB(L.wk, B.xn, B.k, kvDim, dim), mvB(L.wv, B.xn, B.v, kvDim, dim)],
+        o: mvB(L.wo, B.attnOut, B.tmpDim, dim, qDim),
+        gateUp: [mvB(L.wgate, B.xn, B.g, inter, dim), mvB(L.wup, B.xn, B.u, inter, dim)],
+        down: mvB(L.wdown, B.g, B.tmpDim, dim, inter),
+        cols: [0, 1, 2, 3].map((c) => ({
+          norm1: bgNormC(B.x, L.inNorm, B.xn, c),
+          norm2: bgNormC(B.x, L.postNorm, B.xn, c),
+          qNorm: L.qNorm ? this._bg2res(this.pipes.head_norm, [slice(B.q, c), { buffer: L.qNorm.buf }, { buffer: this.nHBuf }]) : null,
+          kNorm: L.kNorm ? this._bg2res(this.pipes.head_norm, [slice(B.k, c), { buffer: L.kNorm.buf }, { buffer: this.nKVBuf }]) : null,
+          ropeQ: this._bg2res(this.pipes.rope, [slice(B.q, c), { buffer: this.nHBuf }]),
+          ropeK: this._bg2res(this.pipes.rope, [slice(B.k, c), { buffer: this.nKVBuf }]),
+          scores: this._bg2res(this.pipes.attn_scores, [slice(B.q, c), { buffer: L.kCache }, { buffer: this.scores }]),
+          softmax: this._bg2res(this.pipes.attn_softmax, [{ buffer: this.scores }]),
+          attnOut: this._bg2res(this.pipes.attn_out, [{ buffer: this.scores }, { buffer: L.vCache }, slice(B.attnOut, c)]),
+          addTmp: this._bg2res(this.pipes.add_res, [slice(B.x, c), slice(B.tmpDim, c)]),
+          silu: this._bg2res(this.pipes.silu_mul, [slice(B.g, c), slice(B.u, c)]),
+        })),
+      };
+    });
+  }
+
+  _bg2g0(pipe, resources) {
+    return this.device.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
+      entries: resources.map((r, i) => ({ binding: i, resource: r })),
+    });
+  }
+  _bg2res(pipe, resources) {
+    return this.device.createBindGroup({
+      layout: pipe.getBindGroupLayout(1),
+      entries: resources.map((r, i) => ({ binding: i, resource: r })),
+    });
+  }
+  _dCol(pass, name, col, bg, threads, wgSize = 64) {
+    pass.setPipeline(this.pipes[name]);
+    pass.setBindGroup(0, this.bgCommonB[col][name]);
+    pass.setBindGroup(1, bg);
+    pass.dispatchWorkgroups(Math.ceil(threads / wgSize));
+  }
+
+  _encodeLayerBatch(enc, i, basePos) {
+    const { qDim, nH, nKV, headDim, kvDim, inter, dim } = this.dims;
+    const L = this.layers[i], LB = this.layerB[i], B = this.B;
+    {
+      const pass = enc.beginComputePass();
+      for (let c = 0; c < 4; c++) this._dCol(pass, "rmsnorm", c, LB.cols[c].norm1, 256, 256);
+      for (const op of LB.qkv) this._dispatchOp(pass, op);
+      for (let c = 0; c < 4; c++) {
+        const C = LB.cols[c];
+        if (C.qNorm) this._dCol(pass, "head_norm", c, C.qNorm, nH, 32);
+        if (C.kNorm) this._dCol(pass, "head_norm", c, C.kNorm, nKV, 32);
+        this._dCol(pass, "rope", c, C.ropeQ, nH * headDim / 2);
+        this._dCol(pass, "rope", c, C.ropeK, nKV * headDim / 2);
+      }
+      pass.end();
+    }
+    for (let c = 0; c < 4; c++) {
+      enc.copyBufferToBuffer(B.k.buf, c * B.k.stride, L.kCache, (basePos + c) * kvDim * 4, kvDim * 4);
+      enc.copyBufferToBuffer(B.v.buf, c * B.v.stride, L.vCache, (basePos + c) * kvDim * 4, kvDim * 4);
+    }
+    {
+      const pass = enc.beginComputePass();
+      for (let c = 0; c < 4; c++) {
+        const C = LB.cols[c];
+        this._dCol(pass, "attn_scores", c, C.scores, nH * (basePos + c + 1));
+        this._dCol(pass, "attn_softmax", c, C.softmax, nH, 1);
+        this._dCol(pass, "attn_out", c, C.attnOut, qDim);
+      }
+      this._dispatchOp(pass, LB.o);
+      for (let c = 0; c < 4; c++) this._dCol(pass, "add_res", c, LB.cols[c].addTmp, dim);
+      for (let c = 0; c < 4; c++) this._dCol(pass, "rmsnorm", c, LB.cols[c].norm2, 256, 256);
+      for (const op of LB.gateUp) this._dispatchOp(pass, op);
+      for (let c = 0; c < 4; c++) this._dCol(pass, "silu_mul", c, LB.cols[c].silu, inter);
+      this._dispatchOp(pass, LB.down);
+      for (let c = 0; c < 4; c++) this._dCol(pass, "add_res", c, LB.cols[c].addTmp, dim);
+      pass.end();
+    }
+  }
+
+  // consume prompt tokens (no logits): chunks of 4 through the batched path,
+  // remainder through the single-token fast path.
+  async prefillTokens(ids) {
+    if (!this.B && this.hasEmbed) this._initBatch();
+    let i = 0;
+    let sinceSync = 0;
+    while (this.B && ids.length - i >= 4) {
+      const basePos = this.pos;
+      for (let c = 0; c < 4; c++) {
+        this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1]));
+        if (this.embedGPU) {
+          const enc0 = this.device.createCommandEncoder();
+          enc0.copyBufferToBuffer(this.embedGPU, ids[i + c] * this.dims.dim * 4, this.B.x.buf, c * this.B.x.stride, this.dims.dim * 4);
+          this.device.queue.submit([enc0.finish()]);
+        } else {
+          this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(ids[i + c]));
+        }
+      }
+      const enc = this.device.createCommandEncoder();
+      for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos);
+      // hidden of the last column becomes the running x for any tail tokens
+      enc.copyBufferToBuffer(this.B.x.buf, 3 * this.B.x.stride, this.x, 0, this.dims.dim * 4);
+      this.device.queue.submit([enc.finish()]);
+      this.pos += 4;
+      i += 4;
+      if (++sinceSync >= 4) { await this.device.queue.onSubmittedWorkDone(); sinceSync = 0; }
+    }
+    for (; i < ids.length; i++) {
+      await this.prefillToken(ids[i]);
+      if (i % 8 === 7) await this.device.queue.onSubmittedWorkDone();
+    }
+    await this.device.queue.onSubmittedWorkDone();
   }
 
   // prefill fast path: run the layers for a prompt token, skip head + readback
