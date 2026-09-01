@@ -10,6 +10,24 @@ export const GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8;
 export const QK8_0 = 32;                 // elems per Q8_0 block
 export const Q8_0_BLOCK_BYTES = 34;      // f16 scale + 32 int8
 
+export function f32ToF16(v) {
+  // IEEE f32 -> f16 bits (round-to-nearest via the standard bit trick)
+  const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+  f32[0] = v;
+  const x = u32[0];
+  const sign = (x >>> 16) & 0x8000;
+  let e = (x >>> 23) & 0xff, m = x & 0x7fffff;
+  if (e === 0xff) return sign | 0x7c00 | (m ? 0x200 : 0);
+  e = e - 127 + 15;
+  if (e >= 0x1f) return sign | 0x7c00;
+  if (e <= 0) {
+    if (e < -10) return sign;
+    m = (m | 0x800000) >> (1 - e);
+    return sign | ((m + 0x1000) >> 13);
+  }
+  return sign | (e << 10) | ((m + 0x1000) >> 13);
+}
+
 export function f16ToF32(h) {
   const s = (h & 0x8000) ? -1 : 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
   if (e === 0) return s * m * 2 ** -24;
@@ -124,10 +142,11 @@ export function q8Repack(info, bytes) {
   const n = info.nElems;
   const nb = n / QK8_0;
   const qs = new Uint8Array(n);
-  const scales = new Float32Array(nb);
+  const scales = new Uint32Array(Math.ceil(nb / 2));   // raw f16 scales, 2 per word
+  const sc16 = new Uint16Array(scales.buffer);
   for (let b = 0; b < nb; b++) {
     const base = b * Q8_0_BLOCK_BYTES;
-    scales[b] = f16ToF32(bytes[base] | (bytes[base + 1] << 8));
+    sc16[b] = bytes[base] | (bytes[base + 1] << 8);
     qs.set(bytes.subarray(base + 2, base + 2 + QK8_0), b * QK8_0);
   }
   return { qs, scales };
@@ -189,7 +208,8 @@ export function requantQ8Streaming(info, bytes) {
   const rowBytes = ggmlTypeBytes(info.ggmlType, cols);
   const n = rows * cols;
   const qs = new Uint8Array(n);
-  const scales = new Float32Array(n / 32);
+  const scales = new Uint32Array(Math.ceil(n / 32 / 2));
+  const sc16 = new Uint16Array(scales.buffer);
   const CH = Math.max(1, Math.floor((8 * 2 ** 20) / (cols * 4))); // ~8MB f32 per chunk
   for (let r0 = 0; r0 < rows; r0 += CH) {
     const rc = Math.min(CH, rows - r0);
@@ -198,7 +218,8 @@ export function requantQ8Streaming(info, bytes) {
     const f = dequantF32(sub, view);
     const q = quantizeQ8(f);
     qs.set(q.qs, r0 * cols);
-    scales.set(q.scales, (r0 * cols) / 32);
+    const nbChunk = (rc * cols) / 32;
+    sc16.set(new Uint16Array(q.scales.buffer, 0, nbChunk), (r0 * cols) / 32);
   }
   return { qs, scales };
 }
@@ -366,10 +387,11 @@ export function q4Repack(info, bytes) {
   const n = info.nElems;
   const nb = n / 32;
   const qs = new Uint8Array(n / 2);
-  const scales = new Float32Array(nb);
+  const scales = new Uint32Array(Math.ceil(nb / 2));   // raw f16 scales, 2 per word
+  const sc16 = new Uint16Array(scales.buffer);
   for (let b = 0; b < nb; b++) {
     const base = b * 18;
-    scales[b] = f16ToF32(bytes[base] | (bytes[base + 1] << 8));
+    sc16[b] = bytes[base] | (bytes[base + 1] << 8);
     qs.set(bytes.subarray(base + 2, base + 18), b * 16);
   }
   return { qs, scales };
@@ -381,12 +403,14 @@ export function quantizeQ8(data) {
   const n = data.length;
   const nb = Math.ceil(n / 32);
   const qs = new Uint8Array(nb * 32);
-  const scales = new Float32Array(nb);
+  const scales = new Uint32Array(Math.ceil(nb / 2));   // packed f16, like the GGUF format itself
+  const sc16 = new Uint16Array(scales.buffer);
   for (let b = 0; b < nb; b++) {
     let amax = 0;
     for (let i = b * 32; i < Math.min(n, b * 32 + 32); i++) amax = Math.max(amax, Math.abs(data[i]));
-    const d = amax / 127 || 1;
-    scales[b] = d;
+    const h = f32ToF16(amax / 127 || 1);
+    sc16[b] = h;
+    const d = f16ToF32(h) || 1;
     for (let i = b * 32; i < Math.min(n, b * 32 + 32); i++)
       qs[i] = Math.max(-127, Math.min(127, Math.round(data[i] / d))) & 0xFF;
   }
@@ -504,19 +528,19 @@ export async function streamEntryToGPU(device, info, openRange, { pace = 0, stag
   const nb = info.nElems / 32;
   device.pushErrorScope("out-of-memory");
   const qsBuf = device.createBuffer({ size: Math.ceil(nb * QSB / 4) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
-  const scBuf = device.createBuffer({ size: nb * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  const scBuf = device.createBuffer({ size: Math.ceil(nb / 2) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
   const oom = await device.popErrorScope();
   if (oom) throw new Error(`GPU out of memory while allocating ${info.name} (${(info.byteLength / 2 ** 20).toFixed(0)} MB): this device pledged more than its GPU can hold`);
   const blocksPerFlush = Math.max(1, Math.floor(staging / QSB));
   const qsStage = new Uint8Array(blocksPerFlush * QSB);
-  const scStage = new Float32Array(blocksPerFlush);
+  const scStage = new Uint16Array(blocksPerFlush);   // raw f16 scales
   let staged = 0, block = 0;
   const flush = async () => {
     if (!staged) return;
     const first = block - staged;
     // byte views only: WebKit and Chrome disagree on element-vs-byte sizes for typed arrays
     device.queue.writeBuffer(qsBuf, first * QSB, qsStage.buffer, 0, staged * QSB);
-    device.queue.writeBuffer(scBuf, first * 4, scStage.buffer, 0, staged * 4);
+    device.queue.writeBuffer(scBuf, first * 2, scStage.buffer, 0, staged * 2);
     staged = 0;
     await new Promise((r) => setTimeout(r, 0));      // let WebKit hand the copy to the GPU process before we make more
   };
@@ -532,7 +556,7 @@ export async function streamEntryToGPU(device, info, openRange, { pace = 0, stag
     const whole = Math.floor(buf.length / BLK);
     for (let b = 0; b < whole; b++) {
       const base = b * BLK;
-      scStage[staged] = f16ToF32(buf[base] | (buf[base + 1] << 8));
+      scStage[staged] = buf[base] | (buf[base + 1] << 8);
       qsStage.set(buf.subarray(base + 2, base + BLK), staged * QSB);
       staged++; block++;
       if (staged === blocksPerFlush) await flush();

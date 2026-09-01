@@ -19,7 +19,7 @@ for (const [name, info] of Object.entries(G.tensors)) {
   const ref = (info.ggmlType === GGML_Q4_0 ? q4Repack : q8Repack)(info, await slice(info));
   const e = await streamEntryToGPU(device, info, openRange, { staging: 1 << 20 });
   const qs = await readBack(e.gpu.qs, ref.qs.byteLength);
-  const sc = new Float32Array((await readBack(e.gpu.sc, ref.scales.byteLength)).buffer);
+  const sc = new Uint32Array((await readBack(e.gpu.sc, ref.scales.byteLength)).buffer);
   let bad = 0; for (let i = 0; i < ref.qs.length; i++) if (qs[i] !== ref.qs[i]) { bad++; break; }
   for (let i = 0; i < ref.scales.length; i++) if (sc[i] !== ref.scales[i]) { bad++; break; }
   if (bad) { console.log("MISMATCH", name); Deno.exit(1); }

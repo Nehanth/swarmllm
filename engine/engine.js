@@ -1,5 +1,5 @@
 // bello engine — WebGPU Llama-architecture inference, layer-shardable.
-import { quantizeQ8 } from "./gguf.js";
+import { quantizeQ8, f16ToF32, f32ToF16 } from "./gguf.js";
 // Runs identically in browsers and Deno. The golden reference is ref.js.
 //
 // Sharding model: an engine instance owns layers [lo, hi). The host peer also
@@ -190,7 +190,8 @@ fn matvec(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // --- matvec_q8: y = W x with W in Q8_0 (int8 + per-32-block f32 scale) ---
 @group(1) @binding(0) var<storage, read> q8_qs: array<u32>;   // int8s packed 4/word
-@group(1) @binding(1) var<storage, read> q8_sc: array<f32>;   // scale per 32-block
+@group(1) @binding(1) var<storage, read> q8_sc: array<u32>;   // f16 scales, 2 per word
+fn q8s(i: u32) -> f32 { return unpack2x16float(q8_sc[i >> 1u])[i & 1u]; }
 @group(1) @binding(2) var<storage, read> q8_x: array<f32>;
 @group(1) @binding(3) var<storage, read_write> q8_y: array<f32>;
 @group(1) @binding(4) var<uniform> q8_shape: Shape;
@@ -215,7 +216,7 @@ fn matvec_q8(@builtin(global_invocation_id) gid: vec3<u32>) {
            + f32(extractBits(word, 16u, 8u)) * q8_x[x0 + 2u]
            + f32(extractBits(word, 24u, 8u)) * q8_x[x0 + 3u];
     }
-    acc += q8_sc[rowSc + b] * sum;
+    acc += q8s(rowSc + b) * sum;
   }
   q8_y[r] = acc;
 }
@@ -239,7 +240,8 @@ fn head_norm(@builtin(global_invocation_id) gid: vec3<u32>) {
 // --- matvec_q4: y = W x with W in Q4_0 (packed nibbles + per-32-block f32 scale) ---
 // nibble layout per block: byte j holds elem j (low nibble) and elem j+16 (high)
 @group(1) @binding(0) var<storage, read> q4_qs: array<u32>;
-@group(1) @binding(1) var<storage, read> q4_sc: array<f32>;
+@group(1) @binding(1) var<storage, read> q4_sc: array<u32>;   // f16 scales, 2 per word
+fn q4s(i: u32) -> f32 { return unpack2x16float(q4_sc[i >> 1u])[i & 1u]; }
 @group(1) @binding(2) var<storage, read> q4_x: array<f32>;
 @group(1) @binding(3) var<storage, read_write> q4_y: array<f32>;
 @group(1) @binding(4) var<uniform> q4_shape: Shape;
@@ -268,7 +270,7 @@ fn matvec_q4(@builtin(global_invocation_id) gid: vec3<u32>) {
            + (f32(extractBits(word, 24u, 4u)) - 8.0) * q4_x[j + 3u]
            + (f32(extractBits(word, 28u, 4u)) - 8.0) * q4_x[j + 19u];
     }
-    acc += q4_sc[rowSc + b] * sum;
+    acc += q4s(rowSc + b) * sum;
   }
   q4_y[r] = acc;
 }
@@ -497,9 +499,9 @@ fn matvec_q8_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocatio
     let wBase = row0 * rowWords + b * 8u + qt * 2u;
     let scBase = row0 * nb + b;
     if (full) {
-${fullBody((r) => `q8_row(wBase + ${r}u * rowWords, q8_sc[scBase + ${r}u * nb], xa, xb)`)}
+${fullBody((r) => `q8_row(wBase + ${r}u * rowWords, q8s(scBase + ${r}u * nb), xa, xb)`)}
     } else {
-${tailBody((r) => `q8_row(wBase + ${r}u * rowWords, q8_sc[scBase + ${r}u * nb], xa, xb)`, "q8_shape.dOut")}
+${tailBody((r) => `q8_row(wBase + ${r}u * rowWords, q8s(scBase + ${r}u * nb), xa, xb)`, "q8_shape.dOut")}
     }
   }
 ${reduce}
@@ -535,9 +537,9 @@ fn matvec_q4_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocatio
     let wIdx = row0 * rowWords + b * 4u + qt;
     let scBase = row0 * nb + b;
     if (full) {
-${fullBody((r) => `q4_row(wIdx + ${r}u * rowWords, q4_sc[scBase + ${r}u * nb], xlo, xhi)`)}
+${fullBody((r) => `q4_row(wIdx + ${r}u * rowWords, q4s(scBase + ${r}u * nb), xlo, xhi)`)}
     } else {
-${tailBody((r) => `q4_row(wIdx + ${r}u * rowWords, q4_sc[scBase + ${r}u * nb], xlo, xhi)`, "q4_shape.dOut")}
+${tailBody((r) => `q4_row(wIdx + ${r}u * rowWords, q4s(scBase + ${r}u * nb), xlo, xhi)`, "q4_shape.dOut")}
     }
   }
 ${reduce}
@@ -580,17 +582,17 @@ ${Array.from({ length: 4 }, (_, m) => kind === "_q4" ? `    {
       let xlo = q4_x4[${m}u * xs4 + b * 8u + qt];
       let xhi = q4_x4[${m}u * xs4 + b * 8u + qt + 4u];
       if (full) {
-${Array.from({ length: ROWS }, (_, r) => `        acc${r}_${m} += q4_row(wIdx0 + ${r}u * (dIn / 8u), q4_sc[scBase + ${r}u * nb], xlo, xhi);`).join("\n")}
+${Array.from({ length: ROWS }, (_, r) => `        acc${r}_${m} += q4_row(wIdx0 + ${r}u * (dIn / 8u), q4s(scBase + ${r}u * nb), xlo, xhi);`).join("\n")}
       } else {
-${Array.from({ length: ROWS - 1 }, (_, r) => `        if (row0 + ${r}u < dOut) { acc${r}_${m} += q4_row(wIdx0 + ${r}u * (dIn / 8u), q4_sc[scBase + ${r}u * nb], xlo, xhi); }`).join("\n")}
+${Array.from({ length: ROWS - 1 }, (_, r) => `        if (row0 + ${r}u < dOut) { acc${r}_${m} += q4_row(wIdx0 + ${r}u * (dIn / 8u), q4s(scBase + ${r}u * nb), xlo, xhi); }`).join("\n")}
       }
     }` : kind === "_q8" ? `    {
       let xa = q8_x4[${m}u * xs4 + b * 8u + qt * 2u];
       let xb = q8_x4[${m}u * xs4 + b * 8u + qt * 2u + 1u];
       if (full) {
-${Array.from({ length: ROWS }, (_, r) => `        acc${r}_${m} += q8_row(wBase0 + ${r}u * (dIn / 4u), q8_sc[scBase + ${r}u * nb], xa, xb);`).join("\n")}
+${Array.from({ length: ROWS }, (_, r) => `        acc${r}_${m} += q8_row(wBase0 + ${r}u * (dIn / 4u), q8s(scBase + ${r}u * nb), xa, xb);`).join("\n")}
       } else {
-${Array.from({ length: ROWS - 1 }, (_, r) => `        if (row0 + ${r}u < dOut) { acc${r}_${m} += q8_row(wBase0 + ${r}u * (dIn / 4u), q8_sc[scBase + ${r}u * nb], xa, xb); }`).join("\n")}
+${Array.from({ length: ROWS - 1 }, (_, r) => `        if (row0 + ${r}u < dOut) { acc${r}_${m} += q8_row(wBase0 + ${r}u * (dIn / 4u), q8s(scBase + ${r}u * nb), xa, xb); }`).join("\n")}
       }
     }` : `    {
       let xa = mv_x4[${m}u * xs4 + b * 8u + qt * 2u];
@@ -913,7 +915,8 @@ export class BelloEngine {
     const out = new Float32Array(dim);
     const rowB = id * nb;
     for (let b = 0; b < nb; b++) {
-      const s = e.scales[rowB + b];
+      const si = rowB + b;
+      const s = f16ToF32((e.scales[si >> 1] >>> ((si & 1) * 16)) & 0xFFFF);
       if (e.kind === "q4") {
         const qBase = (rowB + b) * 16;
         for (let j = 0; j < 16; j++) {
@@ -1243,14 +1246,16 @@ export function argmax(a) {
 export function quantizeQ4(data) {
   const n = data.length, nb = Math.ceil(n / 32);
   const qs = new Uint8Array(nb * 16);
-  const scales = new Float32Array(nb);
+  const scales = new Uint32Array(Math.ceil(nb / 2));
+  const sc16 = new Uint16Array(scales.buffer);
   for (let b = 0; b < nb; b++) {
     let amax = 0, maxv = 0;
     for (let i = b * 32; i < Math.min(n, b * 32 + 32); i++) {
       if (Math.abs(data[i]) > amax) { amax = Math.abs(data[i]); maxv = data[i]; }
     }
-    const d = maxv / -8 || 1;
-    scales[b] = d;
+    const h = f32ToF16(maxv / -8 || 1);
+    sc16[b] = h;
+    const d = f16ToF32(h);
     for (let j = 0; j < 16; j++) {
       const lo = Math.max(0, Math.min(15, Math.round((data[b * 32 + j] || 0) / d) + 8));
       const hi = Math.max(0, Math.min(15, Math.round((data[b * 32 + j + 16] || 0) / d) + 8));
@@ -1259,18 +1264,19 @@ export function quantizeQ4(data) {
   }
   return { qs, scales };
 }
+const scOf = (q, b) => f16ToF32((q.scales[b >> 1] >>> ((b & 1) * 16)) & 0xFFFF);
 function dequantQ4(q, n) {
   const out = new Float32Array(n);
   for (let b = 0; b < n / 32; b++) for (let j = 0; j < 16; j++) {
     const byte = q.qs[b * 16 + j];
-    out[b * 32 + j] = q.scales[b] * ((byte & 0xF) - 8);
-    out[b * 32 + j + 16] = q.scales[b] * ((byte >> 4) - 8);
+    out[b * 32 + j] = scOf(q, b) * ((byte & 0xF) - 8);
+    out[b * 32 + j + 16] = scOf(q, b) * ((byte >> 4) - 8);
   }
   return out;
 }
 function dequantQ8(q, n) {
   const out = new Float32Array(n);
-  for (let i = 0; i < n; i++) { const v = q.qs[i]; out[i] = q.scales[(i / 32) | 0] * (v > 127 ? v - 256 : v); }
+  for (let i = 0; i < n; i++) { const v = q.qs[i]; out[i] = scOf(q, (i / 32) | 0) * (v > 127 ? v - 256 : v); }
   return out;
 }
 

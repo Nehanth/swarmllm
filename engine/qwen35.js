@@ -2,6 +2,7 @@
 // inference, layer-shardable like BelloEngine. Golden reference: ref_q38.mjs
 // (validated line-by-line against llama.cpp eval-callback dumps).
 import { WGSL, coopWGSL } from "./engine.js";
+import { f16ToF32 } from "./gguf.js";
 
 const WGSL2 = /* wgsl */ `
 struct DN {
@@ -538,7 +539,8 @@ export class Qwen35Engine {
     const out = new Float32Array(dim);
     const rowB = id * nb;
     for (let b = 0; b < nb; b++) {
-      const s = e.scales[rowB + b];
+      const si = rowB + b;
+      const s = f16ToF32((e.scales[si >> 1] >>> ((si & 1) * 16)) & 0xFFFF);
       if (e.kind === "q4") {
         const qBase = (rowB + b) * 16;
         for (let j = 0; j < 16; j++) {
