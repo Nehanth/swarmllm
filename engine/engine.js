@@ -926,6 +926,20 @@ export class BelloEngine {
     return logits;
   }
 
+  // prefill fast path: run the layers for a prompt token, skip head + readback
+  // (the head is ~11% of the weight traffic and the logits go unused).
+  async prefillToken(tokenId) {
+    this._setFrame(this.pos, this.pos + 1);
+    this._stageEmbed(tokenId);
+    const enc = this.device.createCommandEncoder();
+    for (let i = 0; i < this.layers.length; i++) this._encodeLayer(enc, i);
+    this.device.queue.submit([enc.finish()]);
+    this.pos++;
+    // fire-and-forget: the queue is ordered, so later work sees this token's
+    // caches. Callers apply backpressure every few tokens via
+    // device.queue.onSubmittedWorkDone() to bound queued work.
+  }
+
   // host peer, split mode: embed + local layers -> hidden for next peer
   async embedRun(tokenId, pos) {
     const { dim } = this.dims;

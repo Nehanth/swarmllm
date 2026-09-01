@@ -1287,8 +1287,16 @@ function aiMaybeReady() {
 }
 
 // run one token through the whole pipeline, returns logits
-async function aiPipeToken(id) {
+async function aiPipeToken(id, needLogits = true) {
   const pos = ai.pos;
+  if (!ai.chain.length && !needLogits) {
+    // solo prefill: layers only, no head, no readback; sync every 8 tokens
+    ai.engine.pos = pos;
+    await ai.engine.prefillToken(id);
+    if (pos % 8 === 7) await ai.device.queue.onSubmittedWorkDone();
+    ai.pos++;
+    return null;
+  }
   let h = await ai.engine.embedRun(id, pos);
   if (badF32(h)) throw new Error(`NaN after HOST layers (pos ${pos}) — host GPU kernel issue`);
   if (ai.chain.length) {
@@ -1300,6 +1308,7 @@ async function aiPipeToken(id) {
     h = await returned;
     if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos}) — check peer status lines`);
   } // solo mode: engine holds every layer, embedRun already produced the final hidden
+  if (!needLogits) { ai.pos++; return null; }   // prefill: skip the head entirely
   const logits = await ai.engine.headFromHidden(h);
   if (badF32(logits)) throw new Error(`NaN in logits (pos ${ai.pos}) — head/lm_head kernel issue on host`);
   ai.pos++;
@@ -1345,12 +1354,12 @@ async function aiGenerate(textArg, who) {
   try {
     let logits = null;
     const tPre = performance.now();
-    for (const id of ids) logits = await aiPipeToken(id);
+    for (let i = 0; i < ids.length; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);
     const t0 = performance.now();
     let count = 0, reply = "";
     for (let i = 0; i < 400; i++) {
       const next = aiSample(logits);
-      if (next === imEnd || next === eot) { await aiPipeToken(next); break; }
+      if (next === imEnd || next === eot) { await aiPipeToken(next, false); break; }
       const piece = ai.tok.decode([next]);
       reply += piece;
       count++;

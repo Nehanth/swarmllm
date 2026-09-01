@@ -556,6 +556,17 @@ export class Qwen35Engine {
     return out;
   }
 
+  // prefill fast path: layers only, no head, no readback
+  async prefillToken(tokenId) {
+    this._setFrame(this.pos, this.pos + 1);
+    this.device.queue.writeBuffer(this.x, 0, this._embedRowF32(tokenId));
+    const enc = this.device.createCommandEncoder();
+    for (let i = 0; i < this.layers.length; i++) this._encodeLayer(enc, i);
+    this.device.queue.submit([enc.finish()]);
+    this.pos++;
+    // fire-and-forget; callers batch backpressure via onSubmittedWorkDone()
+  }
+
   async embedRun(tokenId, pos) {
     const { dim } = this.dims;
     this.pos = pos;
