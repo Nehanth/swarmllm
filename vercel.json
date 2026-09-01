@@ -1,0 +1,6 @@
+{
+  "framework": null,
+  "trailingSlash": false,
+  "rewrites": [{ "source": "/room", "destination": "/p2p.html" }],
+  "redirects": [{ "source": "/p2p.html", "destination": "/room", "permanent": false }]
+}

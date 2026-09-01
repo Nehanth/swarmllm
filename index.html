@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<title>SwarmLLM · mesh inference</title>
+<meta name="description" content="Pool your phone, laptop, and friends' devices into one room, and run AI models none of them could hold alone.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #f5f4ee;
+    --paper-2: #fbfaf5;
+    --ink: #16171c;
+    --faint: #c4c0b1;
+    --muted: #8b877a;
+    --line: #e1ded2;
+    --accent: #2b4eff;
+    --sans: "Space Grotesk", -apple-system, sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  ::selection { background: var(--accent); color: #fff; }
+
+  #stage { position: fixed; inset: 0; z-index: 0; }
+  #mesh { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: pan-y; pointer-events: none; }
+
+  nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 40;
+    display: flex; align-items: center;
+    padding: 22px max(28px, 4vw);
+    transition: all 0.3s;
+  }
+  nav.scrolled {
+    padding: 14px max(28px, 4vw);
+    background: color-mix(in srgb, var(--paper) 80%, transparent);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--line);
+  }
+  .wordmark { font-weight: 700; font-size: 20px; letter-spacing: -0.02em; color: inherit; text-decoration: none; }
+  .wordmark em { font-style: normal; color: var(--accent); }
+  .spacer { flex: 1; }
+  .navlink { font-family: var(--mono); font-size: 12px; color: var(--muted); text-decoration: none; margin-right: 26px; transition: color 0.2s; }
+  .navlink:hover { color: var(--ink); }
+
+  .cta {
+    display: inline-flex; align-items: center; gap: 10px;
+    font-family: var(--mono); font-size: 14px; font-weight: 500;
+    padding: 15px 28px; border-radius: 100px;
+    background: var(--ink); color: var(--paper);
+    text-decoration: none; border: none; cursor: pointer;
+    transition: all 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .cta:hover { background: var(--accent); transform: translateY(-2px); box-shadow: 0 10px 34px rgba(43,78,255,0.35); }
+  .cta .arrow { transition: transform 0.3s; }
+  .cta:hover .arrow { transform: translateX(4px); }
+  nav .cta { padding: 10px 20px; font-size: 12px; }
+
+  /* hero */
+  #hero { position: relative; z-index: 1; height: 100svh; pointer-events: none; }
+  .copy {
+    position: absolute;
+    left: max(28px, 5vw);
+    top: 50%;
+    transform: translateY(-54%);
+    max-width: 640px;
+  }
+  .copy a { pointer-events: auto; }
+  .kicker {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.22em;
+    color: var(--muted); margin-bottom: 26px;
+  }
+  h1 {
+    font-size: clamp(46px, 6.4vw, 92px);
+    line-height: 0.98; font-weight: 700; letter-spacing: -0.04em;
+    margin-bottom: 26px;
+  }
+  h1 .dim { color: var(--faint); }
+  h1 .acc { color: var(--accent); }
+  .sub { font-size: 17px; color: var(--muted); max-width: 38ch; margin-bottom: 38px; line-height: 1.6; }
+  .sub b { color: var(--ink); font-weight: 500; }
+
+  #strip {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    display: flex; align-items: center; gap: 8px;
+    padding: 20px max(28px, 4vw);
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+  }
+  #strip .sep { color: var(--faint); margin: 0 8px; }
+
+
+  #demo {
+    height: 440px;
+    display: flex; flex-direction: column;
+    background: var(--paper-2);
+    border: 1px solid var(--line); border-radius: 20px;
+    overflow: hidden;
+    box-shadow: 0 2px 6px rgba(20,21,26,0.04), 0 24px 70px rgba(20,21,26,0.09);
+  }
+  .demo-bar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 13px 18px;
+    border-bottom: 1px solid var(--line);
+    background: color-mix(in srgb, var(--paper-2) 60%, var(--paper));
+    flex: none;
+  }
+  .wdots { display: inline-flex; gap: 6px; }
+  .wdots i { width: 9px; height: 9px; border-radius: 50%; background: var(--line); }
+  .wdots i:first-child { background: var(--faint); }
+  .demo-title { font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em; color: var(--muted); }
+  #demo-live {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: 7px;
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.16em;
+    color: var(--accent); background: none; border: none; padding: 0;
+    cursor: default;
+  }
+  #demo-live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: blink 1.6s infinite; }
+  #demo-live.again { cursor: pointer; color: var(--muted); }
+  #demo-live.again::before { animation: none; background: var(--faint); }
+  #demo-live.again:hover { color: var(--ink); }
+  #demo-lines {
+    flex: 1; overflow: hidden;
+    padding: 18px 22px;
+    font-family: var(--mono); font-size: 12.5px; line-height: 2;
+  }
+  #demo-lines .dl { color: var(--muted); animation: rise 0.5s cubic-bezier(0.2,0.8,0.2,1) both; }
+  #demo-lines .dl b { color: var(--ink); font-weight: 500; }
+  #demo-lines .dl .hl { color: var(--accent); }
+  .dprog {
+    display: inline-block; vertical-align: middle;
+    width: 90px; height: 4px; margin-left: 10px;
+    background: var(--line); border-radius: 2px; overflow: hidden;
+  }
+  .dprog > span {
+    display: block; height: 100%; width: 0; background: var(--accent); border-radius: 2px;
+    animation: dfill 1.3s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+  }
+  @keyframes dfill { to { width: 100%; } }
+  #demo-lines .da {
+    margin-top: 14px;
+    background: #eceffe; border: 1px solid #d9defb; border-radius: 14px;
+    padding: 13px 16px;
+    color: var(--ink); font-size: 13.5px; line-height: 1.7;
+    animation: rise 0.5s both;
+  }
+  #demo-lines .da b { color: var(--accent); font-weight: 500; }
+  @media (max-width: 860px) { #demo { height: 420px; } #demo-lines { font-size: 11px; padding: 14px 16px; } }
+
+
+  /* editorial section */
+  main { position: relative; z-index: 2; background: var(--paper); border-top: 1px solid var(--line); }
+  section { max-width: 1080px; margin: 0 auto; padding: 120px max(28px, 4vw) 80px; }
+  .sec-kicker {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.22em;
+    color: var(--accent); margin-bottom: 22px;
+  }
+  h2 { font-size: clamp(32px, 4vw, 56px); font-weight: 700; letter-spacing: -0.03em; line-height: 1.04; }
+  .lede { font-size: 18px; color: var(--muted); max-width: 56ch; margin-top: 26px; line-height: 1.7; }
+  .lede b { color: var(--ink); font-weight: 500; }
+
+  .how-grid {
+    display: grid; grid-template-columns: 1.15fr 1fr;
+    gap: 64px; align-items: start; margin-top: 64px;
+  }
+  .how-left { position: sticky; top: 100px; }
+  .hs {
+    display: flex; gap: 20px; align-items: flex-start;
+    padding: 26px 0; border-bottom: 1px solid var(--line);
+  }
+  .hs:first-child { padding-top: 6px; }
+  .hs-n {
+    font-family: var(--mono); font-size: 11px; color: var(--accent);
+    width: 32px; height: 32px; border: 1px solid var(--accent); border-radius: 50%;
+    display: flex; align-items: center; justify-content: center; flex: none;
+    margin-top: 2px;
+  }
+  .hs h3 { font-size: 20px; font-weight: 500; letter-spacing: -0.01em; margin-bottom: 7px; }
+  .hs p { font-size: 14.5px; color: var(--muted); line-height: 1.65; }
+  .hs-note { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 24px; }
+
+  .endcta { text-align: center; padding: 60px 28px 130px; }
+  .endcta .big { font-size: clamp(26px, 3vw, 42px); font-weight: 700; letter-spacing: -0.03em; margin-bottom: 32px; line-height: 1.15; }
+  .endcta .big em { font-style: normal; color: var(--accent); }
+
+  footer {
+    border-top: 1px solid var(--line);
+    padding: 34px max(28px, 4vw);
+    display: flex; align-items: center; gap: 16px;
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    position: relative; z-index: 2; background: var(--paper);
+  }
+
+  #modal {
+    position: fixed; inset: 0; z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(20,21,26,0.35);
+    backdrop-filter: blur(10px);
+    padding: 24px;
+  }
+  #modal[hidden] { display: none; }
+  #modal-card {
+    position: relative;
+    background: var(--paper); border: 1px solid var(--line);
+    border-radius: 26px; padding: 44px 46px;
+    max-width: 560px; width: 100%;
+    box-shadow: 0 30px 90px rgba(20,21,26,0.25);
+    animation: pop 0.45s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+  @keyframes pop { from { opacity: 0; transform: scale(0.94) translateY(14px); } to { opacity: 1; transform: none; } }
+  #modal-card h3 { font-size: clamp(24px, 2.6vw, 34px); font-weight: 700; letter-spacing: -0.03em; line-height: 1.1; margin-bottom: 18px; }
+  #modal-card p { font-size: 15px; color: var(--muted); line-height: 1.7; margin-bottom: 14px; }
+  #modal-card p b { color: var(--ink); font-weight: 500; }
+  #modal-x {
+    position: absolute; top: 18px; right: 22px;
+    background: none; border: none; font-size: 26px; color: var(--muted);
+    cursor: pointer; line-height: 1;
+  }
+  #modal-x:hover { color: var(--ink); }
+  .modal-row { display: flex; align-items: center; gap: 22px; margin-top: 26px; flex-wrap: wrap; }
+  #modal-more { font-family: var(--mono); font-size: 12px; color: var(--muted); text-decoration: none; }
+  #modal-more:hover { color: var(--ink); }
+
+  .rv { opacity: 0; transform: translateY(26px); transition: all 0.8s cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .rv.in { opacity: 1; transform: none; }
+  .ri { animation: rise 1s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+  .ri.d1 { animation-delay: 0.08s; } .ri.d2 { animation-delay: 0.16s; } .ri.d3 { animation-delay: 0.24s; }
+  @keyframes rise { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: none; } }
+
+  @media (max-width: 860px) {
+    .copy { top: auto; bottom: 78px; transform: none; right: 24px; max-width: none; }
+    h1 { font-size: clamp(38px, 10.5vw, 56px); }
+    .sub { font-size: 14.5px; max-width: none; margin-bottom: 26px; }
+    .cta { padding: 13px 24px; font-size: 13px; }
+    #strip { font-size: 9.5px; padding: 14px 24px; }
+    .navlink { display: none; }
+    .how-grid { grid-template-columns: 1fr; gap: 36px; }
+    .how-left { position: static; }
+  }
+  }
+</style>
+</head>
+<body>
+
+<div id="stage"><canvas id="mesh"></canvas></div>
+
+<div id="modal" hidden>
+  <div id="modal-card">
+    <button id="modal-x" aria-label="close">×</button>
+    <div class="sec-kicker">WHAT IS SWARMLLM</div>
+    <h3>A group of devices,<br>running one AI together.</h3>
+    <p>Big models like <b>Qwen 3.8</b> are too large for any single phone or laptop. That is why AI lives in data centers.</p>
+    <p>SwarmLLM splits the model across every device in a room: each one downloads just its slice, and every word of the answer takes a lightning lap through all of them before it appears on every screen at once.</p>
+    <p>No install. No accounts. No servers. Your words never leave the room.</p>
+    <div class="modal-row">
+      <a class="cta" href="/room">start a swarm <span class="arrow">→</span></a>
+      <a id="modal-more" href="#how">read the full story ↓</a>
+    </div>
+  </div>
+</div>
+
+<nav id="nav">
+  <a class="wordmark ri" href="/">swarm<em>LLM</em></a>
+  <div class="spacer"></div>
+  <a class="navlink ri d1" href="#how">what is this?</a>
+  <a class="cta ri d1" href="/room">start a swarm <span class="arrow">→</span></a>
+</nav>
+
+<div id="hero">
+  <div class="copy">
+    <div class="kicker ri">MESH INFERENCE</div>
+    <h1 class="ri d1">Your phone <span class="dim">can't run</span><br>Qwen 3.8<br><span class="acc">Your room can.</span></h1>
+    <p class="sub ri d2">Phones, laptops, friends' PCs: <b>one room code</b> away from becoming a single machine. Each holds a slice of the model; together they run the whole thing. Nothing to install.</p>
+    <a class="cta ri d3" href="/room">start a swarm <span class="arrow">→</span></a>
+  </div>
+  <div id="strip" class="ri d3">
+    <span>no servers</span><span class="sep">·</span>
+    <span>nothing leaves your room</span><span class="sep">·</span>
+    <span>one code to join</span>
+  </div>
+</div>
+
+<main>
+  <section id="how">
+    <div class="sec-kicker rv">WHAT IS SWARMLLM</div>
+    <h2 class="rv">One model,<br>shared by the room.</h2>
+    <p class="lede rv">Big LLMs need more memory than any one device has. SwarmLLM lets a room of everyday devices share the load, and think as one.</p>
+    <div class="how-grid">
+      <div class="how-left rv">
+        <div id="demo">
+          <div class="demo-bar">
+            <span class="wdots"><i></i><i></i><i></i></span>
+            <span class="demo-title">room RZBB</span>
+            <button id="demo-live">LIVE</button>
+          </div>
+          <div id="demo-lines"></div>
+        </div>
+      </div>
+      <div class="how-steps rv">
+        <div class="hs"><span class="hs-n">01</span><div><h3>Make a room</h3><p>Get a four-letter code. Friends type it in. Devices link up. No accounts.</p></div></div>
+        <div class="hs"><span class="hs-n">02</span><div><h3>Chip in</h3><p>Each device takes a slice of the model. Bigger devices take more.</p></div></div>
+        <div class="hs"><span class="hs-n">03</span><div><h3>Think together</h3><p>Every word laps the room, then appears on every screen at once.</p></div></div>
+        <div class="hs-note">Private by design. Your words never leave the room.</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="endcta rv">
+    <div class="big">Your devices are already a <em>supercomputer</em>.<br>Introduce them.</div>
+    <a class="cta" href="/room">start a swarm <span class="arrow">→</span></a>
+  </div>
+</main>
+
+<footer>
+  <span>swarm<b style="color:var(--accent)">LLM</b> · peer-to-peer inference in the browser</span>
+  <div class="spacer"></div>
+</footer>
+
+<script>
+// ---------- nav + reveal ----------
+const nav = document.getElementById("nav");
+addEventListener("scroll", () => nav.classList.toggle("scrolled", scrollY > 8), { passive: true });
+const modal = document.getElementById("modal");
+document.querySelector(".navlink").addEventListener("click", (e) => {
+  e.preventDefault();
+  modal.hidden = false;
+});
+const closeModal = () => { modal.hidden = true; };
+document.getElementById("modal-x").addEventListener("click", closeModal);
+document.getElementById("modal-more").addEventListener("click", closeModal);
+modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
+addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
+
+const io = new IntersectionObserver((es) => es.forEach(e => {
+  if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+}), { threshold: 0.12 });
+document.querySelectorAll(".rv").forEach(el => io.observe(el));
+
+// ---------- ambient node network ----------
+const cv = document.getElementById("mesh");
+const ctx = cv.getContext("2d");
+const INK = "#16171c", ACCENT = "#2b4eff", MUTED = "#8b877a";
+const NAMES = ["mac", "phone", "spark", "friend", "pc", "tablet", "tv", "watch", "laptop", "pi"];
+let W = 0, H = 0, DPR = 1;
+let pts = [], pulses = [], rings = [];
+const EXTRA = ["you", "desk", "kiosk", "car", "console", "fridge", "camera", "router", "drone", "toaster"];
+let mouse = { x: -1e4, y: -1e4 };
+let lastW = 0, resizeT = null;
+let avoid = { x: 0, y: 0, w: 0, h: 0 };
+const LINK = () => (W < 860 ? 120 : 160);
+const inCopy = (x, y) => x > avoid.x && x < avoid.x + avoid.w && y > avoid.y && y < avoid.y + avoid.h;
+
+function resize() {
+  lastW = innerWidth;
+  DPR = Math.min(devicePixelRatio || 1, innerWidth < 860 ? 1.5 : 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const mobile = W < 860;
+  const cr = document.querySelector(".copy h1").getBoundingClientRect();
+  const pad = mobile ? 10 : 20;
+  avoid = { x: cr.left - pad, y: cr.top - pad, w: cr.width + 2 * pad, h: cr.height + 2 * pad };
+  const n = Math.round(W * H / (mobile ? 16000 : 17000));
+  const nLit = Math.min(NAMES.length, mobile ? 6 : 9);
+  const names = NAMES.slice().sort(() => Math.random() - 0.5);
+  pts = [];
+  pulses = [];
+  for (let i = 0; i < n; i++) {
+    const lit = i < nLit;                                  // which points glow is shuffled below
+    let x = Math.random() * W, y = Math.random() * H;
+    for (let k = 0; lit && inCopy(x, y) && k < 30; k++) { x = Math.random() * W; y = Math.random() * H; }
+    pts.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 0.12, vy: (Math.random() - 0.5) * 0.12,
+      r: 1.2 + Math.random() * 1.6,
+      lit, label: lit ? names[i] : null,   // blue lights are devices
+      ph: Math.random() * 6.28,
+    });
+  }
+  pts.sort(() => Math.random() - 0.5);
+}
+addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTimeout(resize, 120); });
+function init() { resize(); }
+
+function physics(now) {
+  for (const p of pts) {
+    if (p.lit && inCopy(p.x, p.y)) {
+      const cx = avoid.x + avoid.w / 2, cy = avoid.y + avoid.h / 2;
+      p.vx += (p.x - cx) * 0.0006; p.vy += (p.y - cy) * 0.0006;
+      p.vx = Math.max(-0.5, Math.min(0.5, p.vx)); p.vy = Math.max(-0.5, Math.min(0.5, p.vy));
+    }
+    p.x += p.vx; p.y += p.vy;
+    if (p.x < -20) p.x = W + 20; if (p.x > W + 20) p.x = -20;
+    if (p.y < -20) p.y = H + 20; if (p.y > H + 20) p.y = -20;
+  }
+  // send light from one device to another, hopping across the points in between
+  if (Math.random() < 0.035 && pulses.length < (W < 860 ? 4 : 7)) {
+    const lit = pts.filter(p => p.lit);
+    if (lit.length > 1) {
+      const a = lit[Math.floor(Math.random() * lit.length)];
+      let b = lit[Math.floor(Math.random() * lit.length)];
+      if (b === a) b = lit[(lit.indexOf(a) + 1) % lit.length];
+      sendLight(a, b);
+    }
+  }
+  for (let i = rings.length - 1; i >= 0; i--) { rings[i].t += 0.018; if (rings[i].t >= 1) rings.splice(i, 1); }
+  for (let i = pulses.length - 1; i >= 0; i--) {
+    const pu = pulses[i];
+    const a = pu.path[pu.i], b = pu.path[pu.i + 1];
+    const len = Math.max(20, Math.hypot(a.x - b.x, a.y - b.y));
+    pu.t += 2.6 / len;                                    // steady speed in px/frame
+    if (pu.t >= 1) { pu.t = 0; pu.i++; if (pu.i >= pu.path.length - 1) pulses.splice(i, 1); }
+  }
+}
+function sendLight(a, b) {
+  {
+    {
+      const path = [a]; let cur = a; const seen = new Set([a]);
+      for (let hop = 0; hop < 14 && cur !== b; hop++) {
+        let best = null, bd = Math.hypot(cur.x - b.x, cur.y - b.y);
+        for (const q of pts) {
+          if (seen.has(q) || (q !== b && inCopy(q.x, q.y))) continue;
+          const d = Math.hypot(cur.x - q.x, cur.y - q.y);
+          if (d > LINK() * 1.3) continue;
+          const dt = Math.hypot(q.x - b.x, q.y - b.y);
+          if (dt < bd) { bd = dt; best = q; }
+        }
+        if (!best) break;
+        path.push(best); seen.add(best); cur = best;
+      }
+      if (path.length > 1) pulses.push({ path, i: 0, t: 0 });   // no route? no light
+    }
+  }
+}
+// click the page: a new device appears there and the room greets it
+document.addEventListener("pointerdown", (e) => {
+  if (scrollY >= H || e.target.closest("a, button, input, .modal, #demo")) return;
+  const used = new Set(pts.filter(p => p.label).map(p => p.label));
+  const label = [...NAMES, ...EXTRA].find(n => !used.has(n)) || "device " + (used.size + 1);
+  const p = { x: e.clientX, y: e.clientY, vx: (Math.random() - 0.5) * 0.12, vy: (Math.random() - 0.5) * 0.12,
+              r: 2.2, lit: true, label, ph: Math.random() * 6.28, born: performance.now() };
+  pts.push(p);
+  rings.push({ x: p.x, y: p.y, t: 0 });
+  // the two nearest devices send light over to the newcomer
+  const near = pts.filter(q => q.lit && q !== p).sort((a, b) => Math.hypot(a.x - p.x, a.y - p.y) - Math.hypot(b.x - p.x, b.y - p.y)).slice(0, 2);
+  near.forEach((q, i) => setTimeout(() => sendLight(q, p), 250 + i * 500));
+});
+
+function draw(now) {
+  ctx.clearRect(0, 0, W, H);
+  // dot grid: parallax + ripple around the cursor
+  const px = (mouse.x - W / 2), py = (mouse.y - H / 2);
+  const GS = W < 860 ? 27 : 19;
+  const gx0 = -((px * 0.016) % GS), gy0 = -((py * 0.016) % GS);
+  ctx.fillStyle = INK;
+  for (let gx = gx0 - GS; gx < W + GS; gx += GS) for (let gy = gy0 - GS; gy < H + GS; gy += GS) {
+    const dx = gx - mouse.x, dy = gy - mouse.y, d = Math.hypot(dx, dy);
+    let x = gx, y = gy, a = 0.14, r = 0.9;
+    if (d < 200 && d > 0.1) { const f = 1 - d / 200; x += dx / d * f * f * 20; y += dy / d * f * f * 20; a = 0.14 + f * 0.22; r = 0.9 + f * 0.6; }
+    ctx.globalAlpha = a; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  const L = LINK();
+  // links
+  ctx.lineWidth = 1;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    for (let j = i + 1; j < pts.length; j++) {
+      const b = pts[j];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      if (d > L) continue;
+      const k = 1 - d / L;
+      ctx.strokeStyle = (a.lit && b.lit) ? ACCENT : INK;
+      ctx.globalAlpha = k * ((a.lit && b.lit) ? 0.22 : 0.09);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    // link to the cursor when close
+    const dm = Math.hypot(a.x - mouse.x, a.y - mouse.y);
+    if (dm < L * 1.1) {
+      ctx.strokeStyle = ACCENT; ctx.globalAlpha = (1 - dm / (L * 1.1)) * 0.35;
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(mouse.x, mouse.y); ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+  // pulses
+  for (const pu of pulses) {
+    const a = pu.path[pu.i], b = pu.path[pu.i + 1];
+    const x = a.x + (b.x - a.x) * pu.t, y = a.y + (b.y - a.y) * pu.t;
+    // the hop being travelled lights up behind the pulse
+    ctx.strokeStyle = ACCENT; ctx.lineWidth = 1.2; ctx.globalAlpha = 0.45;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(x, y); ctx.stroke();
+    ctx.globalAlpha = 0.14;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.globalAlpha = 1; ctx.lineWidth = 1;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, 14);
+    g.addColorStop(0, "rgba(43,78,255,0.7)"); g.addColorStop(1, "rgba(43,78,255,0)");
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, 14, 0, 7); ctx.fill();
+    ctx.fillStyle = ACCENT; ctx.beginPath(); ctx.arc(x, y, 2.6, 0, 7); ctx.fill();
+  }
+  // join ripples
+  for (const r of rings) {
+    ctx.strokeStyle = ACCENT; ctx.globalAlpha = (1 - r.t) * 0.6; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(r.x, r.y, 6 + r.t * 70, 0, 7); ctx.stroke();
+  }
+  ctx.globalAlpha = 1; ctx.lineWidth = 1;
+  // nodes
+  for (const p of pts) {
+    if (p.lit) {
+      const glow = 0.55 + 0.45 * Math.sin(now / 900 + p.ph);
+      const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 16);
+      g.addColorStop(0, `rgba(43,78,255,${0.28 * glow})`); g.addColorStop(1, "rgba(43,78,255,0)");
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x, p.y, 16, 0, 7); ctx.fill();
+      ctx.fillStyle = ACCENT; ctx.globalAlpha = 0.6 + 0.4 * glow;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 0.6, 0, 7); ctx.fill();
+      if (p.label && !inCopy(p.x, p.y)) {
+        ctx.font = "10px JetBrains Mono, monospace"; ctx.textAlign = "left";
+        ctx.fillStyle = MUTED; ctx.globalAlpha = 0.55 + 0.35 * glow;
+        ctx.fillText(p.label, p.x + 9, p.y + 3.5);
+      }
+    } else {
+      ctx.fillStyle = INK; ctx.globalAlpha = 0.28;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+let last = performance.now(), running = true;
+function loop(now) {
+  last = now;
+  if (running && scrollY < H) { physics(now); draw(now); }
+  requestAnimationFrame(loop);
+}
+document.addEventListener("visibilitychange", () => { running = !document.hidden; });
+addEventListener("mousemove", (e) => { mouse = { x: e.clientX, y: e.clientY }; });
+addEventListener("mouseleave", () => { mouse = { x: -1e4, y: -1e4 }; });
+
+// ---------- scroll-in room replay ----------
+const demoEl = document.getElementById("demo-lines");
+const demoLive = document.getElementById("demo-live");
+const DEMO = [
+  [0, `<b>mac</b> created room <span class="hl">RZBB</span> · host · pledged 6 GB`],
+  [800, `<b>+ phone</b> joined · pledged 0.9 GB`],
+  [1500, `<b>+ spark</b> joined · pledged 12 GB`],
+  [2200, `<b>+ friend</b> joined · pledged 4 GB`],
+  [3100, `<b>Qwen 3.8 27B</b> · layers dealt: spark <b>34</b> · mac <b>17</b> · friend <b>11</b> · phone <b>2</b>`],
+  [4200, `downloading shards<span class="dprog"><span></span></span>`],
+  [5700, `<span class="hl">cluster online</span> · <b>you:</b> what can a room full of gadgets do?`],
+];
+const DEMO_ANS = "run a model none of us could hold alone. each of us keeps a few layers, and every word you read took a lap through the whole room.";
+let demoState = "idle";
+function playDemo() {
+  if (demoState === "playing") return;
+  demoState = "playing";
+  demoEl.innerHTML = "";
+  demoLive.textContent = "LIVE";
+  demoLive.classList.remove("again");
+  for (const [t, html] of DEMO) setTimeout(() => { const d = document.createElement("div"); d.className = "dl"; d.innerHTML = html; demoEl.appendChild(d); }, t);
+  setTimeout(() => {
+    const a = document.createElement("div"); a.className = "da"; demoEl.appendChild(a);
+    let i = 0;
+    const iv = setInterval(() => {
+      i++;
+      a.innerHTML = `<b>THE ROOM ›</b> ` + DEMO_ANS.slice(0, i) + (i < DEMO_ANS.length ? "▌" : "");
+      if (i >= DEMO_ANS.length) { clearInterval(iv); demoState = "done"; demoLive.textContent = "↺ replay"; demoLive.classList.add("again"); }
+    }, 42);
+  }, 6600);
+}
+demoLive.addEventListener("click", () => { if (demoState === "done") playDemo(); });
+new IntersectionObserver((es) => { if (es[0].isIntersecting && demoState === "idle") playDemo(); }, { threshold: 0.35 })
+  .observe(document.getElementById("demo"));
+
+init();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

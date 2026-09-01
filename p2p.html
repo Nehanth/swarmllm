@@ -1,0 +1,1493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<title>SwarmLLM · room</title>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  :root {
+    --bg: #f5f4ee;
+    --panel: #fbfaf5;
+    --panel-2: #efede6;
+    --border: #e1ded2;
+    --text: #16171c;
+    --muted: #8b877a;
+    --faint: #c4c0b1;
+    --accent: #2b4eff;
+    --accent-dim: #2b4eff;
+    --user-bubble: #e2e7fd;
+    --ok: #1a7f37;
+    --warn: #b58500;
+    --err: #d1242f;
+    --sans: "Space Grotesk", -apple-system, BlinkMacSystemFont, sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    background-image: radial-gradient(var(--border) 1px, transparent 1px);
+    background-size: 26px 26px;
+    color: var(--text);
+    font: 15px/1.55 var(--sans);
+    display: flex; flex-direction: column;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent); color: #fff; }
+
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 16px max(20px, 3vw);
+    padding-top: max(16px, env(safe-area-inset-top));
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+    backdrop-filter: blur(10px);
+  }
+  .logo { font-size: 19px; font-weight: 700; letter-spacing: -0.02em; }
+  .logo span { color: var(--accent); }
+  .logo a { color: inherit; text-decoration: none; }
+  .tagline { font-family: var(--mono); font-size: 10px; letter-spacing: 0.18em; color: var(--muted); text-transform: uppercase; }
+  .spacer { flex: 1; }
+  #room-badge {
+    display: none; font-family: var(--mono); font-size: 14px;
+    background: var(--text); color: var(--bg);
+    border: none; border-radius: 100px; padding: 8px 18px;
+    letter-spacing: 4px; font-weight: 500; cursor: pointer;
+    transition: all 0.25s;
+  }
+  #room-badge:hover { background: var(--accent); }
+
+  button, input, select {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px 16px; font-size: 14px; font-family: var(--sans);
+  }
+  button { cursor: pointer; transition: all 0.25s cubic-bezier(0.2,0.8,0.2,1); }
+  button:hover:not(:disabled) { border-color: var(--text); transform: translateY(-1px); }
+  button:disabled { opacity: 0.45; cursor: default; transform: none; }
+  button.primary {
+    background: var(--text); color: var(--bg); border-color: var(--text);
+    font-family: var(--mono); font-size: 13px; border-radius: 100px; padding: 11px 22px;
+  }
+  button.primary:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); box-shadow: 0 8px 26px rgba(43,78,255,0.3); }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+
+  /* ---- join screen ---- */
+  #join-screen {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 16px; padding: 24px;
+  }
+  .kicker {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.22em;
+    color: var(--muted);
+  }
+  #join-screen h1 { font-size: clamp(32px, 5vw, 46px); font-weight: 700; letter-spacing: -0.03em; }
+  #join-screen h1 span { color: var(--accent); }
+  #join-screen p { color: var(--muted); font-size: 14px; text-align: center; max-width: 360px; margin-bottom: 8px; }
+  #join-screen input { width: 280px; text-align: center; padding: 13px 16px; }
+  #code-input { font-family: var(--mono); letter-spacing: 6px; text-transform: uppercase; font-weight: 500; }
+  .join-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  #join-status { font-family: var(--mono); font-size: 12px; color: var(--warn); min-height: 18px; max-width: 420px; text-align: center; }
+  #contrib-box {
+    border: 1px solid var(--border); border-radius: 16px;
+    background: var(--panel); padding: 16px 20px; margin-top: 4px;
+  }
+  #contrib-box label { font-size: 13px; color: var(--muted); }
+  #contrib-box label b { color: var(--text); font-weight: 500; }
+  #contrib-box input[type="radio"] { accent-color: var(--accent); }
+  #measure-btn { font-family: var(--mono); font-size: 11px; padding: 6px 14px; border-radius: 100px; }
+  #join-pledge { display: flex; align-items: center; justify-content: center; gap: 8px; font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 2px; }
+  #join-pledge input { width: 64px; padding: 6px 8px; font-family: var(--mono); font-size: 12px; border-radius: 8px; text-align: center; }
+  #join-pledge .step { width: 30px; height: 30px; border-radius: 100px; padding: 0; font-family: var(--mono); font-size: 15px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; }
+  #join-pledge input { width: 52px; padding: 6px 4px; -moz-appearance: textfield; }
+  #join-pledge input::-webkit-outer-spin-button, #join-pledge input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+  /* ---- room screen ---- */
+  #room-screen { flex: 1; display: none; flex-direction: column; overflow: hidden; }
+  #peers {
+    overflow-y: auto; padding: 18px max(20px, 3vw) 6px;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px;
+    align-content: start;
+  }
+  .peer-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 18px; padding: 16px 18px;
+    transition: all 0.3s cubic-bezier(0.2,0.8,0.2,1);
+  }
+  .peer-card:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(20,21,26,0.06); }
+  .peer-card.self { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .peer-name { font-weight: 700; display: flex; align-items: center; gap: 9px; letter-spacing: -0.01em; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+  .dot.ok { background: var(--accent); box-shadow: 0 0 0 3px rgba(43,78,255,0.15); }
+  .dot.warn { background: var(--warn); }
+  .peer-gpu { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 8px; word-wrap: break-word; }
+  .peer-stats { font-family: var(--mono); font-size: 11px; margin-top: 10px; display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); }
+  .peer-stats b { color: var(--accent); font-weight: 500; }
+  .peer-card button { margin-top: 12px; font-family: var(--mono); font-size: 11px; padding: 6px 12px; border-radius: 100px; }
+
+  /* ---- ai panel ---- */
+  #ai-panel {
+    display: none; flex-direction: column; gap: 12px;
+    margin: 10px max(20px, 3vw) 14px; padding: 18px 20px;
+    background: var(--panel);
+    border: 1px solid var(--border); border-radius: 20px;
+    box-shadow: 0 14px 44px rgba(20,21,26,0.07);
+  }
+  #ai-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  #ai-title {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.18em;
+    color: var(--muted); display: flex; align-items: center; gap: 8px;
+  }
+  #ai-title::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: blink 1.6s infinite; }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+  #ai-model { font-family: var(--mono); font-size: 12.5px; border-radius: 100px; padding: 9px 16px; }
+  #ai-status { font-family: var(--mono); font-size: 11.5px; color: var(--muted); flex: 1; min-width: 160px; }
+  #ai-status:empty { display: none; }
+  #ai-need { width: 100%; display: flex; flex-direction: column; gap: 6px; }
+  /* panel states: pick -> loading -> online */
+  #ai-panel.loading #ai-model, #ai-panel.loading #ai-start, #ai-panel.loading #ai-need,
+  #ai-panel.online #ai-model, #ai-panel.online #ai-start, #ai-panel.online #ai-need { display: none; }
+  #need-bar { height: 6px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+  #need-fill { height: 100%; width: 0%; background: var(--muted); border-radius: 4px; transition: width 0.9s cubic-bezier(0.2,0.8,0.2,1), background 0.4s; }
+  #ai-need.ok #need-fill { background: var(--accent); }
+  #need-text { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  #cache-line a { color: var(--muted); text-decoration: underline dotted; }
+  #cache-line a:hover { color: var(--text); }
+  #ai-need.ok #need-text { color: var(--accent); }
+  @keyframes unlock { 0% { transform: scale(1); } 40% { transform: scale(1.04); } 100% { transform: scale(1); } }
+  #ai-start.unlocked { animation: unlock 0.5s cubic-bezier(0.2,0.8,0.2,1); }
+  #ai-loading { padding: 4px 0; }
+  #ldg-title { font-family: var(--mono); font-size: 11.5px; color: var(--text); margin-bottom: 8px; }
+  #ldg-bar { height: 7px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+  #ldg-fill {
+    height: 100%; width: 0%; border-radius: 4px; transition: width 0.25s;
+    background: linear-gradient(90deg, var(--accent), #7a94ff);
+  }
+  #ldg-sub { font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin-top: 7px; }
+  #ai-output {
+    display: none; white-space: pre-wrap; word-wrap: break-word;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 14px;
+    padding: 14px 16px; font-size: 14px; max-height: 42vh; overflow-y: auto;
+    line-height: 1.65;
+  }
+  #ai-output .u { color: var(--accent); font-weight: 600; }
+  #ai-output .stats { font-family: var(--mono); color: var(--muted); font-size: 10.5px; }
+  #ai-row { display: none; gap: 10px; }
+  #ai-prompt { flex: 1; border-radius: 100px; padding: 11px 18px; }
+
+  /* ---- footer bars ---- */
+  #cluster-bar {
+    padding: 9px max(20px, 3vw);
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    border-top: 1px solid var(--border);
+  }
+  #cluster-bar b { color: var(--text); font-weight: 500; }
+  #chat-log {
+    max-height: 96px; overflow-y: auto; padding: 6px max(20px, 3vw);
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    border-top: 1px solid var(--border);
+  }
+  #chat-log b { color: var(--accent); font-weight: 500; }
+  #chat-row {
+    display: flex; gap: 10px; padding: 10px max(20px, 3vw);
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+    border-top: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+  }
+  #chat-input { flex: 1; border-radius: 100px; padding: 10px 18px; font-size: 13px; }
+
+  /* ---- chat bubbles ---- */
+  #ai-output { display: none; background: var(--bg); border: 1px solid var(--border); border-radius: 16px; padding: 14px 16px; max-height: 46vh; overflow-y: auto; }
+  .m { display: flex; flex-direction: column; margin: 8px 0; max-width: 86%; }
+  .m.user { align-self: flex-end; align-items: flex-end; margin-left: auto; }
+  .m.bot { align-self: flex-start; align-items: flex-start; }
+  .m .who { font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; }
+  .m .bubble { padding: 10px 14px; border-radius: 16px; font-size: 14.5px; line-height: 1.6; white-space: normal; word-wrap: break-word; }
+  .m.user .bubble { background: var(--text); color: var(--bg); border-bottom-right-radius: 5px; }
+  .m.bot .bubble { background: var(--panel); border: 1px solid var(--border); border-bottom-left-radius: 5px; }
+  .m .bubble h3, .m .bubble h4 { font-size: 15px; margin: 10px 0 4px; font-weight: 700; }
+  .m .bubble p { margin: 6px 0; }
+  .m .bubble ul, .m .bubble ol { margin: 6px 0 6px 18px; }
+  .m .bubble li { margin: 3px 0; }
+  .m .bubble code { font-family: var(--mono); font-size: 12.5px; background: var(--panel-2); padding: 1px 5px; border-radius: 5px; }
+  .m .bubble pre { font-family: var(--mono); font-size: 12px; background: var(--panel-2); padding: 10px 12px; border-radius: 10px; overflow-x: auto; margin: 8px 0; }
+  .m .stats { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 5px; }
+  .cursor { display: inline-block; width: 7px; height: 14px; background: var(--accent); vertical-align: -2px; margin-left: 2px; animation: blink 1s infinite; }
+  .pledge { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .pledge input { width: 62px; padding: 4px 8px; font-family: var(--mono); font-size: 11px; border-radius: 8px; text-align: center; }
+  #toasts { position: fixed; top: 74px; right: max(20px, 3vw); z-index: 60; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+  .toast { display: flex; align-items: center; gap: 9px; background: var(--text); color: var(--bg); font-family: var(--mono); font-size: 12px; padding: 10px 16px; border-radius: 100px; box-shadow: 0 10px 30px rgba(20,21,26,0.2); animation: toastin 0.45s cubic-bezier(0.2,0.8,0.2,1) both, toastout 0.4s ease-in 3.6s both; }
+  .toast::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+  @keyframes toastin { from { opacity: 0; transform: translateX(24px) scale(0.96); } to { opacity: 1; transform: none; } }
+  @keyframes toastout { to { opacity: 0; transform: translateY(-8px); } }
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  /* ---- room: sidebar + chat ---- */
+  #room-screen { flex-direction: row; overflow: hidden; }
+  #side { width: 300px; flex: none; display: flex; flex-direction: column; gap: 10px; padding: 14px 14px 12px; border-right: 1px solid var(--border); overflow: hidden; min-height: 0; background: color-mix(in srgb, var(--panel) 70%, transparent); }
+  #side > #peers { flex: 0 1 auto; min-height: 0; overflow-y: auto; scrollbar-width: none; }
+  #side > #peers::-webkit-scrollbar { display: none; }
+  .side-k { font-family: var(--mono); font-size: 10px; letter-spacing: 0.2em; color: var(--muted); }
+  #side-room { padding: 10px 14px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  #side-room .side-k { flex-basis: 100%; }
+  #side-code { font-family: var(--mono); font-size: 26px; letter-spacing: 7px; font-weight: 500; color: var(--accent); margin: 0; cursor: pointer; }
+  .side-hint { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+  #peers { display: flex; flex-direction: column; gap: 10px; padding: 0; overflow: visible; }
+  .peer-card { padding: 9px 12px; border-radius: 12px; }
+  .peer-gpu { margin-top: 4px; }
+  .peer-stats { margin-top: 6px; }
+  .pledge { margin-top: 6px; }
+  #ai-panel { margin: 0; padding: 12px 12px 12px; gap: 8px; box-shadow: none; }
+  #ai-head { flex-direction: column; align-items: stretch; gap: 8px; }
+  #ai-title { display: none; }
+  #ai-model { width: 100%; }
+  #ai-status { min-width: 0; }
+  #ai-start { width: 100%; }
+  #cluster-bar { border-top: none; padding: 4px 2px; margin-top: auto; }
+  #chatpane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #chat-log { max-height: 60px; border-top: none; border-bottom: 1px solid var(--border); padding: 6px max(16px, 2vw); opacity: 0.8; }
+  #ai-empty { flex: 1; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  #load-card { display: none; margin: auto; width: min(460px, 92%); padding: 22px 24px; background: var(--panel); border: 1px solid var(--border); border-radius: 20px; box-shadow: 0 14px 44px rgba(20,21,26,0.07); }
+  #load-card.on { display: block; }
+  .lc-k { font-family: var(--mono); font-size: 11px; letter-spacing: 0.18em; color: var(--muted); display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+  .lc-k::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: blink 1.6s infinite; }
+  .lc-k span { color: var(--text); letter-spacing: 0; }
+  .lc-row { display: grid; grid-template-columns: 92px 1fr 44px; align-items: center; gap: 12px; margin: 10px 0; font-family: var(--mono); font-size: 12px; }
+  .lc-row .n { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lc-row .n small { color: var(--muted); display: block; font-size: 10px; }
+  .lc-row .bar { height: 6px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+  .lc-row .fill { height: 100%; width: 0%; background: var(--accent); border-radius: 4px; transition: width 0.6s ease; }
+  .lc-row .pct { text-align: right; color: var(--muted); }
+  .lc-row.done .pct { color: var(--accent); }
+  .lc-note { font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin-top: 14px; }
+  #ai-output { flex: 1; max-height: none; border: none; border-radius: 0; background: transparent; padding: 18px max(16px, 3vw); }
+  .m { max-width: 72%; }
+  #ai-row { padding: 12px max(16px, 3vw); padding-bottom: max(12px, env(safe-area-inset-bottom)); border-top: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 85%, transparent); }
+  #ai-prompt { padding: 13px 20px; font-size: 15px; }
+  @media (max-width: 820px) {
+    header { padding: 10px 14px; }
+    .tagline, #room-badge { display: none !important; }
+    #room-screen { flex-direction: column; }
+    #side { width: auto; flex: none; border-right: none; border-bottom: 1px solid var(--border); padding: 10px 12px; gap: 8px; max-height: none; overflow: visible; background: var(--panel); }
+    #side-room { display: flex; align-items: baseline; gap: 10px; padding: 8px 12px; border-radius: 12px; }
+    #side-room .side-k { display: none; }
+    #side-code { font-size: 20px; letter-spacing: 5px; margin: 0; }
+    .side-hint { font-size: 10px; }
+    #side > .side-k { display: none; }
+    input, select, textarea { font-size: 16px; }   /* iOS zooms into anything smaller */
+    #join-pledge { white-space: nowrap; }
+    #join-pledge input { font-size: 16px; width: 56px !important; flex: none; }
+    #join-pledge .step { width: 34px; height: 34px; }
+    #peers { flex-direction: row; overflow-x: auto; gap: 8px; padding-bottom: 2px; scrollbar-width: none; }
+    #peers::-webkit-scrollbar { display: none; }
+    .peer-card { min-width: 150px; padding: 8px 10px; border-radius: 12px; }
+    .peer-name { font-size: 13px; }
+    .peer-gpu { display: none; }
+    .peer-stats { margin-top: 5px; gap: 8px; font-size: 10px; }
+    .peer-card button { display: none; }
+    .pledge { margin-top: 6px; font-size: 10px; }
+    #ai-panel { padding: 8px 10px; border-radius: 12px; gap: 6px; }
+    #ai-panel > .side-k { display: none; }
+    #ai-head { flex-direction: row; align-items: center; gap: 8px; }
+    #ai-model { flex: 1; width: auto; padding: 8px 12px; font-size: 11.5px; }
+    #ai-start { width: auto; padding: 9px 18px; }
+    #ai-status { flex-basis: 100%; font-size: 10.5px; }
+    #cluster-bar { display: none; }
+    #chat-log { display: none; }
+    #chatpane { flex: 1; min-height: 0; }
+    #ai-output { padding: 12px 12px; }
+    .m { max-width: 88%; }
+    .m .bubble { font-size: 14px; padding: 9px 12px; }
+    #ai-row { padding: 8px 10px; padding-bottom: max(8px, env(safe-area-inset-bottom)); }
+    #ai-prompt { padding: 11px 16px; font-size: 15px; }
+  }
+  @media (max-width: 640px) {
+    .tagline { display: none; }
+    #peers { grid-template-columns: 1fr 1fr; }
+    #join-screen input { width: min(320px, 84vw); }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo"><a href="/">swarm<span>LLM</span></a></div>
+  <div class="tagline">swarm room</div>
+  <div class="spacer"></div>
+  <div id="room-badge" title="Click to copy room code"></div>
+</header>
+
+<div id="join-screen">
+  <div class="kicker">MESH INFERENCE</div>
+  <h1>start a <span>swarm</span></h1>
+  <p>One room code. Every device that types it becomes part of one machine.</p>
+  <input id="name-input" placeholder="device name (e.g. mac, phone)" maxlength="20">
+  <input id="code-input" placeholder="ROOM CODE" maxlength="6">
+  <div class="join-row">
+    <button id="create-btn" class="primary">Create room</button>
+    <button id="join-btn">Join room</button>
+  </div>
+  <div id="join-pledge">give <button class="step" id="gb-minus" type="button">−</button><input id="join-gb" type="number" min="1" max="64" step="1" value="1" inputmode="numeric"><button class="step" id="gb-plus" type="button">+</button> GB of memory</div>
+  <div id="join-status"></div>
+</div>
+
+<div id="room-screen">
+  <aside id="side">
+    <div id="side-room"><div class="side-k">ROOM</div><div id="side-code" title="click to copy">----</div><div class="side-hint">share this code</div></div>
+    <div class="side-k">DEVICES</div>
+    <div id="peers"></div>
+    <div id="ai-panel">
+      <div class="side-k">MODEL</div>
+      <div id="ai-head">
+      <span id="ai-title">SWARM MODEL</span>
+      <select id="ai-model">
+        <option value="qwen3-0.6b">Qwen3 0.6B · Q8</option>
+        <option value="qwen3-1.7b">Qwen3 1.7B · Q8</option>
+        <option value="qwen3-4b">Qwen3 4B · Q8</option>
+        <option value="qwen3.8-27b">Qwen 3.8 27B · Q4</option>
+        <option value="smollm-135m">SmolLM 135M · bf16</option>
+      </select>
+      <div id="ai-need">
+        <div id="need-bar"><div id="need-fill"></div></div>
+        <div id="need-text">needs ~0.8 GB · room gives 0 GB</div>
+      </div>
+      <span id="ai-status">split across every device in the room</span>
+      <button id="ai-start" class="primary">start</button>
+    </div>
+      <div id="ai-loading" style="display:none">
+        <div id="ldg-title"></div>
+        <div id="ldg-bar"><div id="ldg-fill"></div></div>
+        <div id="ldg-sub"></div>
+      </div>
+    </div>
+    <div id="awake" class="side-hint" style="margin-top:6px"></div>
+    <div id="cache-line" class="side-hint" style="margin-top:4px"><a href="#" id="cache-clear">clear cached weights</a></div>
+    <div id="cluster-bar">cluster: <b id="cluster-summary">—</b></div>
+  </aside>
+  <main id="chatpane">
+    <div id="chat-log"></div>
+    <div id="ai-empty">pick a model and press start</div>
+    <div id="load-card">
+      <div class="lc-k">DOWNLOADING <span id="lc-model"></span></div>
+      <div id="lc-rows"></div>
+      <div class="lc-note">each device fetches only its own layers, in step with the room</div>
+    </div>
+    <div id="ai-output"></div>
+    <div id="ai-row"><input id="ai-prompt" placeholder="ask the swarm…"><button id="ai-send" class="primary">Send</button></div>
+  </main>
+</div>
+
+<div id="toasts"></div>
+<script type="module">
+import { makeTokenizer, BelloEngine, argmax, fetchModelShard, shardTensorNames, gpuSelfTest, kernelMicroTests }
+  from "./engine/engine.js";
+import { parseGGUFHeader, ggufWeights, ggufShardBytes, GGML_EMBED, GGML_OUTPUT, GGML_FINAL_NORM,
+  ggmlLayerNames, qwen35Weights, qwen35ShardBytes, qwen35LayerNames, tokenizerFromGGUF, gpuUploadEntry, streamEntryToGPU }
+  from "./engine/gguf.js";
+import { Qwen35Engine } from "./engine/qwen35.js";
+
+const $ = (id) => document.getElementById(id);
+function toast(text) {
+  const t = document.createElement("div");
+  t.className = "toast";
+  t.textContent = text;
+  $("toasts").appendChild(t);
+  setTimeout(() => t.remove(), 4200);
+}
+function mascot() {}
+const PREFIX = "swarmllm-room-";
+const rand = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n)))
+  .map(b => "ABCDEFGHJKMNPQRSTVWXYZ23456789"[b % 30]).join("");
+
+let peer = null;          // my PeerJS peer
+let isHost = false;
+let roomCode = null;
+let myName = null;
+let myMeta = {};
+// conns: peerId -> { conn, name, meta, rtt, mbps, card }
+const conns = new Map();
+// host only: roster of member peer ids -> {name, meta}
+const roster = new Map();
+
+// --- GPU capability probe (runs at page load so the join screen can offer
+// contribution presets) ---
+async function probeGPU() {
+  const meta = { ua: navigator.userAgent.includes("iPhone") ? "iPhone" :
+                     navigator.userAgent.includes("Mac") ? "Mac" :
+                     navigator.userAgent.includes("Android") ? "Android" : "Device",
+                 webgpu: false, gpu: "no WebGPU", maxBufGB: 0 };
+  if (navigator.gpu) {
+    try {
+      const a = await navigator.gpu.requestAdapter();
+      if (a) {
+        meta.webgpu = true;
+        const info = a.info || {};
+        meta.gpu = [...new Set([info.vendor, info.architecture || info.device].filter(Boolean))].join(" ") || "GPU";
+        meta.maxBufGB = +(a.limits.maxBufferSize / 2 ** 30).toFixed(1);
+        // browsers hide real GPU memory (fingerprinting). Default to the
+        // conservative per-buffer limit; the user can opt in to a real
+        // measurement (see measureBudgetGB) which replaces this estimate.
+        meta.budgetGB = meta.maxBufGB;
+        meta.canMeasure = meta.ua !== "iPhone" && meta.ua !== "Android";
+      }
+    } catch {}
+  }
+  return meta;
+}
+
+async function measureBudgetGB(adapter, capGB) {
+  try {
+    const dev = await adapter.requestDevice();
+    let lost = false;
+    dev.lost.then(() => { lost = true; });
+    const chunk = 512 * 2 ** 20;
+    const bufs = [];
+    let total = 0;
+    while (total < capGB * 2 ** 30 && !lost) {
+      dev.pushErrorScope("out-of-memory");
+      const b = dev.createBuffer({ size: chunk, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      try { // commit the pages for real, or lazy allocation lies to us
+        const enc = dev.createCommandEncoder();
+        enc.clearBuffer(b);
+        dev.queue.submit([enc.finish()]);
+        await dev.queue.onSubmittedWorkDone();
+      } catch { lost = true; }
+      const err = await dev.popErrorScope().catch(() => true);
+      if (err || lost) { try { b.destroy(); } catch {} break; }
+      bufs.push(b);
+      total += chunk;
+    }
+    for (const b of bufs) { try { b.destroy(); } catch {} }
+    try { dev.destroy(); } catch {}
+    return +(total / 2 ** 30).toFixed(1);
+  } catch { return 0; }
+}
+
+// probe once at load; fill the contribution selector
+function applyBudget(m, label) {
+  m.recGB = Math.max(0.2, Math.round(m.budgetGB * 0.5 * 10) / 10);
+  m.maxGB = Math.max(0.2, Math.round(m.budgetGB * 0.85 * 10) / 10);
+  $("gpu-name").textContent = `${m.gpu} · ${m.budgetGB} GB ${label}`;
+  $("rec-gb").textContent = m.recGB + " GB";
+  $("max-gb").textContent = m.maxGB + " GB";
+}
+
+const metaPromise = (async () => {
+  const m = await probeGPU();
+  if (m.webgpu && m.budgetGB) m.contribGB = Math.max(0.2, Math.round(m.budgetGB * 0.5 * 10) / 10);
+  m.phone = m.ua === "iPhone" || m.ua === "Android";
+  if (m.phone) { m.contribGB = 0.5; $("join-gb").min = "0.5"; $("join-gb").step = "0.5"; }
+  else if (m.contribGB) m.contribGB = Math.max(1, Math.round(m.contribGB));
+  if (m.contribGB) $("join-gb").value = m.contribGB;
+  return m;
+})();
+
+// --- UI helpers ---
+function log(from, text) {
+  const div = document.createElement("div");
+  div.innerHTML = `<b></b> `;
+  div.querySelector("b").textContent = from;
+  div.appendChild(document.createTextNode(text));
+  $("chat-log").appendChild(div);
+  $("chat-log").scrollTop = $("chat-log").scrollHeight;
+}
+
+function peerCard(id, name, meta, self) {
+  const card = document.createElement("div");
+  card.className = "peer-card" + (self ? " self" : "");
+  card.innerHTML = `
+    <div class="peer-name"><span class="dot ${self ? "ok" : "warn"}"></span><span class="pname"></span></div>
+    <div class="peer-gpu"></div>
+    <div class="peer-stats">
+      <span>rtt <b class="rtt">—</b></span>
+      <span>bw <b class="bw">—</b></span>
+      <span>buf <b class="buf">—</b></span>
+    </div>
+    ${self ? "" : '<button class="bw-btn">test bandwidth</button>'}`;
+  card.querySelector(".pname").textContent = name + (self ? " (you)" : "");
+  card.querySelector(".peer-gpu").textContent = meta.webgpu
+    ? `${meta.ua} · ${meta.gpu}` : `${meta.ua} · ⚠ no WebGPU`;
+  const budget = meta.budgetGB || meta.maxBufGB;
+  card.querySelector(".buf").textContent = meta.contribGB ? "gives " + meta.contribGB + " GB" : (budget ? budget + " GB" : "—");
+  $("peers").appendChild(card);
+  if (!self) card.querySelector(".bw-btn").addEventListener("click", () => bwTest(id));
+  return card;
+}
+
+const NEED_GB = { "qwen3-0.6b": 0.8, "qwen3-1.7b": 2.0, "qwen3-4b": 4.6, "qwen3.8-27b": 16.5, "smollm-135m": 0.6 };
+let wasReady = false;
+function updateNeed(pledged) {
+  const need = NEED_GB[$("ai-model").value] || 1;
+  const ok = pledged >= need;
+  $("need-fill").style.width = Math.min(100, pledged / need * 100).toFixed(1) + "%";
+  $("need-text").textContent = ok
+    ? `needs ~${need} GB \u00b7 room gives ${pledged.toFixed(1)} GB \u00b7 ready`
+    : `needs ~${need} GB \u00b7 room gives ${pledged.toFixed(1)} GB \u00b7 add ${(need - pledged).toFixed(1)} GB more`;
+  $("ai-need").classList.toggle("ok", ok);
+  if (!ai.busy && !ai.engine) $("ai-start").disabled = !ok;
+  if (ok && !wasReady) { $("ai-start").classList.remove("unlocked"); void $("ai-start").offsetWidth; $("ai-start").classList.add("unlocked"); }
+  wasReady = ok;
+}
+$("ai-model").addEventListener("change", () => updateCluster());
+function updateCluster() {
+  const all = [myMeta, ...[...conns.values()].map(c => c.meta)];
+  const gpus = all.filter(m => m && m.webgpu).length;
+  const pledged = all.reduce((s, m) => s + (m?.contribGB || 0), 0);
+  updateNeed(pledged);
+  const mem = all.reduce((s, m) => s + (m?.budgetGB || m?.maxBufGB || 0), 0);
+  $("cluster-summary").textContent =
+    `${all.length} device${all.length > 1 ? "s" : ""} \u00b7 ${gpus} WebGPU \u00b7 ${pledged.toFixed(1)} GB pledged`;
+}
+
+function enterRoom() {
+  $("join-screen").style.display = "none";
+  $("room-screen").style.display = "flex";
+  $("room-badge").style.display = "block";
+  $("room-badge").textContent = roomCode;
+  $("side-code").textContent = roomCode;
+  $("side-code").addEventListener("click", () => { navigator.clipboard?.writeText(roomCode); toast("room code copied"); });
+  peerCard("self", myName, myMeta, true);
+  updateCluster();
+  log("swarm", `room ${roomCode} — share this code with your other devices`);
+  $("ai-panel").style.display = "flex";
+  aiStatus("");
+  $("ai-empty").textContent = "pick a model and press start, from any device";
+  const selfCard = document.querySelector(".peer-card.self");
+  if (selfCard && myMeta.webgpu) {
+    const row = document.createElement("div");
+    row.className = "pledge";
+    row.innerHTML = `give <input type="number" min="1" max="64" step="1" value="${myMeta.contribGB}"> GB of GPU`;
+    selfCard.appendChild(row);
+    row.querySelector("input").addEventListener("change", (e) => {
+      const v = parseFloat(e.target.value);
+      if (v >= (myMeta.phone ? 0.5 : 1)) { myMeta.contribGB = v; selfCard.querySelector(".buf").textContent = "gives " + v + " GB"; updateCluster(); broadcastAll({ t: "pledge", gb: v }); }
+    });
+  }
+}
+
+// --- connection wiring ---
+function wire(conn, name, meta) {
+  const entry = { conn, name: name || conn.peer, meta: meta || {}, rtt: null, card: null };
+  conns.set(conn.peer, entry);
+
+  conn.on("data", (d) => onData(conn.peer, d));
+  conn.on("close", () => {
+    const e = conns.get(conn.peer);
+    if (e?.card) e.card.remove();
+    conns.delete(conn.peer);
+    roster.delete(conn.peer);
+    if (isHost) broadcastRoster();
+    updateCluster();
+    log("swarm", `${e?.name || conn.peer} left`);
+  });
+  conn.on("error", () => {});
+  return entry;
+}
+
+function ensureCard(id) {
+  const e = conns.get(id);
+  if (e && !e.card) {
+    e.card = peerCard(id, e.name, e.meta, false);
+    updateCluster();
+    log("swarm", `${e.name} connected`);
+    mascot(`${e.name} joined! ${conns.size + 1} devices in the room.`);
+  }
+}
+
+function sendTo(id, obj) { conns.get(id)?.conn.send(obj); }
+function broadcastAll(obj) { for (const [id] of conns) sendTo(id, obj); }
+
+// bandwidth test state
+const bwRecv = new Map(); // fromId -> {bytes, t0}
+
+function onData(from, d) {
+  // binary chunk = bandwidth test payload
+  if (d instanceof ArrayBuffer || ArrayBuffer.isView(d)) {
+    const st = bwRecv.get(from);
+    if (st) st.bytes += d.byteLength || d.length;
+    return;
+  }
+  const e = conns.get(from);
+  if (d.t && d.t.startsWith("ai-")) { aiOnData(from, d); return; }
+  switch (d.t) {
+    case "hello":
+      e.name = d.name; e.meta = d.meta;
+      ensureCard(from);
+      if (isHost) {
+        roster.set(from, { name: d.name, meta: d.meta }); broadcastRoster();
+        aiRejoin(from, d.name);
+      }
+      break;
+    case "ai-next": ai.next = d.next; break;
+    case "ai-reset": try { ai.engine?.reset?.(); } catch {} break;
+    case "ai-layers": ai.layersByName = d.by; loadCardRender(); break;
+    case "ai-start-req":
+      if (MODELS[d.model]) $("ai-model").value = d.model;   // every screen shows the model that was actually started
+      $("ai-start").disabled = true; $("ai-model").disabled = true;
+      if (d.boss !== peer.id) { aiLoading(true, `starting ${MODELS[d.model]?.label.split("\u00b7")[0].trim()}`); $("ldg-sub").textContent = `${d.by} pressed start`; $("ldg-fill").style.width = "0%"; }
+      if (d.boss === peer.id) { toast(`${d.by} started ${MODELS[d.model]?.label.split("\u00b7")[0].trim()}`); aiStart(d.model); }
+      else aiStatus(`${d.by} started the model\u2026`);
+      break;
+    case "roster":
+      // connect to any member I don't know yet (mesh completion)
+      // exactly one side initiates (larger id), so no duplicate connections
+      for (const m of d.members) {
+        if (m.id !== peer.id && !conns.has(m.id) && peer.id > m.id) meshConnect(m.id);
+      }
+      break;
+    case "ping": sendTo(from, { t: "pong", ts: d.ts }); break;
+    case "pong": {
+      e.rtt = Math.round(performance.now() - d.ts);
+      if (e.card) e.card.querySelector(".rtt").textContent = e.rtt + " ms";
+      break;
+    }
+    case "pledge":
+      if (e) { e.meta = { ...e.meta, contribGB: d.gb }; if (e.card) e.card.querySelector(".buf").textContent = "gives " + d.gb + " GB"; updateCluster(); }
+      break;
+    case "bw-start": bwRecv.set(from, { bytes: 0, t0: performance.now() }); break;
+    case "bw-end": {
+      const st = bwRecv.get(from);
+      if (st) {
+        const secs = (performance.now() - st.t0) / 1000;
+        const mbps = (st.bytes * 8 / 1e6 / secs).toFixed(0);
+        sendTo(from, { t: "bw-result", mbps });
+        bwRecv.delete(from);
+      }
+      break;
+    }
+    case "bw-result":
+      if (e.card) e.card.querySelector(".bw").textContent = d.mbps + " Mbps";
+      log("swarm", `bandwidth to ${e.name}: ${d.mbps} Mbps`);
+      break;
+  }
+}
+
+function broadcastRoster() {
+  const members = [{ id: peer.id, name: myName, meta: myMeta },
+    ...[...roster.entries()].map(([id, m]) => ({ id, ...m }))];
+  broadcastAll({ t: "roster", members });
+}
+
+function meshConnect(targetId) {
+  const conn = peer.connect(targetId, { reliable: true });
+  conn.on("open", () => {
+    wire(conn);
+    conn.send({ t: "hello", name: myName, meta: myMeta });
+  });
+}
+
+async function bwTest(id) {
+  const e = conns.get(id);
+  if (!e) return;
+  log("swarm", `testing bandwidth to ${e.name}…`);
+  sendTo(id, { t: "bw-start" });
+  const chunk = new Uint8Array(64 * 1024);
+  const total = 4 * 1024 * 1024;
+  for (let sent = 0; sent < total; sent += chunk.length) {
+    e.conn.send(chunk);
+    // yield so the datachannel buffer can drain
+    if (e.conn.dataChannel && e.conn.dataChannel.bufferedAmount > 1 << 20)
+      await new Promise(r => setTimeout(r, 20));
+  }
+  sendTo(id, { t: "bw-end" });
+}
+
+// --- ping loop ---
+setInterval(() => broadcastAll({ t: "ping", ts: performance.now() }), 2500);
+
+const stepGB = (d) => { const i = $("join-gb"); const lo = parseFloat(i.min) || 1; const st = parseFloat(i.step) || 1; i.value = Math.min(64, Math.max(lo, (parseFloat(i.value) || lo) + d * st)); };
+$("gb-minus").addEventListener("click", () => stepGB(-1));
+$("gb-plus").addEventListener("click", () => stepGB(1));
+// --- join / create ---
+async function start(create) {
+  myName = $("name-input").value.trim() || (create ? "host" : "peer") + "-" + rand(2);
+  const code = create ? rand(4) : $("code-input").value.trim().toUpperCase();
+  if (!code) { $("join-status").textContent = "enter a room code"; return; }
+  $("create-btn").disabled = $("join-btn").disabled = true;
+  $("join-status").textContent = "connecting to signaling…";
+  myMeta = await metaPromise;
+  const gbIn = parseFloat($("join-gb").value);
+  myMeta.contribGB = Math.max(myMeta.phone ? 0.5 : 1, gbIn > 0 ? gbIn : (myMeta.contribGB || 1));
+
+  // STUN for hole-punching; TURN as fallback for symmetric NAT / CGNAT peers.
+  // ICE prefers direct candidates, so TURN only carries traffic when a direct
+  // path is impossible.
+  const ICE = {
+    iceServers: [
+      { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+      // TURN fallback for symmetric-NAT peers goes here (needs credentials —
+      // see TURN_CREDS below); without it, strict-NAT peers can't join.
+      ...(window.TURN_SERVERS || []),
+    ],
+  };
+  // host claims the well-known id for the code; joiners get random ids
+  peer = new Peer(create ? PREFIX + code : undefined, { debug: 1, config: ICE });
+
+  peer.on("open", () => {
+    isHost = create;
+    roomCode = code;
+    if (create) { enterRoom(); return; }
+    // joiner: connect to host
+    $("join-status").textContent = "joining room " + code + "…";
+    const conn = peer.connect(PREFIX + code, { reliable: true });
+    const timeout = setTimeout(() => {
+      const ice = conn.peerConnection?.iceConnectionState;
+      $("join-status").textContent =
+        ice === "checking" || ice === "failed" || ice === "disconnected"
+          ? "found the room, but the direct connection failed (strict NAT/firewall on one side) — trying relay, give it ~20s or try another network"
+          : "no room with that code (is the host page open?)";
+      $("create-btn").disabled = $("join-btn").disabled = false;
+    }, 15000);
+    conn.on("open", () => {
+      clearTimeout(timeout);
+      wire(conn, "host");
+      let died = null;
+      try { const c = JSON.parse(localStorage.getItem("swarm-crumb") || "null"); if (c && Date.now() - c.t < 10 * 60 * 1000) died = { during: c.s, ago: Math.round((Date.now() - c.t) / 1000) }; } catch {}
+      conn.send({ t: "hello", name: myName, meta: myMeta, died });
+      enterRoom();
+    });
+  });
+
+  peer.on("connection", (conn) => {
+    conn.on("open", () => {
+      wire(conn);
+      conn.send({ t: "hello", name: myName, meta: myMeta });
+    });
+  });
+
+  peer.on("error", (err) => {
+    if (err.type === "unavailable-id")
+      $("join-status").textContent = "that code is already hosting — pick Join instead";
+    else if (err.type === "peer-unavailable")
+      $("join-status").textContent = "no room with that code";
+    else
+      $("join-status").textContent = "error: " + err.type;
+    $("create-btn").disabled = $("join-btn").disabled = false;
+  });
+}
+
+let wakeLock = null, awakeVideo = null;
+function awakeStatus(s) { const el = $("awake"); if (el && myMeta?.phone) el.textContent = s; }
+async function keepAwake() {
+  // 1. the real API (iOS 16.4+, must be called from a tap)
+  try {
+    if (!wakeLock && navigator.wakeLock) {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; awakeStatus("screen lock: released"); });
+      awakeStatus("screen stays awake \u2713");
+    }
+  } catch (e) { awakeStatus("wake lock failed: " + (e?.message || e)); }
+  // 2. belt and braces: a silent looping video keeps iOS from locking the screen
+  try {
+    if (!awakeVideo) {
+      awakeVideo = document.createElement("video");
+      awakeVideo.setAttribute("playsinline", ""); awakeVideo.muted = true; awakeVideo.loop = true;
+      awakeVideo.style.cssText = "position:fixed;width:1px;height:1px;opacity:0.01;pointer-events:none;bottom:0;left:0";
+      awakeVideo.src = "data:video/mp4;base64,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";
+      document.body.appendChild(awakeVideo);
+    }
+    await awakeVideo.play();
+    if (!wakeLock) awakeStatus("screen stays awake (video) \u2713");
+  } catch (e) { if (!wakeLock) awakeStatus("\u26a0 can\u2019t keep the screen awake: set Auto-Lock to Never"); }
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") keepAwake(); });
+document.addEventListener("touchstart", keepAwake, { passive: true });
+$("create-btn").addEventListener("click", () => { keepAwake(); start(true); });
+// (auto-rejoin removed: the user prefers to see what happened)
+$("join-btn").addEventListener("click", () => { keepAwake(); start(false); });
+$("code-input").addEventListener("keydown", (e) => { if (e.key === "Enter") start(false); });
+$("room-badge").addEventListener("click", () => {
+  navigator.clipboard?.writeText(roomCode);
+  log("swarm", "room code copied");
+});
+
+// ================= distributed inference =================
+const MODELS = {
+  "qwen3-0.6b": { label: "Qwen3 0.6B · Q8", kind: "gguf",
+    gguf: "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+    cfg: "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json",
+    tok: "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json" },
+  "qwen3-1.7b": { label: "Qwen3 1.7B · Q8", kind: "gguf",
+    gguf: "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf",
+    cfg: "https://huggingface.co/Qwen/Qwen3-1.7B/resolve/main/config.json",
+    tok: "https://huggingface.co/Qwen/Qwen3-1.7B/resolve/main/tokenizer.json" },
+  "qwen3-4b": { label: "Qwen3 4B · Q8", kind: "gguf",
+    gguf: "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q8_0.gguf",
+    cfg: "https://huggingface.co/Qwen/Qwen3-4B/resolve/main/config.json",
+    tok: "https://huggingface.co/Qwen/Qwen3-4B/resolve/main/tokenizer.json" },
+  "qwen3.8-27b": { label: "Qwen 3.8 27B \u00b7 Q4", kind: "qwen35",
+    gguf: "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q4_0.gguf" },
+  "smollm-135m": { label: "SmolLM 135M · bf16", kind: "safetensors",
+    st: "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/model.safetensors",
+    cfg: "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/config.json",
+    tok: "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/tokenizer.json" },
+};
+const MAX_SEQ = 512;
+
+// ---- on-disk cache of weight ranges (Cache API): a second start skips the download ----
+let weightCache = null, cacheHits = 0;
+async function getWeightCache() {
+  if (weightCache !== null) return weightCache;
+  try { weightCache = await caches.open("swarmllm-weights-v1"); } catch { weightCache = false; }
+  return weightCache;
+}
+function cacheKey(url, lo, hi) { return "https://weights.swarmllm.ai/" + encodeURIComponent(url) + "/" + lo + "-" + hi; }
+async function rangeFetch(url, lo, hi, noCache = false) {
+  const c = await getWeightCache();
+  const key = cacheKey(url, lo, hi);
+  if (c && !noCache) {
+    try {
+      const hit = await c.match(key);
+      if (hit) {
+        // only trust a complete entry: a tab that died mid-write leaves a short one behind
+        if (hit.headers.get("x-swarm-len") === String(hi - lo + 1)) { cacheHits += hi - lo + 1; return hit; }
+        c.delete(key).catch(() => {});
+      }
+    } catch {}
+  }
+  const r = await fetch(url, { headers: { Range: `bytes=${lo}-${hi}` } });
+  if (r.status !== 206) throw new Error("model host refused range requests");
+  if (c && !myMeta?.phone) {   // phones skip the store (no spare RAM for the copy); Cache API refuses 206s, so store as a plain 200
+    try {
+      // buffer the copy fully first, so a complete body is the only thing that ever gets stored
+      r.clone().arrayBuffer().then((buf) => {
+        if (buf.byteLength !== hi - lo + 1) return;
+        return c.put(key, new Response(buf, { status: 200, headers: { "content-type": "application/octet-stream", "x-swarm-len": String(buf.byteLength) } }));
+      }).then(() => { ai.cachedBytes = (ai.cachedBytes || 0) + (hi - lo + 1); }, () => {});
+    } catch {}
+  }
+  return r;
+}
+async function fetchGGUFHeader(url, needTokenizer = true) {
+  let size = 12 * 2 ** 20;
+  for (;;) {
+    const r = await rangeFetch(url, 0, size - 1);   // 206 from the network, 200 from the cache
+    const buf = await r.arrayBuffer();
+    try { return parseGGUFHeader(buf, { skipTokenizer: !needTokenizer }); }
+    catch (e) { if (size > 256 * 2 ** 20) throw e; size *= 2; }
+  }
+}
+let pacerHook = null;
+const streamWithRetry = (url, streamOpts) => async (info) => {
+  try { return await streamEntryToGPU(ai.device, info, openRangeOf(url), streamOpts); }
+  catch (e) {
+    if (!/short tensor/.test(String(e))) throw e;
+    const c = await getWeightCache();
+    if (c) c.delete(cacheKey(url, info.byteOffset, info.byteOffset + info.byteLength - 1)).catch(() => {});
+    return streamEntryToGPU(ai.device, info, (i) => rangeFetch(url, i.byteOffset, i.byteOffset + i.byteLength - 1, true), streamOpts);
+  }
+};
+const openRangeOf = (url) => async (info) => {
+  if (pacerHook) await pacerHook();
+  crumb("streaming " + info.name + " (" + (info.byteLength / 2 ** 20).toFixed(0) + " MB)");
+  return rangeFetch(url, info.byteOffset, info.byteOffset + info.byteLength - 1);
+};
+const rangeBytesOf = (url) => async (info) => {
+  if (pacerHook) await pacerHook();
+  crumb("fetching " + info.name + " (" + (info.byteLength / 2 ** 20).toFixed(0) + " MB)");
+  let r = await rangeFetch(url, info.byteOffset, info.byteOffset + info.byteLength - 1);
+  let bytes = new Uint8Array(await r.arrayBuffer());
+  if (bytes.length !== info.byteLength) {
+    r = await rangeFetch(url, info.byteOffset, info.byteOffset + info.byteLength - 1, true);
+    bytes = new Uint8Array(await r.arrayBuffer());
+    if (bytes.length !== info.byteLength) throw new Error(`short download for ${info.name}: ${bytes.length}/${info.byteLength} bytes`);
+  }
+  return bytes;
+};
+
+let ai = {
+  engine: null, tok: null, cfg: null, device: null,
+  role: null,            // "host" | "worker"
+  chain: [],             // host: worker peer ids in pipeline order
+  next: null,            // worker: peer id to forward hidden to, or "host"
+  readyPeers: new Set(),
+  pos: 0,
+  waiters: new Map(),    // pos -> resolve(hiddenF32) for host awaiting return
+  busy: false,
+};
+
+function aiStatus(s) { $("ai-status").textContent = s; crumb(s); }
+// breadcrumb: if iOS kills the tab, the reloaded page can say where it died
+function crumb(s) { try { localStorage.setItem("swarm-crumb", JSON.stringify({ s, t: Date.now(), mem: performance.memory?.usedJSHeapSize })); } catch {} }
+// (crumb is kept in localStorage for debugging, not shown on the join screen)
+function aiLoading(show, title) {
+  $("ai-loading").style.display = show ? "block" : "none";
+  if (title) $("ldg-title").textContent = title;
+  $("ai-panel").classList.toggle("loading", !!show);
+  $("load-card").classList.toggle("on", !!show);
+  $("ai-empty").style.display = show ? "none" : "";
+  if (show) { $("lc-model").textContent = MODELS[$("ai-model").value]?.label.split("\u00b7")[0].trim() || ""; loadCardRender(); }
+}
+function loadCardRender() {
+  const rows = $("lc-rows"); if (!rows) return;
+  const names = [myName, ...[...conns.values()].map((c) => c.name)];
+  const layersOf = (nm) => (ai.layersByName || {})[nm];
+  rows.innerHTML = names.map((nm) => {
+    const pct = Math.max(0, Math.min(100, (ai.prog || {})[nm] ?? 0));
+    const l = layersOf(nm);
+    return `<div class="lc-row${pct >= 100 ? " done" : ""}"><div class="n">${nm}${l ? `<small>layers ${l}</small>` : ""}</div><div class="bar"><div class="fill" style="width:${pct}%"></div></div><div class="pct">${pct >= 100 ? "ready" : pct + "%"}</div></div>`;
+  }).join("");
+}
+function aiProgress(done, total, note) {
+  const pct = total ? Math.min(100, Math.round(done / total * 100)) : 0;
+  $("ldg-fill").style.width = pct + "%";
+  $("ldg-sub").textContent = `${(done / 2 ** 20).toFixed(0)} MB of ${(total / 2 ** 20).toFixed(0)} MB · ${pct}%` + (note ? " · " + note : "");
+}
+function aiOut() { const o = $("ai-output"); o.style.display = "block"; $("ai-empty").style.display = "none"; return o; }
+function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function md(src) {
+  let s = esc(src);
+  s = s.replace(/```([\s\S]*?)```/g, (_, c) => `<pre>${c.trim()}</pre>`);
+  s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>").replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>");
+  const lines = s.split("\n");
+  let out = "", list = null, para = [];
+  const flushP = () => { if (para.length) { out += `<p>${para.join("<br>")}</p>`; para = []; } };
+  const flushL = () => { if (list) { out += `</${list}>`; list = null; } };
+  for (const ln of lines) {
+    const h = ln.match(/^(#{1,4})\s+(.*)$/);
+    const ul = ln.match(/^\s*[-*]\s+(.*)$/);
+    const ol = ln.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (ln.startsWith("<pre>")) { flushP(); flushL(); out += ln; continue; }
+    if (h) { flushP(); flushL(); const lv = Math.min(4, h[1].length + 1); out += `<h${lv}>${h[2]}</h${lv}>`; continue; }
+    if (ul) { flushP(); if (list !== "ul") { flushL(); list = "ul"; out += "<ul>"; } out += `<li>${ul[1]}</li>`; continue; }
+    if (ol) { flushP(); if (list !== "ol") { flushL(); list = "ol"; out += "<ol>"; } out += `<li>${ol[1]}</li>`; continue; }
+    if (!ln.trim()) { flushP(); flushL(); continue; }
+    flushL(); para.push(ln);
+  }
+  flushP(); flushL();
+  return out;
+}
+let botEl = null;
+function chatUser(name, text) {
+  const o = aiOut();
+  const m = document.createElement("div");
+  m.className = "m user";
+  m.innerHTML = `<div class="who">${esc(name)}</div><div class="bubble">${esc(text)}</div>`;
+  o.appendChild(m); o.scrollTop = o.scrollHeight;
+}
+function chatBotStart() {
+  const o = aiOut();
+  const m = document.createElement("div");
+  m.className = "m bot";
+  m.innerHTML = `<div class="who">swarm</div><div class="bubble"><span class="cursor"></span></div>`;
+  o.appendChild(m); o.scrollTop = o.scrollHeight;
+  botEl = m;
+}
+function chatBotUpdate(raw) {
+  if (!botEl) chatBotStart();
+  botEl.querySelector(".bubble").innerHTML = md(raw) + '<span class="cursor"></span>';
+  $("ai-output").scrollTop = $("ai-output").scrollHeight;
+}
+function chatBotEnd(raw, stats) {
+  if (!botEl) chatBotStart();
+  botEl.querySelector(".bubble").innerHTML = md(raw);
+  if (stats) { const s = document.createElement("div"); s.className = "stats"; s.textContent = stats; botEl.appendChild(s); }
+  botEl = null;
+}
+
+function badF32(a) {
+  for (let i = 0; i < a.length; i += 97) if (!Number.isFinite(a[i])) return true;
+  return !Number.isFinite(a[0]) || !Number.isFinite(a[a.length - 1]);
+}
+function f32ToB64(f) {
+  const u = new Uint8Array(f.buffer, f.byteOffset, f.byteLength);
+  let s = "";
+  for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function b64ToF32(b) {
+  const s = atob(b);
+  const u = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
+  return new Float32Array(u.buffer);
+}
+
+async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
+  const M = MODELS[modelKey];
+  aiLoading(true, `downloading layers ${range[0]}\u2013${range[1] - 1} of ${M.label.split("\u00b7")[0].trim()}`);
+  aiStatus("requesting GPU\u2026");
+  mascot("Grabbing my slice of the model… hang tight.");
+  // a previous attempt in this tab still owns its weights: release them first, or the
+  // second load doubles GPU memory and every buffer after the limit comes back invalid
+  if (ai.device) { try { ai.device.destroy(); } catch {} ai.device = null; ai.engine = null; }
+  ai.firstGpuError = null;
+  const adapter = await navigator.gpu?.requestAdapter();
+  if (!adapter) throw new Error("no WebGPU on this device");
+  ai.device = await adapter.requestDevice({
+    requiredLimits: {
+      maxBufferSize: myMeta?.phone ? Math.min(adapter.limits.maxBufferSize, 256 * 2 ** 20) : adapter.limits.maxBufferSize,
+      maxStorageBufferBindingSize: myMeta?.phone ? Math.min(adapter.limits.maxStorageBufferBindingSize, 256 * 2 ** 20) : adapter.limits.maxStorageBufferBindingSize,
+    },
+  });
+  ai.device.addEventListener?.("uncapturederror", (ev) => {
+    const gmsg = ev.error?.message || "";
+    if (!ai.firstGpuError) { ai.firstGpuError = gmsg; aiStatus("GPU error: " + gmsg.slice(0, 300)); log("swarm", "\u26a0 FIRST GPU error on " + myName + ": " + gmsg.slice(0, 600)); }
+    crumb("GPU validation error: " + gmsg.slice(0, 400));
+    if (ai.hostId && ai.role !== "host") sendTo(ai.hostId, { t: "ai-error", message: "GPU error: " + (ev.error?.message || "").slice(0, 300) });
+    log("swarm", "\u26a0 GPU error on " + myName + ": " + (ev.error?.message || "").slice(0, 140));
+  });
+  if (location.hash === "#debug") log("swarm", `${myName}: maxBuf ${(adapter.limits.maxBufferSize / 2 ** 30).toFixed(1)} GB \u00b7 maxBind ${(adapter.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0)} MB`);
+  aiStatus("testing GPU kernels on this device\u2026");
+  const tAdapter = await navigator.gpu.requestAdapter();   // an adapter gives out one device only
+  const tdev = await tAdapter.requestDevice();               // throwaway: its test buffers die with it
+  const st = await gpuSelfTest(tdev);
+  if (!st.ok) log("swarm", `${myName} GPU self-test: ${st.detail}`);
+  if (!st.ok) throw new Error("GPU self-test FAILED on this device: " + st.detail + " \u2014 please screenshot this");
+  const mt = await kernelMicroTests(tdev);
+  if (!mt.ok) log("swarm", `${myName} kernels: ${mt.detail}`);
+  if (!mt.ok) throw new Error("GPU kernel FAILED on this device \u2192 " + mt.firstFail + " \u2014 please send me this line");
+  try { tdev.destroy(); } catch {}
+  ai.device.lost.then((l) => crumb("GPU device lost: " + l.reason + " " + l.message));
+  const isPhone = myMeta?.phone;
+  ai.myPct = 0;
+  ai.prog = { [myName]: 0 }; ai.progAt = { [myName]: Date.now() };
+  const streamOpts = { pace: isPhone ? 300 : 0, staging: isPhone ? 2 * 2 ** 20 : 8 * 2 ** 20 };
+  if (M.cfg) {
+    ai.cfg = await (await fetch(M.cfg)).json();
+    if (hasEmbed || hasHead) ai.tok = makeTokenizer(await (await fetch(M.tok)).json());
+  }
+
+  const onProg = (done, total) => {
+    aiProgress(done, total);
+    aiStatus(cacheHits > done * 0.5 ? `loading weights from this device's cache\u2026` : `downloading weights\u2026`);
+    ai.myPct = total ? done / total * 100 : 0;
+    ai.prog = ai.prog || {}; ai.progAt = ai.progAt || {};
+    ai.prog[myName] = Math.round(ai.myPct); ai.progAt[myName] = Date.now();
+    if (ai.role === "worker") sendTo(ai.hostId, { t: "ai-progress", pct: Math.round(ai.myPct) });
+    loadCardRender();
+  };
+  if (ai.role === "host") {
+    clearInterval(ai.progTimer);
+    ai.progTimer = setInterval(() => { if (ai.role === "host") broadcastAll({ t: "ai-hostprog", all: ai.prog || {}, at: Date.now() }); }, 600);
+  }
+  // every device (host included, even when its weights come from cache) keeps within a few
+  // percent of the slowest device, so the bars climb together and the room finishes as one
+  const slowest = () => {
+    const now = Date.now();
+    let m = Infinity;
+    for (const [nm, pct] of Object.entries(ai.prog || {})) {
+      if (nm === myName || pct >= 100) continue;
+      if (now - ((ai.progAt || {})[nm] || 0) > 30000) continue;     // silent for 30 s: don't wait on it
+      m = Math.min(m, pct);
+    }
+    return m;
+  };
+  const pacer = async () => {
+    while (ai.myPct < 100 && ai.myPct > slowest() + 4) {
+      aiStatus(`downloading weights\u2026 in step with the room (${Math.round(ai.myPct)}%)`);
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  };
+  pacerHook = pacer;
+
+  if (M.kind === "qwen35") {
+    aiStatus("reading model index\u2026");
+    const needTok = hasEmbed || hasHead;
+    const cachedOk = ai.G && ai.GModel === modelKey && (!needTok || ai.G.meta["tokenizer.ggml.tokens"]);
+    const G = cachedOk ? ai.G : await fetchGGUFHeader(M.gguf, needTok);
+    ai.G = G; ai.GModel = modelKey;
+    ai.cfg = { num_hidden_layers: G.meta["qwen35.block_count"] - (G.meta["qwen35.nextn_predict_layers"] || 0) };
+    if (hasEmbed || hasHead) ai.tok = makeTokenizer(tokenizerFromGGUF(G.meta));
+    const opts = { lo: range[0], hi: range[1], hasEmbed, hasHead };
+    const total = qwen35ShardBytes(G, opts);
+    G.streamEntry = streamWithRetry(M.gguf, streamOpts);
+    const weights = await qwen35Weights(G, rangeBytesOf(M.gguf), opts, (done) => onProg(done, total),
+      (e, name) => gpuUploadEntry(ai.device, e, name === GGML_EMBED));   // straight to the GPU, RAM stays flat
+    aiStatus("building GPU pipelines (compiling shaders)\u2026");
+    ai.engine = await Qwen35Engine.create({
+      device: ai.device, meta: G.meta, weights, vocab: G.tensors[GGML_EMBED]?.shape?.[0],
+      layerRange: range, hasEmbed, hasHead, maxSeq: MAX_SEQ,
+    });
+  } else if (M.kind === "gguf") {
+    aiStatus("reading model index\u2026");
+    const G = ai.G && ai.GModel === modelKey ? ai.G : await fetchGGUFHeader(M.gguf, false);   // vocab comes from tokenizer.json
+    ai.G = G; ai.GModel = modelKey;
+    const opts = { lo: range[0], hi: range[1], hasEmbed, hasHead };
+    const total = ggufShardBytes(G, opts);
+    G.streamEntry = streamWithRetry(M.gguf, streamOpts);
+    const weights = await ggufWeights(G, rangeBytesOf(M.gguf), opts, (done) => onProg(done, total),
+      (e, name) => gpuUploadEntry(ai.device, e, name === GGML_EMBED));
+    aiStatus("building GPU pipelines\u2026");
+    ai.engine = await BelloEngine.create({
+      device: ai.device, cfg: ai.cfg, weights,
+      layerRange: range, hasEmbed, hasHead, maxSeq: MAX_SEQ,
+    });
+  } else {
+    const names = shardTensorNames(ai.cfg, range, hasEmbed, hasHead);
+    const tensors = await fetchModelShard(M.st, names, (p, done, total) => onProg(done, total));
+    aiStatus("building GPU pipelines\u2026");
+    ai.engine = await BelloEngine.create({
+      device: ai.device, cfg: ai.cfg, tensors,
+      layerRange: range, hasEmbed, hasHead, maxSeq: MAX_SEQ,
+    });
+  }
+  ai.range = range;
+  ai.model = modelKey;
+  aiLoading(false);
+}
+
+// ---- host ----
+function biggestPeerId() {
+  const gb = (m) => m?.contribGB ?? 0;
+  let best = peer.id, bestGB = gb(myMeta);
+  for (const [id, e] of conns) if (gb(e.meta) > bestGB || (gb(e.meta) === bestGB && id < best)) { best = id; bestGB = gb(e.meta); }
+  return best;
+}
+function aiStartAnywhere() {
+  const model = $("ai-model").value;
+  const boss = biggestPeerId();
+  if (boss === peer.id) { aiStart(model); return; }
+  $("ai-start").disabled = true; $("ai-model").disabled = true;
+  aiLoading(true, `starting ${MODELS[model].label.split("\u00b7")[0].trim()}`);
+  $("ldg-sub").textContent = `${conns.get(boss)?.name || "the biggest device"} is dealing the layers`;
+  $("ldg-fill").style.width = "0%";
+  aiStatus(`asked ${conns.get(boss)?.name || "the biggest device"} to start ${MODELS[model].label.split("\u00b7")[0].trim()}\u2026`);
+  broadcastAll({ t: "ai-start-req", model, boss, by: myName });
+}
+async function aiStart(modelArg) {
+  if (ai.engine || ai.busy) return;
+  ai.busy = true;
+  if (typeof modelArg === "string") $("ai-model").value = modelArg;
+  $("ai-start").disabled = true;
+  $("ai-model").disabled = true;
+  try {
+    ai.role = "host";
+    const modelKey = $("ai-model").value;
+    const M = MODELS[modelKey];
+    ai.chain = [...conns.keys()].sort();
+    ai.plan = new Map();                      // name -> load message, so a reloaded device can be re-seated
+    ai.chainNames = ai.chain.map((id) => conns.get(id)?.name || id);
+    const n = ai.chain.length + 1;
+    let L, layerBytes, embedBytes, cfg = null;
+    if (M.kind === "qwen35") {
+      aiStatus("reading model index\u2026 (11 MB)");
+      ai.G = await fetchGGUFHeader(M.gguf);
+      ai.GModel = modelKey;
+      L = ai.G.meta["qwen35.block_count"] - (ai.G.meta["qwen35.nextn_predict_layers"] || 0);
+      layerBytes = qwen35ShardBytes(ai.G, { lo: 0, hi: 4, hasEmbed: false, hasHead: false }) / 4;
+      embedBytes = (ai.G.tensors[GGML_EMBED]?.byteLength || 0) + (ai.G.tensors[GGML_OUTPUT]?.byteLength || 0);
+    } else {
+      cfg = await (await fetch(M.cfg)).json();
+      L = cfg.num_hidden_layers;
+    }
+
+    // real per-shard byte costs (gguf: from the file's own index)
+    if (M.kind === "gguf") {
+      aiStatus("reading model index\u2026");
+      ai.G = await fetchGGUFHeader(M.gguf, false);
+      ai.GModel = modelKey;
+      layerBytes = Object.values(ggmlLayerNames(0))
+        .reduce((s, nm) => s + (ai.G.tensors[nm]?.byteLength || 0), 0);
+      embedBytes = (ai.G.tensors[GGML_EMBED]?.byteLength || 0) + (ai.G.tensors[GGML_OUTPUT]?.byteLength || 0);
+    } else if (M.kind === "safetensors") {
+      const d = cfg.hidden_size;
+      const kvDim = cfg.num_key_value_heads * ((cfg.head_dim || d / cfg.num_attention_heads));
+      layerBytes = (2 * d * d + 2 * kvDim * d + 3 * cfg.intermediate_size * d) * 4;
+      embedBytes = cfg.vocab_size * d * 4;
+    }
+    const pledgeOf = (m) => ((m?.contribGB ?? (m?.maxBufGB ? m.maxBufGB * 0.5 : 0.5))) * 2 ** 30;
+    const parts = [
+      { cap: Math.max(pledgeOf(myMeta) - embedBytes, layerBytes / 2) },
+      ...ai.chain.map((id) => ({ cap: Math.max(pledgeOf(conns.get(id)?.meta), layerBytes / 2) })),
+    ];
+    const totalCap = parts.reduce((s, p) => s + p.cap, 0);
+    const assigned = parts.map((p) => Math.floor(L * p.cap / totalCap));
+    const fracs = parts.map((p, i) => ({ i, f: L * p.cap / totalCap - assigned[i] })).sort((a, b) => b.f - a.f);
+    let rem = L - assigned.reduce((a, b) => a + b, 0);
+    for (let k = 0; k < rem; k++) assigned[fracs[k % fracs.length].i]++;
+    for (let i = 1; i < assigned.length; i++)
+      if (assigned[i] === 0) { const j = assigned.indexOf(Math.max(...assigned)); assigned[j]--; assigned[i]++; }
+    const ranges = [];
+    let acc = 0;
+    for (const a of assigned) { ranges.push([acc, acc + a]); acc += a; }
+
+    const needGB = (L * layerBytes + embedBytes) / 2 ** 30;
+    const haveGB = parts.reduce((s, p) => s + p.cap, embedBytes) / 2 ** 30;
+    if (needGB > haveGB * 1.15)
+      log("swarm", `\u26a0 this model needs ~${needGB.toFixed(1)} GB but the room pledged ~${haveGB.toFixed(1)} GB \u2014 it may not fit`);
+
+    ai.deferred = [];
+    ai.chain.forEach((id, i) => {
+      const msg = {
+        t: "ai-load", model: modelKey, range: ranges[i + 1],
+        next: i + 1 < ai.chain.length ? ai.chain[i + 1] : "host",
+        host: peer.id,
+      };
+      const small = false;   // everyone downloads at once (phones used to wait; the wait itself was the problem)
+      ai.plan.set(conns.get(id)?.name || id, { msg, small });
+      if (small) { ai.deferred.push({ id, msg }); sendTo(id, { t: "ai-wait" }); }
+      else sendTo(id, msg);
+    });
+    ai.layersByName = Object.fromEntries([[myName, `${ranges[0][0]}\u2013${ranges[0][1] - 1}`], ...ai.chain.map((id, i) => [conns.get(id)?.name || id, `${ranges[i + 1][0]}\u2013${ranges[i + 1][1] - 1}`])]);
+    broadcastAll({ t: "ai-layers", by: ai.layersByName });
+    const splitDesc = [`you ${assigned[0]}+embed`, ...ai.chain.map((id, i) =>
+      `${conns.get(id)?.name || id} ${assigned[i + 1]}`)].join(" \u00b7 ");
+    log("swarm", `${M.label} \u2014 layer split by pledge: ${splitDesc}`);
+    await aiLoadShard(modelKey, ranges[0], true, true);
+    aiStatus(n === 1
+      ? `solo: all ${L} layers local \u2014 ready`
+      : `layers ${ranges[0][0]}\u2013${ranges[0][1] - 1} ready \u00b7 syncing with ${ai.chain.length} device${ai.chain.length > 1 ? "s" : ""}\u2026`);
+    aiMaybeReady();
+  } catch (err) {
+    clearInterval(ai.progTimer);
+    aiLoading(false);
+    ai.engine = null;
+    $("ai-panel").classList.remove("online");
+    aiStatus("failed: " + err.message);
+    ai.busy = false;
+    $("ai-start").disabled = false;
+    $("ai-model").disabled = false;
+  }
+}
+
+// a device whose tab got reloaded comes back with a new peer id: put it back in its slot
+function aiRejoin(newId, name) {
+  if (ai.role !== "host" || !ai.plan?.has(name)) return;
+  const i = ai.chainNames.indexOf(name);
+  if (i < 0 || ai.chain[i] === newId || ai.chain.includes(newId)) return;
+  const oldId = ai.chain[i];
+  ai.chain[i] = newId;
+  ai.readyPeers.delete(oldId);
+  const { msg, small } = ai.plan.get(name);
+  const fresh = { ...msg, next: i + 1 < ai.chain.length ? ai.chain[i + 1] : "host", host: peer.id };
+  if (i > 0) sendTo(ai.chain[i - 1], { t: "ai-next", next: newId });
+  const dIdx = ai.deferred?.findIndex((d) => d.id === oldId) ?? -1;
+  if (dIdx >= 0) { ai.deferred[dIdx] = { id: newId, msg: fresh }; sendTo(newId, { t: "ai-wait" }); }
+  else sendTo(newId, fresh);
+  log("swarm", `${name} came back — reloading its layers`);
+  aiStatus(`${name} reconnected, reloading its layers…`);
+  $("ai-row").style.display = ai.readyPeers.size >= ai.chain.length ? "flex" : "none";
+}
+function aiMaybeReady() {
+  if (ai.role !== "host" || !ai.engine) return;
+  if (ai.deferred?.length && ai.readyPeers.size >= ai.chain.length - ai.deferred.length) {
+    // host and the big devices are done: now the small ones fetch their few layers
+    const d = ai.deferred; ai.deferred = [];
+    aiStatus(`big devices ready — loading ${d.length} small device(s) now…`);
+    for (const { id, msg } of d) sendTo(id, msg);
+    return;
+  }
+  if (ai.readyPeers.size < ai.chain.length) return;
+  const n = ai.chain.length + 1;
+  aiStatus(`cluster online — ${n} device${n > 1 ? "s" : ""}, ${ai.cfg.num_hidden_layers} layers split ${n} ways`);
+  clearInterval(ai.progTimer);
+  $("ai-panel").classList.add("online");
+  $("ai-row").style.display = "flex";
+  $("ai-empty").textContent = "cluster online. ask anything.";
+  $("ai-prompt").focus();
+  broadcastAll({ t: "ai-ready-all" });
+  mascot("Cluster online! Ask anything. Everyone in the room can.");
+}
+
+// run one token through the whole pipeline, returns logits
+async function aiPipeToken(id) {
+  const pos = ai.pos;
+  let h = await ai.engine.embedRun(id, pos);
+  if (badF32(h)) throw new Error(`NaN after HOST layers (pos ${pos}) — host GPU kernel issue`);
+  if (ai.chain.length) {
+    const returned = new Promise((res, rej) => {
+      ai.waiters.set(pos, res);
+      setTimeout(() => { ai.waiters.delete(pos); rej(new Error("pipeline timeout (peer gone?)")); }, 30000);
+    });
+    sendTo(ai.chain[0], { t: "ai-hidden", pos, data: f32ToB64(h) });
+    h = await returned;
+    if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos}) — check peer status lines`);
+  } // solo mode: engine holds every layer, embedRun already produced the final hidden
+  const logits = await ai.engine.headFromHidden(h);
+  if (badF32(logits)) throw new Error(`NaN in logits (pos ${ai.pos}) — head/lm_head kernel issue on host`);
+  ai.pos++;
+  return logits;
+}
+
+function aiSample(logits, temp = 0.8, topk = 40) {
+  const idx = [...logits.keys()].sort((a, b) => logits[b] - logits[a]).slice(0, topk);
+  const mx = logits[idx[0]];
+  const ps = idx.map((i) => Math.exp((logits[i] - mx) / temp));
+  const sum = ps.reduce((a, b) => a + b, 0);
+  let r = Math.random() * sum;
+  for (let i = 0; i < idx.length; i++) { r -= ps[i]; if (r <= 0) return idx[i]; }
+  return idx[0];
+}
+
+async function aiGenerate(textArg, who) {
+  const text = (textArg ?? $("ai-prompt").value).trim();
+  const asker = who || myName;
+  if (!text || ai.busy === "gen" || !ai.engine) return;
+  try { ai.engine.reset?.(); } catch {}
+  ai.pos = 0;
+  broadcastAll({ t: "ai-reset" });
+  ai.busy = "gen";
+  $("ai-prompt").value = "";
+  $("ai-send").disabled = true;
+  const V = ai.tok.vocab;
+  const imStart = V["<|im_start|>"], imEnd = V["<|im_end|>"], eot = V["<|endoftext|>"];
+  const ids = [imStart, ...ai.tok.encode("user\n" + text), imEnd,
+    ...ai.tok.encode("\n"), imStart, ...ai.tok.encode("assistant\n")];
+  // qwen3 thinking models: pre-close the think block so answers come straight
+  if (V["<think>"] !== undefined && V["</think>"] !== undefined)
+    ids.push(V["<think>"], ...ai.tok.encode("\n\n"), V["</think>"], ...ai.tok.encode("\n\n"));
+  if (ids.some((t) => !Number.isInteger(t)))
+    throw new Error("tokenizer produced an invalid token id (special tokens missing) \u2014 " + JSON.stringify(ids.slice(0, 6)));
+
+  chatUser(asker, text);
+  chatBotStart();
+  broadcastAll({ t: "ai-genstart", name: asker, text });
+  mascot("Thinking… every word is taking a lap through the room.");
+  aiStatus(`prefill: ${ids.length} tokens…`);
+
+  try {
+    let logits = null;
+    const tPre = performance.now();
+    for (const id of ids) logits = await aiPipeToken(id);
+    const t0 = performance.now();
+    let count = 0, reply = "";
+    for (let i = 0; i < 400; i++) {
+      const next = aiSample(logits);
+      if (next === imEnd || next === eot) { await aiPipeToken(next); break; }
+      const piece = ai.tok.decode([next]);
+      reply += piece;
+      count++;
+      chatBotUpdate(reply);
+      broadcastAll({ t: "ai-token", text: piece });
+      aiStatus(`generating… ${count} tok · ${(count / ((performance.now() - t0) / 1000)).toFixed(1)} tok/s`);
+      logits = await aiPipeToken(next);
+    }
+    const secs = (performance.now() - t0) / 1000;
+    const stats = `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices`;
+    chatBotEnd(reply, stats);
+    broadcastAll({ t: "ai-gendone", stats });
+    mascot("Done. Anyone in the room can ask the next one.");
+    aiStatus(`ready — prefill ${((t0 - tPre) / 1000).toFixed(1)}s, ${stats}`);
+  } catch (err) {
+    aiStatus("generation failed: " + err.message);
+    chatBotEnd("\u26a0 " + err.message, "");
+    broadcastAll({ t: "ai-gendone", stats: "failed: " + err.message });   // unlock everyone's send box
+  }
+  ai.busy = false;
+  $("ai-send").disabled = false;
+}
+
+// ---- worker + shared message handling ----
+async function aiOnData(from, d) {
+  const e = conns.get(from);
+  switch (d.t) {
+    case "ai-wait":
+      ai.role = "worker"; ai.hostId = from;
+      aiLoading(true, "Syncing with the room");
+      $("ldg-sub").textContent = "your turn comes after they finish downloading. keep this screen on.";
+      $("ldg-fill").style.width = "0%";
+      aiStatus("syncing with the room\u2026");
+      break;
+    case "ai-load": {
+      if (MODELS[d.model]) $("ai-model").value = d.model;
+      ai.role = "worker";
+      ai.next = d.next;
+      ai.hostId = d.host;
+      try {
+        await aiLoadShard(d.model || "smollm-135m", d.range, false, false);
+        aiStatus(`layers ${d.range[0]}\u2013${d.range[1] - 1} ready \u00b7 syncing with the room\u2026`);
+        aiLoading(true, `layers ${d.range[0]}\u2013${d.range[1] - 1} ready`);
+        $("ldg-sub").textContent = "syncing with the rest of the room";
+        $("ldg-fill").style.width = "100%";
+        sendTo(ai.hostId, { t: "ai-ready" });
+      } catch (err) {
+        aiLoading(false);
+        aiStatus("failed: " + err.message);
+        sendTo(ai.hostId, { t: "ai-error", message: err.message });
+      }
+      break;
+    }
+    case "ai-hostprog": {
+      const now = Date.now();
+      ai.prog = { ...(d.all || {}), [myName]: Math.round(ai.myPct || 0) };
+      ai.progAt = ai.progAt || {};
+      for (const nm of Object.keys(d.all || {})) if (nm !== myName) ai.progAt[nm] = now;
+      loadCardRender();
+      break;
+    }
+    case "ai-progress":
+      if (e?.card) e.card.querySelector(".bw").textContent = "dl " + d.pct + "%";
+      ai.prog = ai.prog || {}; ai.progAt = ai.progAt || {};
+      ai.prog[e?.name || from] = d.pct; ai.progAt[e?.name || from] = Date.now(); loadCardRender();
+      break;
+    case "ai-ready":
+      ai.readyPeers.add(from);
+      if (e?.card) e.card.querySelector(".bw").textContent = "ready";
+      aiMaybeReady();
+      break;
+    case "ai-error":
+      aiStatus(`peer ${e?.name || from} failed: ${d.message}`);
+      break;
+    case "ai-hidden": {
+      // worker: run my layers, forward along the chain
+      if (!ai.engine) return;
+      const hin = b64ToF32(d.data);
+      if (badF32(hin)) { aiStatus(`\u26a0 NaN ARRIVED at this device (pos ${d.pos}) — upstream peer broken`); }
+      const h = await ai.engine.runHidden(hin, d.pos);
+      if (badF32(h)) { aiStatus(`\u26a0 NaN PRODUCED by this device (pos ${d.pos}, layers ${ai.range[0]}\u2013${ai.range[1] - 1}) — GPU kernel issue here`); sendTo(ai.hostId, { t: "ai-error", message: `NaN produced on worker layers ${ai.range[0]}\u2013${ai.range[1] - 1}` }); }
+      const msg = { pos: d.pos, data: f32ToB64(h) };
+      if (ai.next === "host") sendTo(ai.hostId, { t: "ai-hiddenret", ...msg });
+      else sendTo(ai.next, { t: "ai-hidden", ...msg });
+      if (d.pos % 8 === 0) aiStatus(`serving layers ${ai.range[0]}–${ai.range[1] - 1} — pos ${d.pos}`);
+      break;
+    }
+    case "ai-hiddenret": {
+      // host: pipeline round-trip complete
+      const w = ai.waiters.get(d.pos);
+      if (w) { ai.waiters.delete(d.pos); w(b64ToF32(d.data)); }
+      break;
+    }
+    case "ai-genstart":
+      ai.remoteReply = "";
+      chatUser(d.name, d.text);
+      chatBotStart();
+      $("ai-send").disabled = true;
+      mascot(`${d.name} asked something. Thinking…`);
+      break;
+    case "ai-token": ai.remoteReply = (ai.remoteReply || "") + d.text; chatBotUpdate(ai.remoteReply); break;
+    case "ai-gendone": chatBotEnd(ai.remoteReply || "", d.stats); $("ai-send").disabled = false; mascot("Your turn. Ask anything."); break;
+    case "ai-ready-all":
+      aiLoading(false);
+      $("ai-panel").classList.add("online");
+      if (ai.role !== "host") { ai.role = ai.role || "guest"; ai.hostId = from; }
+      $("ai-row").style.display = "flex";
+      $("ai-empty").textContent = "cluster online. ask anything.";
+      aiStatus(`cluster online · serving layers ${ai.range ? ai.range[0] + "–" + (ai.range[1] - 1) : ""}`);
+      mascot("Cluster online! Type a question, the whole room answers.");
+      break;
+    case "ai-ask":
+      if (ai.role !== "host") break;
+      if (ai.busy === "gen") { sendTo(from, { t: "ai-busy" }); break; }
+      aiGenerate(d.text, d.name);
+      break;
+    case "ai-busy": toast("the swarm is still answering, try again in a moment"); break;
+  }
+}
+
+$("ai-start").addEventListener("click", aiStartAnywhere);
+$("cache-clear").addEventListener("click", async (ev) => {
+  ev.preventDefault();
+  try { await caches.delete("swarmllm-weights-v1"); weightCache = null; toast("cached weights cleared"); } catch { toast("could not clear the cache"); }
+});
+function aiSubmit() {
+  const text = $("ai-prompt").value.trim();
+  if (!text) return;
+  if (ai.role === "host") { aiGenerate(); return; }
+  const hostId = ai.hostId;
+  if (!conns.has(hostId)) { toast("not connected to the host"); return; }
+  $("ai-prompt").value = "";
+  sendTo(hostId, { t: "ai-ask", text, name: myName });
+}
+$("ai-send").addEventListener("click", aiSubmit);
+$("ai-prompt").addEventListener("keydown", (e) => { if (e.key === "Enter") aiSubmit(); });
+mascot("Hi! I'm Swarmy. Create a room, or type a friend's code to join one.");
+</script>
+</body>
+</html>

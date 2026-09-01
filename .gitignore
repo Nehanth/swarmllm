@@ -1,0 +1,14 @@
+# model weights & local data (downloaded, never committed)
+engine/model/
+engine/qwen/
+engine/qwen17/
+engine/q38/
+*.gguf
+*.mov
+*.mp4
+*.ips
+# local tooling
+.vercel/
+.gstack/
+node_modules/
+local-server/
