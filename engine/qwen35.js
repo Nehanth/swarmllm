@@ -201,8 +201,9 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop" }) {
     this.device = device;
+    this.mvVariant = matvecVariant;
     const M = meta;
     const dim = M["qwen35.embedding_length"];
     const nH = M["qwen35.attention.head_count"];
@@ -240,6 +241,8 @@ export class Qwen35Engine {
     const G1 = {
       matvec: ["ro", "ro", "rw", "u"], matvec_q8: ["ro", "ro", "ro", "rw", "u"],
       matvec_q4: ["ro", "ro", "ro", "rw", "u"],
+      matvec_coop: ["ro", "ro", "rw", "u"], matvec_q8_coop: ["ro", "ro", "ro", "rw", "u"],
+      matvec_q4_coop: ["ro", "ro", "ro", "rw", "u"],
       rmsnorm: ["ro", "ro", "rw", "u"], head_norm: ["rw", "ro", "u"],
       attn_scores: ["ro", "ro", "rw"], attn_softmax: ["rw"],
       attn_out: ["ro", "ro", "rw"], silu_mul: ["rw", "ro"], add_res: ["rw", "ro"],
@@ -322,10 +325,12 @@ export class Qwen35Engine {
       e2.qs = e2.scales = e2.data = null; // release CPU copy once it lives on the GPU
       return r;
     };
+    const coop = this.mvVariant === "coop";
     const mv = (w, x, y, dOut, dIn) => {
-      const pipe = w.kind === "q8" ? "matvec_q8" : w.kind === "q4" ? "matvec_q4" : "matvec";
+      const base = w.kind === "q8" ? "matvec_q8" : w.kind === "q4" ? "matvec_q4" : "matvec";
+      const pipe = coop ? base + "_coop" : base;
       const bufs = w.kind === "f32" ? [w.buf, x, y, this._shape(dOut, dIn)] : [w.qs, w.sc, x, y, this._shape(dOut, dIn)];
-      return { pipe, threads: dOut, bg: this._bg(this.pipes[pipe], 1, bufs) };
+      return { pipe, wgs: coop ? Math.ceil(dOut / 4) : Math.ceil(dOut / 64), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
     this._mv = mv;
     const bgNorm = (x, w, y) => this._bg(this.pipes.rmsnorm, 1, [x, w.buf, y, this.uDim]);
@@ -445,7 +450,12 @@ export class Qwen35Engine {
     pass.setBindGroup(1, bg);
     pass.dispatchWorkgroups(Math.ceil(threads / wg));
   }
-  _dop(pass, op) { this._d(pass, op.pipe, op.bg, op.threads); }
+  _dop(pass, op) {
+    pass.setPipeline(this.pipes[op.pipe]);
+    pass.setBindGroup(0, this.bgCommonFor[op.pipe]);
+    pass.setBindGroup(1, op.bg);
+    pass.dispatchWorkgroups(op.wgs);
+  }
   _setFrame(pos, seqLen) {
     this.device.queue.writeBuffer(this.frameBuf, 0, new Uint32Array([pos, seqLen]));
   }

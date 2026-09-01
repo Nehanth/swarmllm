@@ -393,6 +393,180 @@ fn add_res(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (i >= cfg.dim) { return; }
   ad_x[i] += ad_y[i];
 }
+
+// ============ cooperative matvec family ============
+// One workgroup of 256 threads computes 4 output rows together (the shape
+// llama.cpp's WebGPU backend, web-llm's generated kernels and zero-tvm all
+// converge on for decode GEMV). Thread t is split into a block-lane
+// (bl = t/4, striding the 32-element quant blocks) and a quarter (qt = t%4,
+// an 8-element slice inside the block), so consecutive threads read
+// consecutive words of the same row — coalesced — and each thread's slice of
+// the activation vector is loaded once and reused across all 4 rows.
+// Reduction is a portable shared-memory halving tree (no subgroups: absent
+// from shipping Safari 26). Requires dIn % 32 == 0 (already true everywhere).
+var<workgroup> mvc_part: array<f32, 1024>;   // [4 rows][256 threads]
+
+fn mvf_row(off: u32, xa: vec4<f32>, xb: vec4<f32>) -> f32 {
+  let wa = vec4<f32>(mv_w[off], mv_w[off + 1u], mv_w[off + 2u], mv_w[off + 3u]);
+  let wb = vec4<f32>(mv_w[off + 4u], mv_w[off + 5u], mv_w[off + 6u], mv_w[off + 7u]);
+  return dot(wa, xa) + dot(wb, xb);
+}
+@compute @workgroup_size(256)
+fn matvec_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x;
+  let qt = t & 3u;
+  let bl = t >> 2u;
+  let dIn = mv_shape.dIn;
+  let nb = dIn / 32u;
+  let row0 = wg.x * 4u;
+  let full = row0 + 3u < mv_shape.dOut;
+  var acc0 = 0.0; var acc1 = 0.0; var acc2 = 0.0; var acc3 = 0.0;
+  for (var b: u32 = bl; b < nb; b += 64u) {
+    let c0 = b * 32u + qt * 8u;
+    let xa = vec4<f32>(mv_x[c0], mv_x[c0 + 1u], mv_x[c0 + 2u], mv_x[c0 + 3u]);
+    let xb = vec4<f32>(mv_x[c0 + 4u], mv_x[c0 + 5u], mv_x[c0 + 6u], mv_x[c0 + 7u]);
+    let off = row0 * dIn + c0;
+    if (full) {
+      acc0 += mvf_row(off, xa, xb);
+      acc1 += mvf_row(off + dIn, xa, xb);
+      acc2 += mvf_row(off + 2u * dIn, xa, xb);
+      acc3 += mvf_row(off + 3u * dIn, xa, xb);
+    } else {
+      if (row0 < mv_shape.dOut) { acc0 += mvf_row(off, xa, xb); }
+      if (row0 + 1u < mv_shape.dOut) { acc1 += mvf_row(off + dIn, xa, xb); }
+      if (row0 + 2u < mv_shape.dOut) { acc2 += mvf_row(off + 2u * dIn, xa, xb); }
+    }
+  }
+  mvc_part[t] = acc0; mvc_part[256u + t] = acc1; mvc_part[512u + t] = acc2; mvc_part[768u + t] = acc3;
+  workgroupBarrier();
+  var stride: u32 = 128u;
+  while (stride > 0u) {
+    if (t < stride) {
+      mvc_part[t] += mvc_part[t + stride];
+      mvc_part[256u + t] += mvc_part[256u + t + stride];
+      mvc_part[512u + t] += mvc_part[512u + t + stride];
+      mvc_part[768u + t] += mvc_part[768u + t + stride];
+    }
+    workgroupBarrier();
+    stride = stride >> 1u;
+  }
+  if (t < 4u) {
+    let row = row0 + t;
+    if (row < mv_shape.dOut) { mv_y[row] = mvc_part[t * 256u]; }
+  }
+}
+
+fn q8_row(wBase: u32, sc: f32, xa: vec4<f32>, xb: vec4<f32>) -> f32 {
+  let w0 = bitcast<i32>(q8_qs[wBase]);
+  let w1 = bitcast<i32>(q8_qs[wBase + 1u]);
+  let d0 = vec4<f32>(f32(extractBits(w0, 0u, 8u)), f32(extractBits(w0, 8u, 8u)),
+                     f32(extractBits(w0, 16u, 8u)), f32(extractBits(w0, 24u, 8u)));
+  let d1 = vec4<f32>(f32(extractBits(w1, 0u, 8u)), f32(extractBits(w1, 8u, 8u)),
+                     f32(extractBits(w1, 16u, 8u)), f32(extractBits(w1, 24u, 8u)));
+  return sc * (dot(d0, xa) + dot(d1, xb));
+}
+@compute @workgroup_size(256)
+fn matvec_q8_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x;
+  let qt = t & 3u;
+  let bl = t >> 2u;
+  let dIn = q8_shape.dIn;
+  let nb = dIn / 32u;
+  let rowWords = dIn / 4u;
+  let row0 = wg.x * 4u;
+  let full = row0 + 3u < q8_shape.dOut;
+  var acc0 = 0.0; var acc1 = 0.0; var acc2 = 0.0; var acc3 = 0.0;
+  for (var b: u32 = bl; b < nb; b += 64u) {
+    let xBase = b * 32u + qt * 8u;
+    let xa = vec4<f32>(q8_x[xBase], q8_x[xBase + 1u], q8_x[xBase + 2u], q8_x[xBase + 3u]);
+    let xb = vec4<f32>(q8_x[xBase + 4u], q8_x[xBase + 5u], q8_x[xBase + 6u], q8_x[xBase + 7u]);
+    let wBase = row0 * rowWords + b * 8u + qt * 2u;
+    let scBase = row0 * nb + b;
+    if (full) {
+      acc0 += q8_row(wBase, q8_sc[scBase], xa, xb);
+      acc1 += q8_row(wBase + rowWords, q8_sc[scBase + nb], xa, xb);
+      acc2 += q8_row(wBase + 2u * rowWords, q8_sc[scBase + 2u * nb], xa, xb);
+      acc3 += q8_row(wBase + 3u * rowWords, q8_sc[scBase + 3u * nb], xa, xb);
+    } else {
+      if (row0 < q8_shape.dOut) { acc0 += q8_row(wBase, q8_sc[scBase], xa, xb); }
+      if (row0 + 1u < q8_shape.dOut) { acc1 += q8_row(wBase + rowWords, q8_sc[scBase + nb], xa, xb); }
+      if (row0 + 2u < q8_shape.dOut) { acc2 += q8_row(wBase + 2u * rowWords, q8_sc[scBase + 2u * nb], xa, xb); }
+    }
+  }
+  mvc_part[t] = acc0; mvc_part[256u + t] = acc1; mvc_part[512u + t] = acc2; mvc_part[768u + t] = acc3;
+  workgroupBarrier();
+  var stride: u32 = 128u;
+  while (stride > 0u) {
+    if (t < stride) {
+      mvc_part[t] += mvc_part[t + stride];
+      mvc_part[256u + t] += mvc_part[256u + t + stride];
+      mvc_part[512u + t] += mvc_part[512u + t + stride];
+      mvc_part[768u + t] += mvc_part[768u + t + stride];
+    }
+    workgroupBarrier();
+    stride = stride >> 1u;
+  }
+  if (t < 4u) {
+    let row = row0 + t;
+    if (row < q8_shape.dOut) { q8_y[row] = mvc_part[t * 256u]; }
+  }
+}
+
+fn q4_row(wIdx: u32, sc: f32, xlo: vec4<f32>, xhi: vec4<f32>) -> f32 {
+  let word = q4_qs[wIdx];
+  let lo = vec4<f32>(f32(word & 0xFu), f32((word >> 8u) & 0xFu),
+                     f32((word >> 16u) & 0xFu), f32((word >> 24u) & 0xFu)) - vec4<f32>(8.0);
+  let hi = vec4<f32>(f32((word >> 4u) & 0xFu), f32((word >> 12u) & 0xFu),
+                     f32((word >> 20u) & 0xFu), f32((word >> 28u) & 0xFu)) - vec4<f32>(8.0);
+  return sc * (dot(lo, xlo) + dot(hi, xhi));
+}
+@compute @workgroup_size(256)
+fn matvec_q4_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x;
+  let qt = t & 3u;
+  let bl = t >> 2u;
+  let dIn = q4_shape.dIn;
+  let nb = dIn / 32u;
+  let rowWords = dIn / 8u;   // 4 bits/weight -> dIn/8 u32 words per row
+  let row0 = wg.x * 4u;
+  let full = row0 + 3u < q4_shape.dOut;
+  var acc0 = 0.0; var acc1 = 0.0; var acc2 = 0.0; var acc3 = 0.0;
+  for (var b: u32 = bl; b < nb; b += 64u) {
+    // word qt of block b covers x[j..j+3] (low nibbles) and x[j+16..j+19] (high)
+    let j = b * 32u + qt * 4u;
+    let xlo = vec4<f32>(q4_x[j], q4_x[j + 1u], q4_x[j + 2u], q4_x[j + 3u]);
+    let xhi = vec4<f32>(q4_x[j + 16u], q4_x[j + 17u], q4_x[j + 18u], q4_x[j + 19u]);
+    let wIdx = row0 * rowWords + b * 4u + qt;
+    let scBase = row0 * nb + b;
+    if (full) {
+      acc0 += q4_row(wIdx, q4_sc[scBase], xlo, xhi);
+      acc1 += q4_row(wIdx + rowWords, q4_sc[scBase + nb], xlo, xhi);
+      acc2 += q4_row(wIdx + 2u * rowWords, q4_sc[scBase + 2u * nb], xlo, xhi);
+      acc3 += q4_row(wIdx + 3u * rowWords, q4_sc[scBase + 3u * nb], xlo, xhi);
+    } else {
+      if (row0 < q4_shape.dOut) { acc0 += q4_row(wIdx, q4_sc[scBase], xlo, xhi); }
+      if (row0 + 1u < q4_shape.dOut) { acc1 += q4_row(wIdx + rowWords, q4_sc[scBase + nb], xlo, xhi); }
+      if (row0 + 2u < q4_shape.dOut) { acc2 += q4_row(wIdx + 2u * rowWords, q4_sc[scBase + 2u * nb], xlo, xhi); }
+    }
+  }
+  mvc_part[t] = acc0; mvc_part[256u + t] = acc1; mvc_part[512u + t] = acc2; mvc_part[768u + t] = acc3;
+  workgroupBarrier();
+  var stride: u32 = 128u;
+  while (stride > 0u) {
+    if (t < stride) {
+      mvc_part[t] += mvc_part[t + stride];
+      mvc_part[256u + t] += mvc_part[256u + t + stride];
+      mvc_part[512u + t] += mvc_part[512u + t + stride];
+      mvc_part[768u + t] += mvc_part[768u + t + stride];
+    }
+    workgroupBarrier();
+    stride = stride >> 1u;
+  }
+  if (t < 4u) {
+    let row = row0 + t;
+    if (row < q4_shape.dOut) { q4_y[row] = mvc_part[t * 256u]; }
+  }
+}
 `;
 
 // ---------- weight entries ----------
@@ -434,10 +608,11 @@ export class BelloEngine {
     return e;
   }
 
-  async _init({ device, cfg, tensors, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512 }) {
+  async _init({ device, cfg, tensors, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, matvecVariant = "coop" }) {
     this.device = device;
     this.cfg = cfg;
     this.maxSeq = maxSeq;
+    this.mvVariant = matvecVariant;
     const dim = cfg.hidden_size;
     const nH = cfg.num_attention_heads;
     const nKV = cfg.num_key_value_heads;
@@ -465,6 +640,8 @@ export class BelloEngine {
     const G1 = {
       matvec: ["ro", "ro", "rw", "u"], matvec_q8: ["ro", "ro", "ro", "rw", "u"],
       matvec_q4: ["ro", "ro", "ro", "rw", "u"],
+      matvec_coop: ["ro", "ro", "rw", "u"], matvec_q8_coop: ["ro", "ro", "ro", "rw", "u"],
+      matvec_q4_coop: ["ro", "ro", "ro", "rw", "u"],
       rmsnorm: ["ro", "ro", "rw", "u"], head_norm: ["rw", "ro", "u"],
       rope: ["rw", "u"], attn_scores: ["ro", "ro", "rw"], attn_softmax: ["rw"],
       attn_out: ["ro", "ro", "rw"], silu_mul: ["rw", "ro"], add_res: ["rw", "ro"],
@@ -547,12 +724,12 @@ export class BelloEngine {
     for (const [k2, p] of Object.entries(this.pipes))
       this.bgCommonFor[k2] = this._bg(p, 0, [this.cfgBuf, this.frameBuf]);
 
+    const coop = this.mvVariant === "coop";
     const mv = (w, x, y, dOut, dIn) => {
-      if (w.kind === "q8" || w.kind === "q4") {
-        const pipe = w.kind === "q8" ? "matvec_q8" : "matvec_q4";
-        return { pipe, threads: dOut, bg: this._bg(this.pipes[pipe], 1, [w.qs, w.sc, x, y, this._shape(dOut, dIn)]) };
-      }
-      return { pipe: "matvec", threads: dOut, bg: this._bg(this.pipes.matvec, 1, [w.buf, x, y, this._shape(dOut, dIn)]) };
+      const base = w.kind === "q8" ? "matvec_q8" : w.kind === "q4" ? "matvec_q4" : "matvec";
+      const pipe = coop ? base + "_coop" : base;
+      const bufs = w.kind === "f32" ? [w.buf, x, y, this._shape(dOut, dIn)] : [w.qs, w.sc, x, y, this._shape(dOut, dIn)];
+      return { pipe, wgs: coop ? Math.ceil(dOut / 4) : Math.ceil(dOut / 64), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
     this._mv = mv;
     const bgNorm = (x, w, y) => this._bg(this.pipes.rmsnorm, 1, [x, w.buf, y, this.nBufDim]);
@@ -614,7 +791,12 @@ export class BelloEngine {
     pass.dispatchWorkgroups(Math.ceil(threads / wgSize));
   }
 
-  _dispatchOp(pass, op) { this._dispatch(pass, op.pipe, op.bg, op.threads); }
+  _dispatchOp(pass, op) {
+    pass.setPipeline(this.pipes[op.pipe]);
+    pass.setBindGroup(0, this.bgCommonFor[op.pipe]);
+    pass.setBindGroup(1, op.bg);
+    pass.dispatchWorkgroups(op.wgs);
+  }
 
   _setFrame(pos, seqLen) {
     this.device.queue.writeBuffer(this.frameBuf, 0, new Uint32Array([pos, seqLen]));
