@@ -428,6 +428,116 @@ ${treeAdd}
     workgroupBarrier();
     stride = stride >> 1u;
   }`;
+  // fused gate/up: two GEMVs sharing x, SiLU(g)*u epilogue in-kernel.
+  // Saves one full-size dispatch + the silu dispatch + the u round-trip per
+  // layer. Helpers are generated per concrete buffer (no pointer params:
+  // unrestricted_pointer_parameters is not guaranteed in Safari 26).
+  const guKernel = (kind, batched) => {
+    const P = kind === "f32" ? "guf" : kind === "q8" ? "gu8" : "gu4";
+    const shape = `${P}_shape`;
+    const decl = kind === "f32" ? `
+@group(1) @binding(0) var<storage, read> ${P}_gw: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read> ${P}_uw: array<vec4<f32>>;
+@group(1) @binding(2) var<storage, read> ${P}_x: array<vec4<f32>>;
+@group(1) @binding(3) var<storage, read_write> ${P}_y: array<f32>;
+@group(1) @binding(4) var<uniform> ${shape}: BShape;` : `
+@group(1) @binding(0) var<storage, read> ${P}_gqs: array<u32>;
+@group(1) @binding(1) var<storage, read> ${P}_gsc: array<u32>;
+@group(1) @binding(2) var<storage, read> ${P}_uqs: array<u32>;
+@group(1) @binding(3) var<storage, read> ${P}_usc: array<u32>;
+@group(1) @binding(4) var<storage, read> ${P}_x: array<vec4<f32>>;
+@group(1) @binding(5) var<storage, read_write> ${P}_y: array<f32>;
+@group(1) @binding(6) var<uniform> ${shape}: BShape;`;
+    const helpers = kind === "f32" ? "" : ["g", "u"].map((w) => kind === "q8" ? `
+fn ${P}_${w}row(wBase: u32, si: u32, xa: vec4<f32>, xb: vec4<f32>) -> f32 {
+  let sc = unpack2x16float(${P}_${w}sc[si >> 1u])[si & 1u];
+  let w0 = bitcast<i32>(${P}_${w}qs[wBase]);
+  let w1 = bitcast<i32>(${P}_${w}qs[wBase + 1u]);
+  let d0 = vec4<f32>(f32((w0 << 24u) >> 24u), f32((w0 << 16u) >> 24u), f32((w0 << 8u) >> 24u), f32(w0 >> 24u));
+  let d1 = vec4<f32>(f32((w1 << 24u) >> 24u), f32((w1 << 16u) >> 24u), f32((w1 << 8u) >> 24u), f32(w1 >> 24u));
+  return sc * (dot(d0, xa) + dot(d1, xb));
+}` : `
+fn ${P}_${w}row(wIdx: u32, si: u32, xlo: vec4<f32>, xhi: vec4<f32>) -> f32 {
+  let sc = unpack2x16float(${P}_${w}sc[si >> 1u])[si & 1u];
+  let word = ${P}_${w}qs[wIdx];
+  let lo = vec4<f32>(f32(word & 0xFu), f32((word >> 8u) & 0xFu), f32((word >> 16u) & 0xFu), f32((word >> 24u) & 0xFu)) - vec4<f32>(8.0);
+  let hi = vec4<f32>(f32((word >> 4u) & 0xFu), f32((word >> 12u) & 0xFu), f32((word >> 20u) & 0xFu), f32((word >> 28u) & 0xFu)) - vec4<f32>(8.0);
+  return sc * (dot(lo, xlo) + dot(hi, xhi));
+}`).join("");
+    const rowTerm = (which, r) => kind === "f32"
+      ? `dot(${P}_${which}w[off4 + ${r}u * dIn4], xa) + dot(${P}_${which}w[off4 + ${r}u * dIn4 + 1u], xb)`
+      : `${P}_${which}row(${kind === "q8" ? "wBase" : "wIdx"} + ${r}u * rowWords, scBase + ${r}u * nb, xa, xb)`;
+    const loads = kind === "q4" ? `
+      let xa = ${P}_x[xcol + b * 8u + qt];
+      let xb = ${P}_x[xcol + b * 8u + qt + 4u];
+      let wIdx = row0 * rowWords + b * 4u + qt;
+      let scBase = row0 * nb + b;` : kind === "q8" ? `
+      let xa = ${P}_x[xcol + b * 8u + qt * 2u];
+      let xb = ${P}_x[xcol + b * 8u + qt * 2u + 1u];
+      let wBase = row0 * rowWords + b * 8u + qt * 2u;
+      let scBase = row0 * nb + b;` : `
+      let xa = ${P}_x[xcol + b * 8u + qt * 2u];
+      let xb = ${P}_x[xcol + b * 8u + qt * 2u + 1u];
+      let off4 = row0 * dIn4 + b * 8u + qt * 2u;`;
+    const accs = (w) => Array.from({ length: ROWS }, (_, r) => `var ${w}${r} = 0.0;`).join(" ");
+    const body = (w, which) => `      if (full) {
+${Array.from({ length: ROWS }, (_, r) => `        ${w}${r} += ${rowTerm(which, r)};`).join("\n")}
+      } else {
+${Array.from({ length: ROWS - 1 }, (_, r) => `        if (row0 + ${r}u < dOut) { ${w}${r} += ${rowTerm(which, r)}; }`).join("\n")}
+      }`;
+    const reduceTo = (w, dest) => `
+${Array.from({ length: ROWS }, (_, r) => `  mvc_part[${r * WG}u + t] = ${w}${r};`).join("\n")}
+  workgroupBarrier();
+  {
+    var stride: u32 = ${WG / 2}u;
+    while (stride > 0u) {
+      if (t < stride) {
+${Array.from({ length: ROWS }, (_, r) => `        mvc_part[${r * WG}u + t] += mvc_part[${r * WG}u + t + stride];`).join("\n")}
+      }
+      workgroupBarrier();
+      stride = stride >> 1u;
+    }
+  }
+  ${dest}
+  workgroupBarrier();`;
+    const colBody = (m) => `
+  {
+    let xcol = ${batched ? `${m}u * ${shape}.xs4 * 0u + ${m}u * ${shape}.xs4` : "0u"};
+    ${accs("ag")}
+    ${accs("au")}
+    for (var b: u32 = bl; b < nb; b += ${LANES}u) {${loads}
+${body("ag", "g")}
+${body("au", "u")}
+    }
+${reduceTo("ag", `if (t < ${ROWS}u) { gu_res[t] = mvc_part[t * ${WG}u]; }`)}
+${reduceTo("au", `if (t < ${ROWS}u) {
+    let row = row0 + t;
+    if (row < dOut) {
+      let g = gu_res[t];
+      ${P}_y[${batched ? `${m}u * ${shape}.ys + row` : "row"}] = (g / (1.0 + exp(-g))) * mvc_part[t * ${WG}u];
+    }
+  }`)}
+  }`;
+    return `${batched ? "" : decl + helpers}
+@compute @workgroup_size(${WG})
+fn matvec${kind === "f32" ? "" : "_" + kind}_gu${batched ? "_b" : ""}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x;
+  let qt = t & 3u;
+  let bl = t >> 2u;
+  let dIn = ${shape}.dIn;
+  let dOut = ${shape}.dOut;
+  let nb = dIn / 32u;
+  let dIn4 = dIn / 4u;
+  let rowWords = ${kind === "q4" ? "dIn / 8u" : "dIn / 4u"};
+  let row0 = wg.x * ${ROWS}u;
+  let full = row0 + ${ROWS - 1}u < dOut;
+${batched ? [0, 1, 2, 3].map(colBody).join("\n") : colBody(0)}
+}`;
+  };
+  const guAll = `
+var<workgroup> gu_res: array<f32, ${ROWS}>;
+` + ["f32", "q8", "q4"].map((k) => guKernel(k, false)).join("\n")
+    + ["f32", "q8", "q4"].map((k) => guKernel(k, true)).join("\n");
   return /* wgsl */ `
 var<workgroup> mvc_part: array<f32, ${WG * ROWS}>;   // [${ROWS} rows][${WG} threads]
 
@@ -623,6 +733,7 @@ ${Array.from({ length: ROWS }, (_, r) => `        mvc_part[${r * WG}u + t] += mv
   }
   workgroupBarrier();`).join("\n")}
 }`).join("\n")}
+${guAll}
 `;
 }
 
@@ -703,6 +814,9 @@ export class BelloEngine {
       matvec_q4_coop: ["ro", "ro", "ro", "rw", "u"],
       matvec_coop_b: ["ro", "ro", "rw", "u"], matvec_q8_coop_b: ["ro", "ro", "ro", "rw", "u"],
       matvec_q4_coop_b: ["ro", "ro", "ro", "rw", "u"],
+      matvec_gu: ["ro", "ro", "ro", "rw", "u"], matvec_gu_b: ["ro", "ro", "ro", "rw", "u"],
+      matvec_q8_gu: ["ro", "ro", "ro", "ro", "ro", "rw", "u"], matvec_q8_gu_b: ["ro", "ro", "ro", "ro", "ro", "rw", "u"],
+      matvec_q4_gu: ["ro", "ro", "ro", "ro", "ro", "rw", "u"], matvec_q4_gu_b: ["ro", "ro", "ro", "ro", "ro", "rw", "u"],
       rmsnorm: ["ro", "ro", "rw", "u"], head_norm: ["rw", "ro", "u"],
       rope: ["rw", "u"], attn_scores: ["ro", "ro", "rw"], attn_softmax: ["rw"],
       attn_out: ["ro", "ro", "rw"], silu_mul: ["rw", "ro"], add_res: ["rw", "ro"],
@@ -795,6 +909,16 @@ export class BelloEngine {
       return { pipe, wgs: coop ? Math.ceil(dOut / this.coopRows) : Math.ceil(dOut / 64), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
     this._mv = mv;
+    // fused gate/up(+SiLU) op; null when kinds differ (fallback: unfused path)
+    const guOp = (wg2, wu2, x, y, dOut, dIn, xB, yB) => {
+      if (!coop || !wg2 || !wu2 || wg2.kind !== wu2.kind) return null;
+      const base = wg2.kind === "q8" ? "matvec_q8_gu" : wg2.kind === "q4" ? "matvec_q4_gu" : "matvec_gu";
+      const pipe = xB ? base + "_b" : base;
+      const shp = xB ? this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4) : this._shapeB(dOut, dIn, 0, 0);
+      const bufs = wg2.kind === "f32" ? [wg2.buf, wu2.buf, x, y, shp] : [wg2.qs, wg2.sc, wu2.qs, wu2.sc, x, y, shp];
+      return { pipe, wgs: Math.ceil(dOut / this.coopRows), bg: this._bg(this.pipes[pipe], 1, bufs) };
+    };
+    this._guOp = guOp;
     const bgNorm = (x, w, y) => this._bg(this.pipes.rmsnorm, 1, [x, w.buf, y, this.nBufDim]);
 
     this.layerBGs = this.layers.map((L2) => ({
@@ -811,6 +935,7 @@ export class BelloEngine {
       norm2: bgNorm(this.x, L2.postNorm, this.xn),
       gate: mv(L2.wgate, this.xn, this.g, inter, dim),
       up: mv(L2.wup, this.xn, this.u, inter, dim),
+      gu: guOp(L2.wgate, L2.wup, this.xn, this.g, inter, dim),
       down: mv(L2.wdown, this.g, this.tmpDim, dim, inter),
     }));
     this.bgRopeQ = this._bg(this.pipes.rope, 1, [this.q, this.nHBuf]);
@@ -898,9 +1023,12 @@ export class BelloEngine {
       this._dispatchOp(pass, BG.o);
       this._dispatch(pass, "add_res", this.bgAddTmp, dim);
       this._dispatch(pass, "rmsnorm", BG.norm2, 256, 256);
-      this._dispatchOp(pass, BG.gate);
-      this._dispatchOp(pass, BG.up);
-      this._dispatch(pass, "silu_mul", this.bgSilu, inter);
+      if (BG.gu) this._dispatchOp(pass, BG.gu);
+      else {
+        this._dispatchOp(pass, BG.gate);
+        this._dispatchOp(pass, BG.up);
+        this._dispatch(pass, "silu_mul", this.bgSilu, inter);
+      }
       this._dispatchOp(pass, BG.down);
       this._dispatch(pass, "add_res", this.bgAddTmp, dim);
       pass.end();
@@ -1029,6 +1157,7 @@ export class BelloEngine {
         qkv: [mvB(L.wq, B.xn, B.q, qDim, dim), mvB(L.wk, B.xn, B.k, kvDim, dim), mvB(L.wv, B.xn, B.v, kvDim, dim)],
         o: mvB(L.wo, B.attnOut, B.tmpDim, dim, qDim),
         gateUp: [mvB(L.wgate, B.xn, B.g, inter, dim), mvB(L.wup, B.xn, B.u, inter, dim)],
+        gu: this._guOp(L.wgate, L.wup, B.xn.buf, B.g.buf, inter, dim, B.xn, B.g),
         down: mvB(L.wdown, B.g, B.tmpDim, dim, inter),
         cols: [0, 1, 2, 3].map((c) => ({
           norm1: bgNormC(B.x, L.inNorm, B.xn, c),
@@ -1097,8 +1226,11 @@ export class BelloEngine {
       this._dispatchOp(pass, LB.o);
       for (let c = 0; c < 4; c++) this._dCol(pass, "add_res", c, LB.cols[c].addTmp, dim);
       for (let c = 0; c < 4; c++) this._dCol(pass, "rmsnorm", c, LB.cols[c].norm2, 256, 256);
-      for (const op of LB.gateUp) this._dispatchOp(pass, op);
-      for (let c = 0; c < 4; c++) this._dCol(pass, "silu_mul", c, LB.cols[c].silu, inter);
+      if (LB.gu) this._dispatchOp(pass, LB.gu);
+      else {
+        for (const op of LB.gateUp) this._dispatchOp(pass, op);
+        for (let c = 0; c < 4; c++) this._dCol(pass, "silu_mul", c, LB.cols[c].silu, inter);
+      }
       this._dispatchOp(pass, LB.down);
       for (let c = 0; c < 4; c++) this._dCol(pass, "add_res", c, LB.cols[c].addTmp, dim);
       pass.end();

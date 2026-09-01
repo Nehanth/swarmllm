@@ -247,6 +247,9 @@ export class Qwen35Engine {
       matvec_q4_coop: ["ro", "ro", "ro", "rw", "u"],
       matvec_coop_b: ["ro", "ro", "rw", "u"], matvec_q8_coop_b: ["ro", "ro", "ro", "rw", "u"],
       matvec_q4_coop_b: ["ro", "ro", "ro", "rw", "u"],
+      matvec_gu: ["ro", "ro", "ro", "rw", "u"], matvec_gu_b: ["ro", "ro", "ro", "rw", "u"],
+      matvec_q8_gu: ["ro", "ro", "ro", "ro", "ro", "rw", "u"], matvec_q8_gu_b: ["ro", "ro", "ro", "ro", "ro", "rw", "u"],
+      matvec_q4_gu: ["ro", "ro", "ro", "ro", "ro", "rw", "u"], matvec_q4_gu_b: ["ro", "ro", "ro", "ro", "ro", "rw", "u"],
       rmsnorm: ["ro", "ro", "rw", "u"], head_norm: ["rw", "ro", "u"],
       attn_scores: ["ro", "ro", "rw"], attn_softmax: ["rw"],
       attn_out: ["ro", "ro", "rw"], silu_mul: ["rw", "ro"], add_res: ["rw", "ro"],
@@ -339,6 +342,15 @@ export class Qwen35Engine {
       return { pipe, wgs: coop ? Math.ceil(dOut / this.coopRows) : Math.ceil(dOut / 64), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
     this._mv = mv;
+    const guOp = (wg2, wu2, x, y, dOut, dIn, xB, yB) => {
+      if (!coop || !wg2 || !wu2 || wg2.kind !== wu2.kind) return null;
+      const base = wg2.kind === "q8" ? "matvec_q8_gu" : wg2.kind === "q4" ? "matvec_q4_gu" : "matvec_gu";
+      const pipe = xB ? base + "_b" : base;
+      const shp = xB ? this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4) : this._shapeB(dOut, dIn, 0, 0);
+      const bufs = wg2.kind === "f32" ? [wg2.buf, wu2.buf, x, y, shp] : [wg2.qs, wg2.sc, wu2.qs, wu2.sc, x, y, shp];
+      return { pipe, wgs: Math.ceil(dOut / this.coopRows), bg: this._bg(this.pipes[pipe], 1, bufs) };
+    };
+    this._guOp = guOp;
     const bgNorm = (x, w, y) => this._bg(this.pipes.rmsnorm, 1, [x, w.buf, y, this.uDim]);
 
     this.layers = [];
@@ -350,6 +362,7 @@ export class Qwen35Engine {
       R.bgNorm2 = bgNorm(this.x, R.postNorm, this.xn);
       R.mvGate = mv(R.ffnGate, this.xn, this.g, inter, dim);
       R.mvUp = mv(R.ffnUp, this.xn, this.u, inter, dim);
+      R.gu = guOp(R.ffnGate, R.ffnUp, this.xn, this.g, inter, dim);
       R.mvDown = mv(R.ffnDown, this.g, this.tmpDim, dim, inter);
       if (L.isFull) {
         R.wq = up(L.wq); R.wk = up(L.wk); R.wv = up(L.wv); R.wo = up(L.wo);
@@ -522,9 +535,12 @@ export class Qwen35Engine {
     {
       const p = enc.beginComputePass();
       this._d(p, "rmsnorm", L.bgNorm2, 256, 256);
-      this._dop(p, L.mvGate);
-      this._dop(p, L.mvUp);
-      this._d(p, "silu_mul", this.bgSilu, D.inter);
+      if (L.gu) this._dop(p, L.gu);
+      else {
+        this._dop(p, L.mvGate);
+        this._dop(p, L.mvUp);
+        this._d(p, "silu_mul", this.bgSilu, D.inter);
+      }
       this._dop(p, L.mvDown);
       this._d(p, "add_res", this.bgAddTmp, D.dim);
       p.end();
@@ -628,6 +644,7 @@ export class Qwen35Engine {
         [slice(B.x, c), { buffer: w.buf }, slice(B.xn, c), { buffer: this.uDim }]);
       const R = {
         gateUp: [mvB(L.ffnGate, B.xn, B.g, D.inter, D.dim), mvB(L.ffnUp, B.xn, B.u, D.inter, D.dim)],
+        gu: this._guOp(L.ffnGate, L.ffnUp, B.xn.buf, B.g.buf, D.inter, D.dim, B.xn, B.g),
         down: mvB(L.ffnDown, B.g, B.tmpDim, D.dim, D.inter),
         cols: [0, 1, 2, 3].map((c) => ({
           norm1: bgNormC(L.attnNorm, c),
@@ -730,8 +747,11 @@ export class Qwen35Engine {
     {
       const p = enc.beginComputePass();
       for (let c = 0; c < 4; c++) this._dCol(p, "rmsnorm", c, LB.cols[c].norm2, 256, 256);
-      for (const op of LB.gateUp) this._dop(p, op);
-      for (let c = 0; c < 4; c++) this._dCol(p, "silu_mul", c, LB.cols[c].silu, D.inter);
+      if (LB.gu) this._dop(p, LB.gu);
+      else {
+        for (const op of LB.gateUp) this._dop(p, op);
+        for (let c = 0; c < 4; c++) this._dCol(p, "silu_mul", c, LB.cols[c].silu, D.inter);
+      }
       this._dop(p, LB.down);
       for (let c = 0; c < 4; c++) this._dCol(p, "add_res", c, LB.cols[c].addTmp, D.dim);
       p.end();
