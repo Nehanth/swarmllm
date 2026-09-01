@@ -406,10 +406,16 @@ fn add_res(@builtin(global_invocation_id) gid: vec3<u32>) {
 // from shipping Safari 26). Requires dIn % 32 == 0 (already true everywhere).
 var<workgroup> mvc_part: array<f32, 1024>;   // [4 rows][256 threads]
 
-fn mvf_row(off: u32, xa: vec4<f32>, xb: vec4<f32>) -> f32 {
-  let wa = vec4<f32>(mv_w[off], mv_w[off + 1u], mv_w[off + 2u], mv_w[off + 3u]);
-  let wb = vec4<f32>(mv_w[off + 4u], mv_w[off + 5u], mv_w[off + 6u], mv_w[off + 7u]);
-  return dot(wa, xa) + dot(wb, xb);
+// vec4 views of the same buffers the scalar kernels bind (same @group/@binding
+// is legal as long as no single entry point references both views). All x/w
+// buffers are multiples of 16 bytes (dims divisible by 4).
+@group(1) @binding(0) var<storage, read> mv_w4: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read> mv_x4: array<vec4<f32>>;
+@group(1) @binding(2) var<storage, read> q8_x4: array<vec4<f32>>;
+@group(1) @binding(2) var<storage, read> q4_x4: array<vec4<f32>>;
+
+fn mvf_row(off4: u32, xa: vec4<f32>, xb: vec4<f32>) -> f32 {
+  return dot(mv_w4[off4], xa) + dot(mv_w4[off4 + 1u], xb);
 }
 @compute @workgroup_size(256)
 fn matvec_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -421,20 +427,21 @@ fn matvec_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
   let row0 = wg.x * 4u;
   let full = row0 + 3u < mv_shape.dOut;
   var acc0 = 0.0; var acc1 = 0.0; var acc2 = 0.0; var acc3 = 0.0;
+  let dIn4 = dIn / 4u;
   for (var b: u32 = bl; b < nb; b += 64u) {
-    let c0 = b * 32u + qt * 8u;
-    let xa = vec4<f32>(mv_x[c0], mv_x[c0 + 1u], mv_x[c0 + 2u], mv_x[c0 + 3u]);
-    let xb = vec4<f32>(mv_x[c0 + 4u], mv_x[c0 + 5u], mv_x[c0 + 6u], mv_x[c0 + 7u]);
-    let off = row0 * dIn + c0;
+    let c4 = b * 8u + qt * 2u;         // vec4 index of this thread's 8-elem slice
+    let xa = mv_x4[c4];
+    let xb = mv_x4[c4 + 1u];
+    let off4 = row0 * dIn4 + c4;
     if (full) {
-      acc0 += mvf_row(off, xa, xb);
-      acc1 += mvf_row(off + dIn, xa, xb);
-      acc2 += mvf_row(off + 2u * dIn, xa, xb);
-      acc3 += mvf_row(off + 3u * dIn, xa, xb);
+      acc0 += mvf_row(off4, xa, xb);
+      acc1 += mvf_row(off4 + dIn4, xa, xb);
+      acc2 += mvf_row(off4 + 2u * dIn4, xa, xb);
+      acc3 += mvf_row(off4 + 3u * dIn4, xa, xb);
     } else {
-      if (row0 < mv_shape.dOut) { acc0 += mvf_row(off, xa, xb); }
-      if (row0 + 1u < mv_shape.dOut) { acc1 += mvf_row(off + dIn, xa, xb); }
-      if (row0 + 2u < mv_shape.dOut) { acc2 += mvf_row(off + 2u * dIn, xa, xb); }
+      if (row0 < mv_shape.dOut) { acc0 += mvf_row(off4, xa, xb); }
+      if (row0 + 1u < mv_shape.dOut) { acc1 += mvf_row(off4 + dIn4, xa, xb); }
+      if (row0 + 2u < mv_shape.dOut) { acc2 += mvf_row(off4 + 2u * dIn4, xa, xb); }
     }
   }
   mvc_part[t] = acc0; mvc_part[256u + t] = acc1; mvc_part[512u + t] = acc2; mvc_part[768u + t] = acc3;
@@ -459,10 +466,11 @@ fn matvec_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
 fn q8_row(wBase: u32, sc: f32, xa: vec4<f32>, xb: vec4<f32>) -> f32 {
   let w0 = bitcast<i32>(q8_qs[wBase]);
   let w1 = bitcast<i32>(q8_qs[wBase + 1u]);
-  let d0 = vec4<f32>(f32(extractBits(w0, 0u, 8u)), f32(extractBits(w0, 8u, 8u)),
-                     f32(extractBits(w0, 16u, 8u)), f32(extractBits(w0, 24u, 8u)));
-  let d1 = vec4<f32>(f32(extractBits(w1, 0u, 8u)), f32(extractBits(w1, 8u, 8u)),
-                     f32(extractBits(w1, 16u, 8u)), f32(extractBits(w1, 24u, 8u)));
+  // shift-based sign extension (extractBits goes through slow polyfill paths)
+  let d0 = vec4<f32>(f32((w0 << 24u) >> 24u), f32((w0 << 16u) >> 24u),
+                     f32((w0 << 8u) >> 24u), f32(w0 >> 24u));
+  let d1 = vec4<f32>(f32((w1 << 24u) >> 24u), f32((w1 << 16u) >> 24u),
+                     f32((w1 << 8u) >> 24u), f32(w1 >> 24u));
   return sc * (dot(d0, xa) + dot(d1, xb));
 }
 @compute @workgroup_size(256)
@@ -477,9 +485,9 @@ fn matvec_q8_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocatio
   let full = row0 + 3u < q8_shape.dOut;
   var acc0 = 0.0; var acc1 = 0.0; var acc2 = 0.0; var acc3 = 0.0;
   for (var b: u32 = bl; b < nb; b += 64u) {
-    let xBase = b * 32u + qt * 8u;
-    let xa = vec4<f32>(q8_x[xBase], q8_x[xBase + 1u], q8_x[xBase + 2u], q8_x[xBase + 3u]);
-    let xb = vec4<f32>(q8_x[xBase + 4u], q8_x[xBase + 5u], q8_x[xBase + 6u], q8_x[xBase + 7u]);
+    let x4 = b * 8u + qt * 2u;
+    let xa = q8_x4[x4];
+    let xb = q8_x4[x4 + 1u];
     let wBase = row0 * rowWords + b * 8u + qt * 2u;
     let scBase = row0 * nb + b;
     if (full) {
@@ -533,9 +541,8 @@ fn matvec_q4_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocatio
   var acc0 = 0.0; var acc1 = 0.0; var acc2 = 0.0; var acc3 = 0.0;
   for (var b: u32 = bl; b < nb; b += 64u) {
     // word qt of block b covers x[j..j+3] (low nibbles) and x[j+16..j+19] (high)
-    let j = b * 32u + qt * 4u;
-    let xlo = vec4<f32>(q4_x[j], q4_x[j + 1u], q4_x[j + 2u], q4_x[j + 3u]);
-    let xhi = vec4<f32>(q4_x[j + 16u], q4_x[j + 17u], q4_x[j + 18u], q4_x[j + 19u]);
+    let xlo = q4_x4[b * 8u + qt];
+    let xhi = q4_x4[b * 8u + qt + 4u];
     let wIdx = row0 * rowWords + b * 4u + qt;
     let scBase = row0 * nb + b;
     if (full) {
