@@ -1,0 +1,405 @@
+<title>SwarmLLM Deck</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --paper: #f5f4ee; --paper-2: #fbfaf5; --ink: #16171c; --faint: #c4c0b1; --muted: #8b877a;
+    --line: #e1ded2; --accent: #2b4eff; --tint: #eceffe; --tint-2: #d9defb;
+    --sans: "Space Grotesk", -apple-system, "Segoe UI", sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { background: var(--paper); color: var(--ink); font-family: var(--sans); font-size: 18px; line-height: 1.45; overflow: hidden; }
+  ::selection { background: var(--accent); color: #fff; }
+  a { color: var(--accent); text-decoration: none; }
+
+  #deck { position: fixed; inset: 0; }
+  .slide { position: absolute; inset: 0; display: grid; grid-template-rows: auto 1fr auto; padding: clamp(28px, 5vh, 56px) clamp(24px, 6vw, 88px);
+    opacity: 0; pointer-events: none; transform: translateX(28px); transition: opacity .45s ease, transform .55s cubic-bezier(.2,.7,.2,1); }
+  .slide.active { opacity: 1; pointer-events: auto; transform: none; }
+  .slide.prev { transform: translateX(-28px); }
+  .top { display: flex; justify-content: space-between; align-items: baseline; font-family: var(--mono); font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+  .top .wordmark { color: var(--ink); font-weight: 500; letter-spacing: .04em; text-transform: none; font-size: 14px; }
+  .top .wordmark em { font-style: normal; color: var(--accent); }
+  .body { display: grid; align-content: center; gap: clamp(18px, 3vh, 36px); min-height: 0; }
+  .bottom { display: flex; justify-content: space-between; align-items: center; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .kicker { font-family: var(--mono); font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); }
+  h1 { font-size: clamp(40px, 7.2vw, 104px); line-height: .98; letter-spacing: -.03em; font-weight: 700; text-wrap: balance; max-width: 12ch; }
+  h1 .dim { color: var(--muted); font-weight: 500; }
+  h1 .acc { color: var(--accent); }
+  h2 { font-size: clamp(30px, 4.6vw, 64px); line-height: 1.02; letter-spacing: -.025em; font-weight: 700; text-wrap: balance; max-width: 18ch; }
+  .lede { font-size: clamp(17px, 1.5vw, 22px); color: var(--muted); max-width: 58ch; }
+  .lede b { color: var(--ink); font-weight: 500; }
+  .two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: clamp(24px, 5vw, 72px); align-items: center; }
+  @media (max-width: 900px) { .two { grid-template-columns: 1fr; } h1 { max-width: none; } }
+  .note { font-family: var(--mono); font-size: 12px; color: var(--muted); line-height: 1.6; }
+
+  /* mesh canvas (title + close) */
+  canvas.mesh { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .slide > * { position: relative; }
+
+  /* memory bars */
+  .bars { display: grid; gap: 14px; font-family: var(--mono); font-size: 13px; }
+  .bar { display: grid; grid-template-columns: 9ch 1fr 7ch; gap: 14px; align-items: center; }
+  .bar .track { height: 26px; background: var(--paper-2); border: 1px solid var(--line); position: relative; overflow: hidden; }
+  .bar .fill { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--ink); transition: width 1.1s cubic-bezier(.2,.8,.2,1); }
+  .bar.model .fill { background: var(--accent); }
+  .active .bar .fill { width: var(--w); }
+  .bar .v { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  /* ring */
+  .ring { position: relative; aspect-ratio: 1; max-height: 58vh; margin: 0 auto; width: min(100%, 58vh); }
+  .ring svg { width: 100%; height: 100%; overflow: visible; }
+  .node { font-family: var(--mono); font-size: 12px; }
+  .node rect { fill: var(--paper-2); stroke: var(--line); }
+  .node text { fill: var(--ink); }
+  .node .lay { fill: var(--muted); }
+  .node.host rect { stroke: var(--accent); stroke-width: 1.5; }
+  .baton { fill: var(--accent); }
+  .path { fill: none; stroke: var(--line); stroke-width: 1.5; }
+  .legend { display: grid; gap: 10px; font-family: var(--mono); font-size: 13px; color: var(--muted); }
+  .legend b { color: var(--ink); font-weight: 500; }
+  .legend .dot { display: inline-block; width: 9px; height: 9px; background: var(--accent); border-radius: 50%; margin-right: 8px; vertical-align: 1px; }
+
+  /* big numbers */
+  .tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+  @media (max-width: 900px) { .tiles { grid-template-columns: 1fr; } }
+  .tile { border-top: 2px solid var(--ink); padding-top: 14px; display: grid; gap: 6px; }
+  .tile.acc { border-top-color: var(--accent); }
+  .tile .n { font-size: clamp(44px, 5.4vw, 76px); line-height: 1; letter-spacing: -.03em; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .tile.acc .n { color: var(--accent); }
+  .tile .u { font-family: var(--mono); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+  .tile .from { font-family: var(--mono); font-size: 13px; color: var(--muted); }
+  .tile .from b { color: var(--ink); font-weight: 500; }
+
+  /* roofline */
+  .roof { display: grid; gap: 10px; font-family: var(--mono); font-size: 13px; }
+  .roof .track { height: 34px; border: 1px solid var(--line); background: var(--paper-2); position: relative; }
+  .roof .fill { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--accent); transition: width 1.4s cubic-bezier(.2,.8,.2,1); }
+  .active .roof .fill { width: 99.5%; }
+  .roof .lab { display: flex; justify-content: space-between; color: var(--muted); }
+  .roof .lab b { color: var(--ink); font-weight: 500; }
+
+  /* speculation */
+  .spec { display: grid; gap: 14px; font-family: var(--mono); font-size: 15px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .row .lab { width: 9ch; color: var(--muted); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
+  .tok { padding: 8px 12px; border: 1px solid var(--line); background: var(--paper-2); opacity: 0; transform: translateY(6px); transition: opacity .4s, transform .4s, border-color .3s, background .3s; }
+  .tok.draft { border-style: dashed; color: var(--muted); }
+  .tok.ok { border-color: var(--accent); background: var(--tint); color: var(--ink); }
+  .tok.no { text-decoration: line-through; color: var(--faint); }
+  .active .tok { opacity: 1; transform: none; }
+  .active .tok:nth-child(2) { transition-delay: .15s } .active .tok:nth-child(3) { transition-delay: .35s } .active .tok:nth-child(4) { transition-delay: .55s }
+  .active .tok:nth-child(5) { transition-delay: .75s } .active .tok:nth-child(6) { transition-delay: .95s } .active .tok:nth-child(7) { transition-delay: 1.15s }
+
+  /* table */
+  table { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 14px; }
+  th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 500; color: var(--muted); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
+  td.num { font-variant-numeric: tabular-nums; text-align: right; }
+  th.num { text-align: right; }
+  tr.us td { color: var(--ink); background: var(--tint); }
+  tr.us td:first-child { color: var(--accent); font-weight: 500; }
+  .tablewrap { overflow-x: auto; }
+
+  /* roadmap */
+  .road { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 36px; }
+  @media (max-width: 900px) { .road { grid-template-columns: 1fr; } }
+  .item { display: grid; grid-template-columns: 5ch 1fr; gap: 12px; padding: 14px 0; border-top: 1px solid var(--line); }
+  .item .when { font-family: var(--mono); font-size: 12px; color: var(--accent); letter-spacing: .08em; padding-top: 4px; }
+  .item h3 { font-size: 19px; font-weight: 500; line-height: 1.2; }
+  .item p { color: var(--muted); font-size: 15px; margin-top: 4px; }
+
+  /* progress + nav */
+  #bar { position: fixed; left: 0; bottom: 0; height: 3px; background: var(--accent); width: 0; transition: width .4s ease; z-index: 5; }
+  #hint { position: fixed; right: clamp(24px, 6vw, 88px); bottom: 18px; font-family: var(--mono); font-size: 11px; color: var(--faint); letter-spacing: .1em; z-index: 5; }
+  .cta { display: inline-block; padding: 12px 20px; background: var(--ink); color: var(--paper); font-family: var(--mono); font-size: 14px; }
+  .cta:hover { background: var(--accent); }
+  @media (prefers-reduced-motion: reduce) { .slide, .tok, .fill { transition: none !important; } }
+</style>
+
+<div id="deck">
+
+<!-- 1 · title -->
+<section class="slide active" data-mesh>
+  <canvas class="mesh"></canvas>
+  <div class="top"><span class="wordmark">Swarm<em>LLM</em></span><span>mesh inference</span></div>
+  <div class="body">
+    <div class="kicker">Run a 27B model in browser tabs</div>
+    <h1>Your phone <span class="dim">can't run</span><br>Qwen 3.8.<br><span class="acc">Your room can.</span></h1>
+    <p class="lede">Phones, laptops, friends' PCs: <b>one room code</b> away from becoming a single machine. Each holds a slice of the model; together they run the whole thing. Nothing to install.</p>
+  </div>
+  <div class="bottom"><span>swarmllm.ai</span><span>Sep 2026</span></div>
+</section>
+
+<!-- 2 · problem -->
+<section class="slide">
+  <div class="top"><span class="wordmark">Swarm<em>LLM</em></span><span>the problem</span></div>
+  <div class="body two">
+    <div>
+      <div class="kicker">Why one device isn't enough</div>
+      <h2>A 27B model is 15 GB of weights. Every word reads all of it.</h2>
+      <p class="lede">Nobody's phone holds 15 GB of GPU memory, and the cloud means an account, a key, and a retention policy. Prior work topped out around <b>8B in a tab</b>.</p>
+    </div>
+    <div class="bars">
+      <div class="bar model" style="--w: 100%"><span>Qwen 3.8 27B</span><div class="track"><div class="fill"></div></div><span class="v">15.0 GB</span></div>
+      <div class="bar" style="--w: 40%"><span>MacBook</span><div class="track"><div class="fill"></div></div><span class="v">~6 GB free</span></div>
+      <div class="bar" style="--w: 13%"><span>iPhone</span><div class="track"><div class="fill"></div></div><span class="v">~2 GB free</span></div>
+      <div class="bar" style="--w: 53%"><span>gaming PC</span><div class="track"><div class="fill"></div></div><span class="v">8 GB VRAM</span></div>
+      <div class="note">Each device only needs room for its own slice. Three ordinary machines cover the whole model.</div>
+    </div>
+  </div>
+  <div class="bottom"><span>Q4_0 · 4.5 bits per weight</span><span>2 / 10</span></div>
+</section>
+
+<!-- 3 · how it works -->
+<section class="slide">
+  <div class="top"><span class="wordmark">Swarm<em>LLM</em></span><span>how it works</span></div>
+  <div class="body two">
+    <div>
+      <div class="kicker">Layer-split over WebRTC</div>
+      <h2>The weights never move. A 10 KB baton does.</h2>
+      <div class="legend">
+        <div><span class="dot"></span><b>hidden state</b> — 5,120 numbers, sent as f16 = 10 KB per hop</div>
+        <div><b>host</b> keeps the tokenizer, embedding, LM head and sampler — text never leaves it</div>
+        <div><b>peers</b> hold only their layer range, fetched straight from HuggingFace and cached</div>
+        <div><b>direct</b> browser-to-browser over WebRTC; the signaling broker leaves after the handshake</div>
+      </div>
+    </div>
+    <div class="ring">
+      <svg viewBox="0 0 400 400" aria-label="three devices in a ring passing the hidden state">
+        <path id="loop" class="path" d="M200,52 A148,148 0 1,1 199.9,52"/>
+        <g class="node host" transform="translate(140,22)"><rect width="120" height="56" rx="0"/><text x="12" y="24">MacBook · host</text><text class="lay" x="12" y="42">layers 0–21</text></g>
+        <g class="node" transform="translate(268,262)"><rect width="120" height="56"/><text x="12" y="24">gaming PC</text><text class="lay" x="12" y="42">layers 22–42</text></g>
+        <g class="node" transform="translate(12,262)"><rect width="120" height="56"/><text x="12" y="24">friend's laptop</text><text class="lay" x="12" y="42">layers 43–63</text></g>
+        <circle class="baton" r="7"><animateMotion dur="3.6s" repeatCount="indefinite" rotate="auto"><mpath href="#loop"/></animateMotion></circle>
+      </svg>
+    </div>
+  </div>
+  <div class="bottom"><span>one lap per token · prefill sends 16 tokens per lap</span><span>3 / 10</span></div>
+</section>
+
+<!-- 4 · engine -->
+<section class="slide">
+  <div class="top"><span class="wordmark">Swarm<em>LLM</em></span><span>the engine</span></div>
+  <div class="body two">
+    <div>
+      <div class="kicker">From-scratch WebGPU engine</div>
+      <h2>~50 hand-written WGSL kernels. Decode runs at the memory roofline.</h2>
+      <p class="lede">Generating a token is <b>memory-bound</b>: you read every weight once. So the work is reading fewer bytes and reading them shoulder-to-shoulder — 64 threads sweep each row together, dequantize 4-bit blocks in registers, and reduce in shared memory.</p>
+    </div>
+    <div class="roof">
+      <div class="lab"><span>decode GEMV throughput on a GB10</span><b>183 GB/s</b></div>
+      <div class="track"><div class="fill"></div></div>
+      <div class="lab"><span>measured achievable bandwidth (streaming read probe)</span><b>184 GB/s</b></div>
+      <div class="note" style="margin-top: 10px">The gap between the two lines is 0.5%. The remaining ~30 ms per token is dispatch and readback overhead — the kernels themselves are done on this GPU; speculation is what moves the number now.</div>
+    </div>
+  </div>
+  <div class="bottom"><span>Chrome · Safari 26 · Deno — no subgroups, f32 accumulate, one submit per token</span><span>4 / 10</span></div>
+</section>
+
+<!-- 5 · numbers -->
+<section class="slide">
+  <div class="top"><span class="wordmark">Swarm<em>LLM</em></span><span>results</span></div>
+  <div class="body">
+    <div class="kicker">Qwen 3.8 27B · bit-identical output throughout</div>
+    <h2>From 3.6 to 16 tokens per second in four days.</h2>
+    <div class="tiles">
+      <div class="tile acc"><div class="n" data-count="16.1" data-dec="1">0</div><div class="u">tok/s · GB10 · speculative</div><div class="from">launch day <b>3.6</b> → plain <b>9.0</b> → speculative <b>16.1</b></div></div>
+      <div class="tile"><div class="n" data-count="7.99" data-dec="2">0</div><div class="u">tok/s · native llama.cpp CUDA</div><div class="from">same GGUF, same GPU — <b>the browser matches native on decode</b></div></div>
+      <div class="tile"><div class="n" data-count="10.8" data-dec="1">0</div><div class="u">tok/s · MacBook · Chrome</div><div class="from">launch day <b>2.5</b> → <b>6.7</b> → <b>10.8</b> with speculation</div></div>
+    </div>
+    <p class="note">Every row lives in docs/bench-log.md with the commit that produced it. Prefill is the honest gap: 27 tok/s vs native 377 — the next kernel.</p>
+  </div>
+  <div class="bottom"><span>DGX Spark (GB10) · MacBook Pro · measured, not projected</span><span>5 / 10</span></div>
+</section>
+
+<!-- 6 · speculation -->
+<section class="slide">
+  <div class="top"><span class="wordmark">Swarm<em>LLM</em></span><span>speculation</span></div>
+  <div class="body two">
+    <div>
+      <div class="kicker">Multi-token prediction</div>
+      <h2>Guess ahead. Verify in the same pass. Lose nothing.</h2>
+      <p class="lede">The model ships with a small draft layer. It proposes the next words; the full model verifies them all in <b>one batched pass</b>. A wrong guess only costs speed — output is <b>bit-identical</b> to plain decoding, and a correct guess saves a whole network lap.</p>
+    </div>
+    <div class="spec">
+      <div class="row"><span class="lab">draft</span><span class="tok draft">The</span><span class="tok draft">capital</span><span class="tok draft">of</span><span class="tok draft">France</span><span class="tok draft">is</span><span class="tok draft">Lyon</span></div>
+      <div class="row"><span class="lab">verify</span><span class="tok ok">The</span><span class="tok ok">capital</span><span class="tok ok">of</span><span class="tok ok">France</span><span class="tok ok">is</span><span class="tok no">Lyon</span></div>
+      <div class="row"><span class="lab">emit</span><span class="tok ok">The capital of France is</span><span class="tok ok">Paris</span></div>
+      <div class="note">5 of 6 drafts accepted → 6 tokens for one lap. Measured: 85% acceptance on code at depth 3, 97% at depth 5. Depth adapts to what actually measures fastest on your link.</div>
+    </div>
+  </div>
+  <div class="bottom"><span>1 lap → up to 8 tokens · DeltaNet state snapshots make rejection exact</span><span>6 / 10</span></div>
+</section>
+
+<!-- 7 · cross-network -->
+<section class="slide">
+  <div class="top"><span class="wordmark">Swarm<em>LLM</em></span><span>across the internet</span></div>
+  <div class="body two">
+    <div>
+      <div class="kicker">When devices aren't on the same Wi-Fi</div>
+      <h2>Physics charges one ping per lap. So we make laps carry more.</h2>
+      <p class="lede">Prefill sends <b>16 tokens per round</b>. Decode chains up to 7 drafts so a slow link still moves ~6 tokens per lap. The room measures tokens per second at each depth and keeps whichever wins.</p>
+    </div>
+    <div class="bars">
+      <div class="bar" style="--w: 22%"><span>1 tok/lap</span><div class="track"><div class="fill"></div></div><span class="v">~2.0 tok/s</span></div>
+      <div class="bar" style="--w: 40%"><span>3.5 tok/lap</span><div class="track"><div class="fill"></div></div><span class="v">3.5–4 tok/s</span></div>
+      <div class="bar model" style="--w: 66%"><span>6 tok/lap</span><div class="track"><div class="fill"></div></div><span class="v">~6 tok/s</span></div>
+      <div class="note">Cross-internet, Boston host + remote peer, ~100 ms round trip. Next: overlapping laps (PipeInfer-style) and latency-aware placement.</div>
+    </div>
+  </div>
+  <div class="bottom"><span>binary frames · f16 wire · STUN today, TURN fallback next</span><span>7 / 10</span></div>
+</section>
+
+<!-- 8 · prior art -->
+<section class="slide">
+  <div class="top"><span class="wordmark">Swarm<em>LLM</em></span><span>where it sits</span></div>
+  <div class="body">
+    <div class="kicker">Browser inference, 2026</div>
+    <h2>The largest model anyone reported in a tab was 8B.</h2>
+    <div class="tablewrap"><table>
+      <tr><th>project</th><th>what it does</th><th class="num">largest model</th><th class="num">decode</th></tr>
+      <tr><td>Synapse (Apr 2026)</td><td>splits a model across phones over WebSockets</td><td class="num">GPT-2 · 124M</td><td class="num">1.3 tok/s</td></tr>
+      <tr><td>AI Grid</td><td>tabs share whole-model jobs (WebLLM)</td><td class="num">≤ 8B</td><td class="num">—</td></tr>
+      <tr><td>WebLLM (MLC)</td><td>single device, ML-compiled kernels</td><td class="num">8B</td><td class="num">71–85% of native</td></tr>
+      <tr><td>LlamaWeb (May 2026)</td><td>WebGPU backend for llama.cpp, single device</td><td class="num">3B examples</td><td class="num">beats native on some GPUs</td></tr>
+      <tr class="us"><td>SwarmLLM</td><td>27B split across browser tabs, direct WebRTC, speculative</td><td class="num">27B</td><td class="num">16 solo · ~6 cross-net</td></tr>
+    </table></div>
+  </div>
+  <div class="bottom"><span>sources: arXiv 2605.20706, arXiv 2412.15803, github.com/tejasphatak/Synapse</span><span>8 / 10</span></div>
+</section>
+
+<!-- 9 · roadmap -->
+<section class="slide">
+  <div class="top"><span class="wordmark">Swarm<em>LLM</em></span><span>what's next</span></div>
+  <div class="body">
+    <div class="kicker">Roadmap</div>
+    <h2>Ollama for groups.</h2>
+    <div class="road">
+      <div class="item"><span class="when">now</span><div><h3>Open source + TURN fallback + honest threat model</h3><p>MIT repo, relay for strict NATs, SECURITY.md that says exactly what peers can see.</p></div></div>
+      <div class="item"><span class="when">next</span><div><h3><code>npx swarmllm serve</code></h3><p>An OpenAI-compatible localhost endpoint bridged to the swarm — Continue.dev, Open WebUI, anything, with one base_url swap.</p></div></div>
+      <div class="item"><span class="when">next</span><div><h3>Parallel prefill</h3><p>Chunkwise DeltaNet + a real GEMM: close the 14× prompt-processing gap to native.</p></div></div>
+      <div class="item"><span class="when">next</span><div><h3>Redundant layer copies + swarm recovery</h3><p>Spare devices hold duplicate ranges; a dropped peer is re-seated without restarting the room.</p></div></div>
+      <div class="item"><span class="when">later</span><div><h3>122B mixture-of-experts across a room</h3><p>Expert-split: a model no consumer device can hold, running in browser tabs.</p></div></div>
+      <div class="item"><span class="when">later</span><div><h3>Randomly audited compute</h3><p>Canary spot-checks so a room can trust a peer's layers — the first P2P inference system with integrity checks live.</p></div></div>
+    </div>
+  </div>
+  <div class="bottom"><span>no accounts · no tokens · no stranger swarms</span><span>9 / 10</span></div>
+</section>
+
+<!-- 10 · close -->
+<section class="slide" data-mesh>
+  <canvas class="mesh"></canvas>
+  <div class="top"><span class="wordmark">Swarm<em>LLM</em></span><span>thanks</span></div>
+  <div class="body">
+    <div class="kicker">Start a swarm</div>
+    <h1><span class="acc">swarmllm.ai</span></h1>
+    <p class="lede">One room code. Nothing to install. Your room runs the model. <b>Built by Nehanth Narendrula.</b></p>
+    <div><a class="cta" href="https://swarmllm.ai/room">start a swarm →</a></div>
+  </div>
+  <div class="bottom"><span>github.com/Nehanth/swarmllm</span><span>10 / 10</span></div>
+</section>
+
+</div>
+<div id="bar"></div>
+<div id="hint">← → · space · click</div>
+
+<script>
+(() => {
+  const slides = [...document.querySelectorAll(".slide")];
+  let cur = 0;
+  const bar = document.getElementById("bar");
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  function countUp(el) {
+    const target = parseFloat(el.dataset.count), dec = +el.dataset.dec || 0;
+    if (reduced) { el.textContent = target.toFixed(dec); return; }
+    const t0 = performance.now(), dur = 1300;
+    const step = (now) => {
+      const p = Math.min(1, (now - t0) / dur), e = 1 - Math.pow(1 - p, 3);
+      el.textContent = (target * e).toFixed(dec);
+      if (p < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
+
+  function go(n) {
+    n = Math.max(0, Math.min(slides.length - 1, n));
+    if (n === cur && slides[n].classList.contains("active")) return;
+    slides.forEach((s, i) => { s.classList.toggle("active", i === n); s.classList.toggle("prev", i < n); });
+    cur = n;
+    bar.style.width = ((n + 1) / slides.length * 100) + "%";
+    slides[n].querySelectorAll("[data-count]").forEach(countUp);
+    location.hash = n ? "#" + (n + 1) : "";
+  }
+  addEventListener("keydown", (e) => {
+    if (["ArrowRight", " ", "PageDown", "Enter"].includes(e.key)) { e.preventDefault(); go(cur + 1); }
+    if (["ArrowLeft", "PageUp", "Backspace"].includes(e.key)) { e.preventDefault(); go(cur - 1); }
+    if (e.key === "Home") go(0); if (e.key === "End") go(slides.length - 1);
+  });
+  addEventListener("click", (e) => { if (e.target.closest("a")) return; go(e.clientX < innerWidth * 0.2 ? cur - 1 : cur + 1); });
+  let tx = 0;
+  addEventListener("touchstart", (e) => { tx = e.touches[0].clientX; }, { passive: true });
+  addEventListener("touchend", (e) => { const dx = e.changedTouches[0].clientX - tx; if (Math.abs(dx) > 50) go(cur + (dx < 0 ? 1 : -1)); });
+  const h = parseInt(location.hash.slice(1), 10);
+  go(Number.isFinite(h) ? h - 1 : 0);
+
+  // ---- mesh: the site's signature — devices as lit points, light hopping between them ----
+  const INK = "#16171c", ACCENT = "#2b4eff", MUTED = "#8b877a";
+  const NAMES = ["mac", "phone", "spark", "friend", "pc", "tablet", "laptop", "pi", "tv"];
+  document.querySelectorAll("canvas.mesh").forEach((cv) => {
+    const ctx = cv.getContext("2d");
+    let W = 0, H = 0, pts = [], pulses = [], DPR = 1;
+    const LINK = () => (W < 860 ? 120 : 160);
+    function resize() {
+      const r = cv.getBoundingClientRect(); W = r.width; H = r.height;
+      DPR = Math.min(devicePixelRatio || 1, 2);
+      cv.width = W * DPR; cv.height = H * DPR; ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+      const n = Math.round(W * H / 17000), names = NAMES.slice().sort(() => Math.random() - 0.5);
+      pts = []; pulses = [];
+      for (let i = 0; i < n; i++) pts.push({ x: Math.random() * W, y: Math.random() * H, vx: (Math.random() - .5) * .12, vy: (Math.random() - .5) * .12,
+        r: 1.2 + Math.random() * 1.6, lit: i < Math.min(NAMES.length, W < 860 ? 5 : 8), label: i < NAMES.length ? names[i] : null, ph: Math.random() * 6.28 });
+      pts.sort(() => Math.random() - 0.5);
+    }
+    function sendLight(a, b) {   // hop across intermediate points like the site does
+      const path = [a]; let curP = a; const seen = new Set([a]);
+      for (let k = 0; k < 12 && curP !== b; k++) {
+        let best = null, bd = Infinity;
+        for (const p of pts) { if (seen.has(p)) continue; const d = Math.hypot(p.x - curP.x, p.y - curP.y); if (d > LINK()) continue;
+          const toB = Math.hypot(p.x - b.x, p.y - b.y); if (toB < bd) { bd = toB; best = p; } }
+        if (!best) break; path.push(best); seen.add(best); curP = best;
+        if (Math.hypot(curP.x - b.x, curP.y - b.y) < LINK()) { path.push(b); break; }
+      }
+      if (path.length > 1) pulses.push({ path, i: 0, t: 0 });
+    }
+    function frame(now) {
+      if (!cv.closest(".slide").classList.contains("active")) { requestAnimationFrame(frame); return; }
+      for (const p of pts) { p.x += p.vx; p.y += p.vy; if (p.x < -20) p.x = W + 20; if (p.x > W + 20) p.x = -20; if (p.y < -20) p.y = H + 20; if (p.y > H + 20) p.y = -20; }
+      if (!reduced && Math.random() < 0.035 && pulses.length < 6) { const lit = pts.filter((p) => p.lit); if (lit.length > 1) { const a = lit[Math.random() * lit.length | 0]; let b = lit[Math.random() * lit.length | 0]; if (b === a) b = lit[(lit.indexOf(a) + 1) % lit.length]; sendLight(a, b); } }
+      ctx.clearRect(0, 0, W, H);
+      ctx.lineWidth = 1;
+      for (let i = 0; i < pts.length; i++) for (let j = i + 1; j < pts.length; j++) {
+        const a = pts[i], b = pts[j], d = Math.hypot(a.x - b.x, a.y - b.y);
+        if (d < LINK()) { ctx.strokeStyle = `rgba(22,23,28,${(1 - d / LINK()) * 0.13})`; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); }
+      }
+      for (const p of pts) {
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.lit ? 3.2 : p.r, 0, 6.28);
+        ctx.fillStyle = p.lit ? ACCENT : "rgba(22,23,28,.35)"; ctx.fill();
+        if (p.lit && p.label) { ctx.fillStyle = MUTED; ctx.font = "11px JetBrains Mono, monospace"; ctx.fillText(p.label, p.x + 8, p.y + 4); }
+      }
+      for (let i = pulses.length - 1; i >= 0; i--) {
+        const pu = pulses[i], a = pu.path[pu.i], b = pu.path[pu.i + 1];
+        if (!b) { pulses.splice(i, 1); continue; }
+        pu.t += 0.06; const x = a.x + (b.x - a.x) * pu.t, y = a.y + (b.y - a.y) * pu.t;
+        ctx.strokeStyle = "rgba(43,78,255,.55)"; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(x, y); ctx.stroke();
+        ctx.beginPath(); ctx.arc(x, y, 2.6, 0, 6.28); ctx.fillStyle = ACCENT; ctx.fill();
+        if (pu.t >= 1) { pu.t = 0; pu.i++; }
+      }
+      requestAnimationFrame(frame);
+    }
+    resize(); addEventListener("resize", resize); requestAnimationFrame(frame);
+  });
+})();
+</script>
