@@ -1,0 +1,14 @@
+# Bench log
+
+Every kernel/engine change gets a row. All 27B numbers are Qwen 3.8 27B Q4_0,
+greedy, bit-identical output verified by the test suite (`test_mtp_deno.js`,
+`test_batch_*_deno.js`). GB10 = DGX Spark via Deno/wgpu (Vulkan, no subgroups,
+shader-f16 available). Mac = user's MacBook, Chrome, staging site.
+
+| Date | Change | Commit | GB10 decode plain | GB10 decode spec K=3 | GB10 spec K=7 | GB10 prefill (batched) | Mac decode | Mac prefill | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| Aug 29 | Launch state | main | 3.6 | — | — | 3.0 | 2.5 | ~3 | one thread per row, f32 scales |
+| Aug 31 | Coop kernels + batched prefill + fusion + f16 scales | 71b7b85..9f8b852 | 9.0 | — | — | 15.2 (4-col) | 6.7 | 14–16 | |
+| Sep 1 | Multi-column batched ops (2x batched passes) | f1a87a9 | 9.1 | — | — | 39.4 | | | |
+| Sep 1 | MTP self-speculation | e8d5642, 15c389f | 9.07 | 15.86 (85% acc) | — | 39.4 | 10–10.8 | 12 s/prompt | cross-network 3.5–4 tok/s |
+| Sep 1 | Adaptive deep speculation (K=3/5/7 by lap RTT) | 3461d10 | 8.72–9.14 | 16.07 (85%) | 13.09 (71%, 6.0 tok/lap) | 39.4 | | | K=7 only chosen when lap >260 ms |
