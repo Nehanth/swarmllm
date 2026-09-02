@@ -408,7 +408,26 @@ fn add_res(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Scalar accumulators only: a dynamically-indexed local array spills to
 // scratch memory and ran 3x slower. Reduction is a portable shared-memory
 // halving tree (no subgroups: absent from shipping Safari 26).
-export function coopWGSL(WG = 256, ROWS = 4, WGB = 64, COLS = 4, ROWSB = ROWS) {
+export async function probeUnpack(device) {
+  if (device.__unpackOk !== undefined) return device.__unpackOk;
+  device.pushErrorScope("validation");
+  const m = device.createShaderModule({ code: `@compute @workgroup_size(1) fn p() { let v = vec4<f32>(unpack4xU8(0x0F0F0F0Fu)) + vec4<f32>(unpack4xI8(1u)); }` });
+  const info = await m.getCompilationInfo();
+  const err = await device.popErrorScope();
+  device.__unpackOk = !err && !info.messages.some((x) => x.type === "error");
+  return device.__unpackOk;
+}
+
+export function coopWGSL(WG = 256, ROWS = 4, WGB = 64, COLS = 4, ROWSB = ROWS, UNPACK = true) {
+  // dequant snippets: unpack4xU8/unpack4xI8 turn 4 packed bytes into a vec4 in
+  // one instruction (Q4: two masked unpacks per word; Q8: one), vs 3 ALU ops
+  // per element. Same values bit-for-bit; the GEMVs are instruction-bound.
+  const q4lo = (w) => UNPACK ? `vec4<f32>(unpack4xU8(${w} & 0x0F0F0F0Fu)) - vec4<f32>(8.0)`
+    : `vec4<f32>(f32(${w} & 0xFu), f32((${w} >> 8u) & 0xFu), f32((${w} >> 16u) & 0xFu), f32((${w} >> 24u) & 0xFu)) - vec4<f32>(8.0)`;
+  const q4hi = (w) => UNPACK ? `vec4<f32>(unpack4xU8((${w} >> 4u) & 0x0F0F0F0Fu)) - vec4<f32>(8.0)`
+    : `vec4<f32>(f32((${w} >> 4u) & 0xFu), f32((${w} >> 12u) & 0xFu), f32((${w} >> 20u) & 0xFu), f32((${w} >> 28u) & 0xFu)) - vec4<f32>(8.0)`;
+  const i8x4 = (w) => UNPACK ? `vec4<f32>(unpack4xI8(bitcast<u32>(${w})))`
+    : `vec4<f32>(f32((${w} << 24u) >> 24u), f32((${w} << 16u) >> 24u), f32((${w} << 8u) >> 24u), f32(${w} >> 24u))`;
   const LANES = WG / 4;
   const LANESB = WGB / 4;   // batched kernels: smaller workgroups amortize the reductions                  // 32-elem blocks in flight per iteration
   const accDecl = Array.from({ length: ROWS }, (_, r) => `var acc${r} = 0.0;`).join(" ");
@@ -454,15 +473,15 @@ fn ${P}_${w}row(wBase: u32, si: u32, xa: vec4<f32>, xb: vec4<f32>) -> f32 {
   let sc = unpack2x16float(${P}_${w}sc[si >> 1u])[si & 1u];
   let w0 = bitcast<i32>(${P}_${w}qs[wBase]);
   let w1 = bitcast<i32>(${P}_${w}qs[wBase + 1u]);
-  let d0 = vec4<f32>(f32((w0 << 24u) >> 24u), f32((w0 << 16u) >> 24u), f32((w0 << 8u) >> 24u), f32(w0 >> 24u));
-  let d1 = vec4<f32>(f32((w1 << 24u) >> 24u), f32((w1 << 16u) >> 24u), f32((w1 << 8u) >> 24u), f32(w1 >> 24u));
+  let d0 = ${i8x4("w0")};
+  let d1 = ${i8x4("w1")};
   return sc * (dot(d0, xa) + dot(d1, xb));
 }` : `
 fn ${P}_${w}row(wIdx: u32, si: u32, xlo: vec4<f32>, xhi: vec4<f32>) -> f32 {
   let sc = unpack2x16float(${P}_${w}sc[si >> 1u])[si & 1u];
   let word = ${P}_${w}qs[wIdx];
-  let lo = vec4<f32>(f32(word & 0xFu), f32((word >> 8u) & 0xFu), f32((word >> 16u) & 0xFu), f32((word >> 24u) & 0xFu)) - vec4<f32>(8.0);
-  let hi = vec4<f32>(f32((word >> 4u) & 0xFu), f32((word >> 12u) & 0xFu), f32((word >> 20u) & 0xFu), f32((word >> 28u) & 0xFu)) - vec4<f32>(8.0);
+  let lo = ${q4lo("word")};
+  let hi = ${q4hi("word")};
   return sc * (dot(lo, xlo) + dot(hi, xhi));
 }`).join("");
     const rowTerm = (which, r) => kind === "f32"
@@ -548,9 +567,9 @@ ${batched ? [0, 1, 2, 3].map(colBody).join("\n") : colBody(0)}
     const idx = kind === "q4" ? `let wIdx = row0 * rowWords + b * 4u + qt; let scBase = row0 * nb + b;`
       : kind === "q8" ? `let wBase = row0 * rowWords + b * 8u + qt * 2u; let scBase = row0 * nb + b;`
       : `let off4 = row0 * dIn4 + b * 8u + qt * 2u;`;
-    const nib = (w, v) => `let ${v}lo = vec4<f32>(f32(${w} & 0xFu), f32((${w} >> 8u) & 0xFu), f32((${w} >> 16u) & 0xFu), f32((${w} >> 24u) & 0xFu)) - vec4<f32>(8.0);
-        let ${v}hi = vec4<f32>(f32((${w} >> 4u) & 0xFu), f32((${w} >> 12u) & 0xFu), f32((${w} >> 20u) & 0xFu), f32((${w} >> 28u) & 0xFu)) - vec4<f32>(8.0);`;
-    const sx = (w, v) => `let ${v} = vec4<f32>(f32((${w} << 24u) >> 24u), f32((${w} << 16u) >> 24u), f32((${w} << 8u) >> 24u), f32(${w} >> 24u));`;
+    const nib = (w, v) => `let ${v}lo = ${q4lo(w)};
+        let ${v}hi = ${q4hi(w)};`;
+    const sx = (w, v) => `let ${v} = ${i8x4(w)};`;
     const rowBlock = (r) => {
       const acc = (ga, gb, ua, ub, gs, us) => cols.map((m) =>
         `ag${r}_${m} += ${gs}(dot(${ga}, xa${m}) + dot(${gb}, xb${m})); au${r}_${m} += ${us}(dot(${ua}, xa${m}) + dot(${ub}, xb${m}));`).join(" ");
@@ -671,10 +690,8 @@ fn q8_row(wBase: u32, sc: f32, xa: vec4<f32>, xb: vec4<f32>) -> f32 {
   let w0 = bitcast<i32>(q8_qs[wBase]);
   let w1 = bitcast<i32>(q8_qs[wBase + 1u]);
   // shift-based sign extension (extractBits goes through slow polyfill paths)
-  let d0 = vec4<f32>(f32((w0 << 24u) >> 24u), f32((w0 << 16u) >> 24u),
-                     f32((w0 << 8u) >> 24u), f32(w0 >> 24u));
-  let d1 = vec4<f32>(f32((w1 << 24u) >> 24u), f32((w1 << 16u) >> 24u),
-                     f32((w1 << 8u) >> 24u), f32(w1 >> 24u));
+  let d0 = ${i8x4("w0")};
+  let d1 = ${i8x4("w1")};
   return sc * (dot(d0, xa) + dot(d1, xb));
 }
 @compute @workgroup_size(${WG})
@@ -709,10 +726,8 @@ ${reduce}
 
 fn q4_row(wIdx: u32, sc: f32, xlo: vec4<f32>, xhi: vec4<f32>) -> f32 {
   let word = q4_qs[wIdx];
-  let lo = vec4<f32>(f32(word & 0xFu), f32((word >> 8u) & 0xFu),
-                     f32((word >> 16u) & 0xFu), f32((word >> 24u) & 0xFu)) - vec4<f32>(8.0);
-  let hi = vec4<f32>(f32((word >> 4u) & 0xFu), f32((word >> 12u) & 0xFu),
-                     f32((word >> 20u) & 0xFu), f32((word >> 28u) & 0xFu)) - vec4<f32>(8.0);
+  let lo = ${q4lo("word")};
+  let hi = ${q4hi("word")};
   return sc * (dot(lo, xlo) + dot(hi, xhi));
 }
 @compute @workgroup_size(${WG})
@@ -766,15 +781,15 @@ ${["", "_q8", "_q4"].map((kind) => {
     : "let off4 = row0 * rowWords + b * 8u + qt * 2u;";
   const rowBlock = (r) => kind === "_q4" ? `if (full || row0 + ${r}u < dOut) {
       let word = q4_qs[wIdx + ${r}u * rowWords];
-      let lo = vec4<f32>(f32(word & 0xFu), f32((word >> 8u) & 0xFu), f32((word >> 16u) & 0xFu), f32((word >> 24u) & 0xFu)) - vec4<f32>(8.0);
-      let hi = vec4<f32>(f32((word >> 4u) & 0xFu), f32((word >> 12u) & 0xFu), f32((word >> 20u) & 0xFu), f32((word >> 28u) & 0xFu)) - vec4<f32>(8.0);
+      let lo = ${q4lo("word")};
+      let hi = ${q4hi("word")};
       let s = q4s(scBase + ${r}u * nb);
       ${cols.map((m) => `a${r}_${m} += s * (dot(lo, xa${m}) + dot(hi, xb${m}));`).join(" ")}
     }` : kind === "_q8" ? `if (full || row0 + ${r}u < dOut) {
       let w0 = bitcast<i32>(q8_qs[wBase + ${r}u * rowWords]);
       let w1 = bitcast<i32>(q8_qs[wBase + ${r}u * rowWords + 1u]);
-      let d0 = vec4<f32>(f32((w0 << 24u) >> 24u), f32((w0 << 16u) >> 24u), f32((w0 << 8u) >> 24u), f32(w0 >> 24u));
-      let d1 = vec4<f32>(f32((w1 << 24u) >> 24u), f32((w1 << 16u) >> 24u), f32((w1 << 8u) >> 24u), f32(w1 >> 24u));
+      let d0 = ${i8x4("w0")};
+      let d1 = ${i8x4("w1")};
       let s = q8s(scBase + ${r}u * nb);
       ${cols.map((m) => `a${r}_${m} += s * (dot(d0, xa${m}) + dot(d1, xb${m}));`).join(" ")}
     }` : `if (full || row0 + ${r}u < dOut) {
@@ -887,7 +902,7 @@ export class BelloEngine {
 
     const W = weights || weightsFromSafetensors(tensors, { lo, hi, hasEmbed, hasHead });
 
-    const mod = device.createShaderModule({ code: WGSL + coopWGSL(coopWG, coopRows) });
+    const mod = device.createShaderModule({ code: WGSL + coopWGSL(coopWG, coopRows, 64, 4, 4, await probeUnpack(device)) });
     const C = GPUShaderStage.COMPUTE;
     const layout0 = device.createBindGroupLayout({
       entries: [
@@ -1474,7 +1489,7 @@ export async function autotuneCoop(device, { dIn = 5120, dOut = 17408, kind = "q
   for (const [wg, rows] of candidates) {
     try {
       const entry = kind === "q4" ? "matvec_q4_coop" : "matvec_q8_coop";
-      const mod = device.createShaderModule({ code: WGSL + coopWGSL(wg, rows) });
+      const mod = device.createShaderModule({ code: WGSL + coopWGSL(wg, rows, 64, 4, 4, await probeUnpack(device)) });
       const l0 = device.createBindGroupLayout({ entries: [0, 1].map((b) => ({ binding: b, visibility: C, buffer: { type: "uniform" } })) });
       const l1 = device.createBindGroupLayout({ entries: ["read-only-storage", "read-only-storage", "read-only-storage", "storage", "uniform"].map((t, i) => ({ binding: i, visibility: C, buffer: { type: t } })) });
       const pipe = await device.createComputePipelineAsync({

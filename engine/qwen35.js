@@ -1,7 +1,7 @@
 // bello Qwen3.5/3.8 engine — hybrid Gated-DeltaNet + gated-attention WebGPU
 // inference, layer-shardable like BelloEngine. Golden reference: ref_q38.mjs
 // (validated line-by-line against llama.cpp eval-callback dumps).
-import { WGSL, coopWGSL } from "./engine.js";
+import { WGSL, coopWGSL, probeUnpack } from "./engine.js";
 import { f16ToF32 } from "./gguf.js";
 
 const WGSL2 = /* wgsl */ `
@@ -498,7 +498,7 @@ export class Qwen35Engine {
     this.pos = 0;
 
     // ---- pipelines with explicit layouts ----
-    const mod = device.createShaderModule({ code: WGSL + coopWGSL(coopWG, coopRows, 64, batchCols, coopRowsB) + WGSL2 });
+    const mod = device.createShaderModule({ code: WGSL + coopWGSL(coopWG, coopRows, 64, batchCols, coopRowsB, await probeUnpack(device)) + WGSL2 });
     const C = GPUShaderStage.COMPUTE;
     const layout0 = device.createBindGroupLayout({
       entries: [
@@ -766,6 +766,7 @@ export class Qwen35Engine {
     });
   }
   _d(pass, name, bg, threads, wg = 64) {
+    if (this.skip && this.skip.has(name)) return;   // profiling aid (bench_breakdown)
     pass.setPipeline(this.pipes[name]);
     pass.setBindGroup(0, this.bgCommonFor[name]);
     pass.setBindGroup(1, bg);

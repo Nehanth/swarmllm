@@ -27,7 +27,23 @@ async function timeSingle(n = 6) {
   for (let i = 0; i < n; i++) await eng.forwardToken(10);
   return (performance.now() - t0) / n;
 }
-console.log(`single pass: ${(await timeSingle()).toFixed(1)} ms`);
+const single = await timeSingle();
+console.log(`single pass: ${single.toFixed(1)} ms`);
+const famsS = {
+  "matvec coop (all decode matvecs+head)": ["matvec_q4_coop", "matvec_q8_coop", "matvec_coop", "matvec_q4_gu", "matvec_q8_gu", "matvec_gu"],
+  "dn_delta": ["dn_delta"],
+  "dn_conv": ["dn_conv"],
+  "dn_gates/l2/gatenorm": ["dn_gates", "dn_l2", "dn_gatenorm"],
+  "rmsnorm + add_res": ["rmsnorm", "add_res"],
+  "attention (scores/softmax/out)": ["attn_scores", "attn_softmax", "attn_out"],
+  "qsplit/head_norm/rope/sigmoid": ["qsplit", "head_norm", "rope_part", "sigmoid_mul"],
+};
+for (const [name, list] of Object.entries(famsS)) {
+  eng.skip = new Set(list);
+  const t = await timeSingle();
+  console.log(`  single without ${name.padEnd(38)} ${t.toFixed(1)} ms  -> family costs ~${(single - t).toFixed(1)} ms`);
+}
+eng.skip = null;
 const full = await timeBatch();
 console.log(`batched pass (all): ${full.toFixed(1)} ms`);
 const fams = {
