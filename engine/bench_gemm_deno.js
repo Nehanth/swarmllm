@@ -4,7 +4,7 @@ import { WGSL, coopWGSL, probeUnpack } from "./engine.js";
 const adapter = await navigator.gpu.requestAdapter();
 const device = await adapter.requestDevice({ requiredLimits: { maxBufferSize: adapter.limits.maxBufferSize, maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize } });
 const dOut = +(Deno.env.get("DOUT") || 17408), dIn = 5120, N = 16, nb = dIn / 32;
-const TM = +(Deno.env.get("TM") || 64);          // rows per workgroup tile
+const TM = +(Deno.env.get("TM") || 32 * +(Deno.env.get("RT") || 2));          // rows per workgroup tile
 const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
 const rnd = (n, f) => { const a = new Uint32Array(n); for (let i = 0; i < n; i++) a[i] = f(i); return a; };
 const qsData = rnd(dOut * dIn / 8, () => (Math.random() * 2 ** 32) >>> 0);
@@ -29,8 +29,11 @@ const unpack = await probeUnpack(device);
 // Weights for the tile are dequantized ONCE into shared memory (each thread
 // unpacks one u32 word = 8 nibbles); the 16 x-columns for the k-block are
 // staged as vec4s; each thread owns 2 rows x 2 cols (4 accumulators).
-const RP = TM / 2;                                  // row-pairs; 4 col-quads -> threads = RP * 4
-const T = RP * 4;
+const RT = +(Deno.env.get("RT") || 2), T = 128;    // RT rows x 4 cols per thread; TM = T/4*RT rows per WG
+if (TM !== T / 4 * RT) throw new Error(`TM must be ${T / 4 * RT} for RT=${RT}`);
+const R = Array.from({ length: RT }, (_, i) => i);
+const WPT = TM * 8 / T;                             // weight words per thread per block pair (8)
+const loads = Array.from({ length: WPT }, (_, j) => j);
 const gemm = `
 struct BShape { dOut: u32, dIn: u32, xs4: u32, ys: u32 };
 @group(0) @binding(0) var<uniform> cfg0: vec4<u32>;
@@ -40,49 +43,53 @@ struct BShape { dOut: u32, dIn: u32, xs4: u32, ys: u32 };
 @group(1) @binding(2) var<storage, read> g_x: array<vec4<f32>>;
 @group(1) @binding(3) var<storage, read_write> g_y: array<f32>;
 @group(1) @binding(4) var<uniform> g_shape: BShape;
-var<workgroup> Ws: array<vec4<f32>, ${TM * 8}>;   // [TM rows][8 k-quads]
-var<workgroup> Xs: array<vec4<f32>, ${8 * 16}>;   // [8 k-quads][16 cols]
+var<workgroup> Ws: array<vec4<f32>, ${TM * 17}>;   // [TM rows][17 = 16 k-quads + pad]
+var<workgroup> Xs: array<vec4<f32>, ${16 * 16}>;   // [16 k-quads][16 cols]
 fn g_sc_at(i: u32) -> f32 { return unpack2x16float(g_sc[i >> 1u])[i & 1u]; }
+fn nib_lo(w: u32) -> vec4<f32> { return vec4<f32>(unpack4xU8(w & 0x0F0F0F0Fu)) - vec4<f32>(8.0); }
+fn nib_hi(w: u32) -> vec4<f32> { return vec4<f32>(unpack4xU8((w >> 4u) & 0x0F0F0F0Fu)) - vec4<f32>(8.0); }
 @compute @workgroup_size(${T})
 fn gemm16(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let t = lid.x;
   let dIn = g_shape.dIn; let dOut = g_shape.dOut; let xs4 = g_shape.xs4; let ys = g_shape.ys;
-  let nb = dIn / 32u; let rowWords = dIn / 8u;
+  let nb = dIn / 32u; let rowWords = dIn / 8u; let nbp = nb / 2u;
   let row0 = (wg.y * 32768u + wg.x) * ${TM}u;
-  let rp = t >> 2u; let cq = t & 3u;                 // 2 rows x 4 cols per thread
-  let r0 = row0 + rp * 2u; let r1 = r0 + 1u;
-  let c0 = cq * 4u;
-  var a0 = vec4<f32>(0.0); var a1 = vec4<f32>(0.0);
-  for (var b: u32 = 0u; b < nb; b++) {
+  let rq = t >> 2u; let cq = t & 3u;                 // row-group, col-quad (0..3)
+  let rb = row0 + rq * ${RT}u; let c0 = cq * 4u;
+  ${R.map((i) => `var a${i} = vec4<f32>(0.0);`).join(" ")}
+  ${loads.map((j) => `let lr${j} = (t + ${j * T}u) >> 3u; let lw${j} = (t + ${j * T}u) & 7u; let ok${j} = row0 + lr${j} < dOut; let wb${j} = (row0 + lr${j}) * rowWords + lw${j};`).join("\n  ")}
+  let xc0 = t & 15u; let xq0 = t >> 4u; let xq1 = xq0 + 8u;
+  let xb0 = xc0 * xs4 + xq0; let xb1 = xc0 * xs4 + xq1;
+  ${loads.map((j) => `var w${j}r = select(0u, g_qs[wb${j}], ok${j});`).join(" ")}
+  var x0r = g_x[xb0]; var x1r = g_x[xb1];
+  for (var bp: u32 = 0u; bp < nbp; bp++) {
     workgroupBarrier();
-    // weights: TM*4 words per block, ${Math.ceil(TM * 4 / T)} per thread; word (row lr, quad lw)
-    for (var i: u32 = t; i < ${TM * 4}u; i += ${T}u) {
-      let lr = i >> 2u; let lw = i & 3u;
-      let row = row0 + lr;
-      let word = select(0u, g_qs[row * rowWords + b * 4u + lw], row < dOut);
-      Ws[lr * 8u + lw] = vec4<f32>(unpack4xU8(word & 0x0F0F0F0Fu)) - vec4<f32>(8.0);          // k = lw*4 .. +3
-      Ws[lr * 8u + 4u + lw] = vec4<f32>(unpack4xU8((word >> 4u) & 0x0F0F0F0Fu)) - vec4<f32>(8.0);   // k = 16 + lw*4 ..
-    }
-    for (var i: u32 = t; i < 128u; i += ${T}u) { let xc = i & 15u; let xq = i >> 4u; Xs[xq * 16u + xc] = g_x[xc * xs4 + b * 8u + xq]; }
+    ${loads.map((j) => `Ws[lr${j} * 17u + (lw${j} >> 2u) * 8u + (lw${j} & 3u)] = nib_lo(w${j}r); Ws[lr${j} * 17u + (lw${j} >> 2u) * 8u + 4u + (lw${j} & 3u)] = nib_hi(w${j}r);`).join("\n    ")}
+    Xs[xq0 * 16u + xc0] = x0r; Xs[xq1 * 16u + xc0] = x1r;
     workgroupBarrier();
-    var p0 = vec4<f32>(0.0); var p1 = vec4<f32>(0.0);
-    for (var q: u32 = 0u; q < 8u; q++) {
-      let w0 = Ws[rp * 16u + q]; let w1 = Ws[rp * 16u + 8u + q];
-      let xa = Xs[q * 16u + c0]; let xb = Xs[q * 16u + c0 + 1u]; let xc2 = Xs[q * 16u + c0 + 2u]; let xd = Xs[q * 16u + c0 + 3u];
-      p0 += vec4<f32>(dot(w0, xa), dot(w0, xb), dot(w0, xc2), dot(w0, xd));
-      p1 += vec4<f32>(dot(w1, xa), dot(w1, xb), dot(w1, xc2), dot(w1, xd));
+    if (bp + 1u < nbp) {
+      let o = (bp + 1u) * 8u;
+      ${loads.map((j) => `w${j}r = select(0u, g_qs[wb${j} + o], ok${j});`).join(" ")}
+      x0r = g_x[xb0 + (bp + 1u) * 16u]; x1r = g_x[xb1 + (bp + 1u) * 16u];
     }
-    let s0 = g_sc_at(min(r0, dOut - 1u) * nb + b); let s1 = g_sc_at(min(r1, dOut - 1u) * nb + b);
-    a0 += s0 * p0; a1 += s1 * p1;
+    for (var half: u32 = 0u; half < 2u; half++) {
+      ${R.map((i) => `var p${i} = vec4<f32>(0.0);`).join(" ")}
+      let q0 = half * 8u;
+      for (var q: u32 = q0; q < q0 + 8u; q++) {
+        let xa = Xs[q * 16u + c0]; let xb = Xs[q * 16u + c0 + 1u]; let xc2 = Xs[q * 16u + c0 + 2u]; let xd = Xs[q * 16u + c0 + 3u];
+        ${R.map((i) => `let w${i} = Ws[(rq * ${RT}u + ${i}u) * 17u + q]; p${i} += vec4<f32>(dot(w${i}, xa), dot(w${i}, xb), dot(w${i}, xc2), dot(w${i}, xd));`).join("\n        ")}
+      }
+      let bi = 2u * bp + half;
+      ${R.map((i) => `a${i} += g_sc_at(min(rb + ${i}u, dOut - 1u) * nb + bi) * p${i};`).join(" ")}
+    }
   }
-  if (r0 < dOut) { g_y[c0 * ys + r0] = a0.x; g_y[(c0 + 1u) * ys + r0] = a0.y; g_y[(c0 + 2u) * ys + r0] = a0.z; g_y[(c0 + 3u) * ys + r0] = a0.w; }
-  if (r1 < dOut) { g_y[c0 * ys + r1] = a1.x; g_y[(c0 + 1u) * ys + r1] = a1.y; g_y[(c0 + 2u) * ys + r1] = a1.z; g_y[(c0 + 3u) * ys + r1] = a1.w; }
+  ${R.map((i) => `if (rb + ${i}u < dOut) { g_y[c0 * ys + rb + ${i}u] = a${i}.x; g_y[(c0 + 1u) * ys + rb + ${i}u] = a${i}.y; g_y[(c0 + 2u) * ys + rb + ${i}u] = a${i}.z; g_y[(c0 + 3u) * ys + rb + ${i}u] = a${i}.w; }`).join("\n  ")}
 }`;
 const mkPipe = async (code, entry) => device.createComputePipelineAsync({ layout: device.createPipelineLayout({ bindGroupLayouts: [l0, l1] }), compute: { module: device.createShaderModule({ code }), entryPoint: entry } });
 const pG = await mkPipe(gemm, "gemm16");
 const p4 = await mkPipe(WGSL + coopWGSL(256, 4, 64, 4, 4, unpack), "matvec_q4_coop_b");
 const p8 = await mkPipe(WGSL + coopWGSL(256, 4, 64, 8, 2, unpack), "matvec_q4_coop_b");
-const time = async (fn, reps = 30) => { fn(3); await device.queue.onSubmittedWorkDone(); const t0 = performance.now(); fn(reps); await device.queue.onSubmittedWorkDone(); return (performance.now() - t0) / reps; };
+const time = async (fn, reps = 30) => { const tw = performance.now(); while (performance.now() - tw < 300) { fn(10); await device.queue.onSubmittedWorkDone(); } const t0 = performance.now(); fn(reps); await device.queue.onSubmittedWorkDone(); return (performance.now() - t0) / reps; };
 const wgsG = Math.ceil(dOut / TM);
 const runG = (n, yb) => { const e = device.createCommandEncoder(); const p = e.beginComputePass(); p.setPipeline(pG); p.setBindGroup(0, bg0); p.setBindGroup(1, bg1(yb)); for (let i = 0; i < n; i++) { if (wgsG > 32768) p.dispatchWorkgroups(32768, Math.ceil(wgsG / 32768)); else p.dispatchWorkgroups(wgsG); } p.end(); device.queue.submit([e.finish()]); };
 // batched GEMV over 16 columns = 4 dispatches of 4 cols (x/y column offsets via separate shapes)
