@@ -511,6 +511,8 @@ export class Qwen35Engine {
       matvec_q4: ["ro", "ro", "ro", "rw", "u"],
       matvec_coop: ["ro", "ro", "rw", "u"], matvec_q8_coop: ["ro", "ro", "ro", "rw", "u"],
       matvec_q4_coop: ["ro", "ro", "ro", "rw", "u"],
+      matvec_coop_acc: ["ro", "ro", "rw", "u"], matvec_q8_coop_acc: ["ro", "ro", "ro", "rw", "u"], matvec_q4_coop_acc: ["ro", "ro", "ro", "rw", "u"],
+      matvec_coop_b_acc: ["ro", "ro", "rw", "u"], matvec_q8_coop_b_acc: ["ro", "ro", "ro", "rw", "u"], matvec_q4_coop_b_acc: ["ro", "ro", "ro", "rw", "u"],
       matvec_coop_b: ["ro", "ro", "rw", "u"], matvec_q8_coop_b: ["ro", "ro", "ro", "rw", "u"],
       matvec_q4_coop_b: ["ro", "ro", "ro", "rw", "u"],
       matvec_gu: ["ro", "ro", "ro", "rw", "u"], matvec_gu_b: ["ro", "ro", "ro", "rw", "u"],
@@ -607,11 +609,13 @@ export class Qwen35Engine {
       return r;
     };
     const coop = this.mvVariant === "coop";
-    const mv = (w, x, y, dOut, dIn) => {
+    // acc: y[row] += W x (coop only) -> the residual add needs no dispatch
+    const mv = (w, x, y, dOut, dIn, acc = false) => {
       const base = w.kind === "q8" ? "matvec_q8" : w.kind === "q4" ? "matvec_q4" : "matvec";
-      const pipe = coop ? base + "_coop" : base;
+      acc = acc && coop;
+      const pipe = coop ? base + "_coop" + (acc ? "_acc" : "") : base;
       const bufs = w.kind === "f32" ? [w.buf, x, y, this._shape(dOut, dIn)] : [w.qs, w.sc, x, y, this._shape(dOut, dIn)];
-      return { pipe, wgs: coop ? Math.ceil(dOut / this.coopRows) : Math.ceil(dOut / 64), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      return { pipe, acc, wgs: coop ? Math.ceil(dOut / this.coopRows) : Math.ceil(dOut / 64), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
     this._mv = mv;
     const guOp = (wg2, wu2, x, y, dOut, dIn, xB, yB) => {
@@ -635,7 +639,7 @@ export class Qwen35Engine {
       R.mvGate = mv(R.ffnGate, this.xn, this.g, inter, dim);
       R.mvUp = mv(R.ffnUp, this.xn, this.u, inter, dim);
       R.gu = guOp(R.ffnGate, R.ffnUp, this.xn, this.g, inter, dim);
-      R.mvDown = mv(R.ffnDown, this.g, this.tmpDim, dim, inter);
+      R.mvDown = coop ? mv(R.ffnDown, this.g, this.x, dim, inter, true) : mv(R.ffnDown, this.g, this.tmpDim, dim, inter);
       if (L.isFull) {
         R.wq = up(L.wq); R.wk = up(L.wk); R.wv = up(L.wv); R.wo = up(L.wo);
         R.qNorm = up(L.qNorm); R.kNorm = up(L.kNorm);
@@ -644,7 +648,7 @@ export class Qwen35Engine {
         R.mvQ = mv(R.wq, this.xn, this.qFull, nH * hd * 2, dim);
         R.mvK = mv(R.wk, this.xn, this.k, kvDim, dim);
         R.mvV = mv(R.wv, this.xn, this.v, kvDim, dim);
-        R.mvO = mv(R.wo, this.attnOut, this.tmpDim, dim, qDim);
+        R.mvO = coop ? mv(R.wo, this.attnOut, this.x, dim, qDim, true) : mv(R.wo, this.attnOut, this.tmpDim, dim, qDim);
         R.bgQsplit = this._bg(this.pipes.qsplit, 1, [this.qFull, this.q, this.gAttn, this.dnBuf]);
         R.bgQNorm = this._bg(this.pipes.head_norm, 1, [this.q, R.qNorm.buf, this.uNH]);
         R.bgKNorm = this._bg(this.pipes.head_norm, 1, [this.k, R.kNorm.buf, this.uNKV]);
@@ -668,7 +672,7 @@ export class Qwen35Engine {
         R.mvZ = mv(R.wz, this.xn, this.z, dInner, dim);
         R.mvBeta = mv(R.wBeta, this.xn, this.betaRaw, nVH, dim);
         R.mvAlpha = mv(R.wAlpha, this.xn, this.alpha, nVH, dim);
-        R.mvOut = mv(R.wOut, this.gated, this.tmpDim, dim, dInner);
+        R.mvOut = coop ? mv(R.wOut, this.gated, this.x, dim, dInner, true) : mv(R.wOut, this.gated, this.tmpDim, dim, dInner);
         R.bgConv = this._bg(this.pipes.dn_conv, 1, [this.qkv, R.convW, R.convState, this.convOut, this.dnBuf]);
         R.bgGates = this._bg(this.pipes.dn_gates, 1, [this.alpha, this.betaRaw, R.dtBias, R.ssmA, this.beta, this.decay, this.dnBuf]);
         R.bgL2Q = this._bg2(this.pipes.dn_l2, [
@@ -810,7 +814,7 @@ export class Qwen35Engine {
         this._d(p, "attn_out", L.bgAttnOut, D.qDim);
         this._d(p, "sigmoid_mul", L.bgSigMul, D.qDim);
         this._dop(p, L.mvO);
-        this._d(p, "add_res", this.bgAddTmp, D.dim);
+        if (!L.mvO.acc) this._d(p, "add_res", this.bgAddTmp, D.dim);
         p.end();
       }
     } else {
@@ -827,7 +831,7 @@ export class Qwen35Engine {
       this._d(p, "dn_delta", L.bgDelta, D.nVH * 128, 128);
       this._d(p, "dn_gatenorm", L.bgGateNorm, D.nVH * 128, 128);
       this._dop(p, L.mvOut);
-      this._d(p, "add_res", this.bgAddTmp, D.dim);
+      if (!L.mvOut.acc) this._d(p, "add_res", this.bgAddTmp, D.dim);
       p.end();
     }
     // ffn
@@ -841,7 +845,7 @@ export class Qwen35Engine {
         this._d(p, "silu_mul", this.bgSilu, D.inter);
       }
       this._dop(p, L.mvDown);
-      this._d(p, "add_res", this.bgAddTmp, D.dim);
+      if (!L.mvDown.acc) this._d(p, "add_res", this.bgAddTmp, D.dim);
       p.end();
     }
   }
@@ -948,12 +952,12 @@ export class Qwen35Engine {
         m[name] = this._bg2g0(this.pipes[name], [{ buffer: this.cfgBuf }, { buffer: this.frameBufsB[c] }]);
       return m;
     });
-    const mvB = (w, xB, yB, dOut, dIn) => {
+    const mvB = (w, xB, yB, dOut, dIn, acc = false) => {
       const base = w.kind === "q8" ? "matvec_q8" : w.kind === "q4" ? "matvec_q4" : "matvec";
-      const pipe = base + "_coop_b";
+      const pipe = base + "_coop_b" + (acc ? "_acc" : "");
       const shp = this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4);
       const bufs = w.kind === "f32" ? [w.buf, xB.buf, yB.buf, shp] : [w.qs, w.sc, xB.buf, yB.buf, shp];
-      return { pipe, wgs: Math.ceil(dOut / this.coopRowsB), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      return { pipe, acc, wgs: Math.ceil(dOut / this.coopRowsB), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
     if (this.hasHead) {
       B.logits = mkB(D.vocab);
@@ -1004,7 +1008,7 @@ export class Qwen35Engine {
         mc,
         gateUp: [mvB(L.ffnGate, B.xn, B.g, D.inter, D.dim), mvB(L.ffnUp, B.xn, B.u, D.inter, D.dim)],
         gu: this._guOp(L.ffnGate, L.ffnUp, B.xn.buf, B.g.buf, D.inter, D.dim, B.xn, B.g),
-        down: mvB(L.ffnDown, B.g, B.tmpDim, D.dim, D.inter),
+        down: mvB(L.ffnDown, B.g, B.x, D.dim, D.inter, true),
         cols: cix.map((c) => ({
           norm1: bgNormC(L.attnNorm, c),
           norm2: bgNormC(L.postNorm, c),
@@ -1015,7 +1019,7 @@ export class Qwen35Engine {
       if (L.isFull) {
         R.qkvOps = [mvB(L.wq, B.xn, B.qFull, D.nH * D.hd * 2, D.dim),
           mvB(L.wk, B.xn, B.k, D.kvDim, D.dim), mvB(L.wv, B.xn, B.v, D.kvDim, D.dim)];
-        R.o = mvB(L.wo, B.attnOut, B.tmpDim, D.dim, D.qDim);
+        R.o = mvB(L.wo, B.attnOut, B.x, D.dim, D.qDim, true);
         for (let c = 0; c < NC; c++) Object.assign(R.cols[c], {
           qsplit: this._bg2res(this.pipes.qsplit, [slice(B.qFull, c), slice(B.q, c), slice(B.gAttn, c), { buffer: this.dnBuf }]),
           qNorm: this._bg2res(this.pipes.head_norm, [slice(B.q, c), { buffer: L.qNorm.buf }, { buffer: this.uNH }]),
@@ -1030,7 +1034,7 @@ export class Qwen35Engine {
       } else {
         R.dnOps = [mvB(L.wqkv, B.xn, B.qkv, D.convDim, D.dim), mvB(L.wz, B.xn, B.z, D.dInner, D.dim),
           mvB(L.wBeta, B.xn, B.betaRaw, D.nVH, D.dim), mvB(L.wAlpha, B.xn, B.alpha, D.nVH, D.dim)];
-        R.out = mvB(L.wOut, B.gated, B.tmpDim, D.dim, D.dInner);
+        R.out = mvB(L.wOut, B.gated, B.x, D.dim, D.dInner, true);
         for (let c = 0; c < NC; c++) Object.assign(R.cols[c], {
           gates: this._bg2res(this.pipes.dn_gates, [slice(B.alpha, c), slice(B.betaRaw, c),
             { buffer: L.dtBias }, { buffer: L.ssmA }, slice(B.beta, c), slice(B.decay, c), { buffer: this.dnBuf }]),
@@ -1085,7 +1089,7 @@ export class Qwen35Engine {
         }
         this._dMC(p, "sigmoid_mul_mc", M.sigMul, D.qDim, 64, nCols);
         this._dop(p, LB.o);
-        this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
+        if (!LB.o.acc) this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
         p.end();
       }
     } else {
@@ -1098,7 +1102,7 @@ export class Qwen35Engine {
       this._dMC(p, "dn_delta_mc", M.delta, D.nVH * 128, 128, 1);     // loops over columns
       this._dMC(p, "dn_gatenorm_mc", M.gatenorm, D.nVH * 128, 128, nCols);
       this._dop(p, LB.out);
-      this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
+      if (!LB.out.acc) this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
       p.end();
     }
     {
@@ -1110,7 +1114,7 @@ export class Qwen35Engine {
         for (let c = 0; c < nCols; c++) this._dCol(p, "silu_mul", c, LB.cols[c].silu, D.inter);
       }
       this._dop(p, LB.down);
-      this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
+      if (!LB.down.acc) this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
       p.end();
     }
   }

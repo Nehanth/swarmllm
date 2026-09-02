@@ -643,21 +643,7 @@ var<workgroup> gu_res: array<f32, ${ROWS}>;
 var<workgroup> gub_part: array<f32, ${2 * ROWSB * WGB}>;
 ` + ["f32", "q8", "q4"].map((k) => guKernel(k, false)).join("\n")
     + ["f32", "q8", "q4"].map((k) => guKernelB(k)).join("\n");
-  return /* wgsl */ `
-var<workgroup> mvc_part: array<f32, ${WG * ROWS}>;   // [${ROWS} rows][${WG} threads]
-
-// vec4 views of the same buffers the scalar kernels bind (same @group/@binding
-// is legal as long as no single entry point references both views). All x/w
-// buffers are multiples of 16 bytes (dims divisible by 4).
-@group(1) @binding(0) var<storage, read> mv_w4: array<vec4<f32>>;
-@group(1) @binding(1) var<storage, read> mv_x4: array<vec4<f32>>;
-@group(1) @binding(2) var<storage, read> q8_x4: array<vec4<f32>>;
-@group(1) @binding(2) var<storage, read> q4_x4: array<vec4<f32>>;
-
-fn mvf_row(off4: u32, xa: vec4<f32>, xb: vec4<f32>) -> f32 {
-  return dot(mv_w4[off4], xa) + dot(mv_w4[off4 + 1u], xb);
-}
-@compute @workgroup_size(${WG})
+  const singleCoop = `@compute @workgroup_size(${WG})
 fn matvec_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let t = lid.x;
   let qt = t & 3u;
@@ -759,6 +745,26 @@ ${reduce}
     if (row < q4_shape.dOut) { q4_y[row] = mvc_part[t * ${WG}u]; }
   }
 }
+`;
+  // accumulate variants: y[row] += W x (residual add folded into the matvec)
+  const singleCoopAcc = singleCoop.replace(/fn (q8|q4)_row\([\s\S]*?\n}\n/g, "")   // helpers already defined once
+    .replace(/_coop\(/g, "_coop_acc(").replace(/_y\[row\] = /g, "_y[row] += ");
+  return /* wgsl */ `
+var<workgroup> mvc_part: array<f32, ${WG * ROWS}>;   // [${ROWS} rows][${WG} threads]
+
+// vec4 views of the same buffers the scalar kernels bind (same @group/@binding
+// is legal as long as no single entry point references both views). All x/w
+// buffers are multiples of 16 bytes (dims divisible by 4).
+@group(1) @binding(0) var<storage, read> mv_w4: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read> mv_x4: array<vec4<f32>>;
+@group(1) @binding(2) var<storage, read> q8_x4: array<vec4<f32>>;
+@group(1) @binding(2) var<storage, read> q4_x4: array<vec4<f32>>;
+
+fn mvf_row(off4: u32, xa: vec4<f32>, xb: vec4<f32>) -> f32 {
+  return dot(mv_w4[off4], xa) + dot(mv_w4[off4 + 1u], xb);
+}
+${singleCoop}
+${singleCoopAcc}
 
 // ---- batched (COLS-column) variants for prefill / verify: each weight word is
 // loaded and decoded once and applied to COLS token columns (ROWSB rows per WG). x is [4][xs4] vec4s,
@@ -768,7 +774,7 @@ struct BShape { dOut: u32, dIn: u32, xs4: u32, ys: u32 };
 @group(1) @binding(3) var<uniform> mvb_shape: BShape;
 @group(1) @binding(4) var<uniform> qb_shape: BShape;
 var<workgroup> mvb_part: array<f32, ${2 * ROWSB * WGB}>;
-${["", "_q8", "_q4"].map((kind) => {
+${[false, true].map((ACC) => ["", "_q8", "_q4"].map((kind) => {
   const shp = kind === "" ? "mvb_shape" : "qb_shape";
   const xbuf = kind === "" ? "mv_x4" : kind === "_q8" ? "q8_x4" : "q4_x4";
   const ybuf = kind === "" ? "mv_y" : kind === "_q8" ? "q8_y" : "q4_y";
@@ -798,7 +804,7 @@ ${["", "_q8", "_q4"].map((kind) => {
     }`;
   return `
 @compute @workgroup_size(${WGB})
-fn matvec${kind}_coop_b(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn matvec${kind}_coop_b${ACC ? "_acc" : ""}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let t = lid.x;
   let qt = t & 3u;
   let bl = t >> 2u;
@@ -831,11 +837,11 @@ ${Array.from({ length: COLS / 2 }, (_, h) => h).map((h) => `
     let r = t % ${ROWSB}u;
     let m = ${2 * h}u + t / ${ROWSB}u;
     let row = row0 + r;
-    if (row < dOut) { ${ybuf}[m * ys + row] = mvb_part[t * ${WGB}u]; }
+    if (row < dOut) { ${ybuf}[m * ys + row] ${ACC ? "+=" : "="} mvb_part[t * ${WGB}u]; }
   }
   workgroupBarrier();`).join("")}
 }`;
-}).join("\n")}
+}).join("\n")).join("\n")}
 ${guAll}
 `;
 }
@@ -915,6 +921,8 @@ export class BelloEngine {
       matvec_q4: ["ro", "ro", "ro", "rw", "u"],
       matvec_coop: ["ro", "ro", "rw", "u"], matvec_q8_coop: ["ro", "ro", "ro", "rw", "u"],
       matvec_q4_coop: ["ro", "ro", "ro", "rw", "u"],
+      matvec_coop_acc: ["ro", "ro", "rw", "u"], matvec_q8_coop_acc: ["ro", "ro", "ro", "rw", "u"], matvec_q4_coop_acc: ["ro", "ro", "ro", "rw", "u"],
+      matvec_coop_b_acc: ["ro", "ro", "rw", "u"], matvec_q8_coop_b_acc: ["ro", "ro", "ro", "rw", "u"], matvec_q4_coop_b_acc: ["ro", "ro", "ro", "rw", "u"],
       matvec_coop_b: ["ro", "ro", "rw", "u"], matvec_q8_coop_b: ["ro", "ro", "ro", "rw", "u"],
       matvec_q4_coop_b: ["ro", "ro", "ro", "rw", "u"],
       matvec_gu: ["ro", "ro", "ro", "rw", "u"], matvec_gu_b: ["ro", "ro", "ro", "rw", "u"],
