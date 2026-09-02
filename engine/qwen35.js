@@ -358,6 +358,67 @@ fn argmax(@builtin(local_invocation_id) lid: vec3<u32>) {
   if (t == 0u) { am_out[0] = am_i[0]; am_out[1] = bitcast<u32>(am_v[0]); }
 }
 
+
+// --- fused DeltaNet pre-pass (after conv): gates (sigmoid beta, decay) on
+// threads [2*nKH, 2*nKH+nVH), per-head L2 norm of the q and k heads on threads
+// [0, 2*nKH). One dispatch instead of three. ---
+@group(1) @binding(0) var<storage, read> pp_alpha: array<f32>;
+@group(1) @binding(1) var<storage, read> pp_beta: array<f32>;
+@group(1) @binding(2) var<storage, read> pp_dt: array<f32>;
+@group(1) @binding(3) var<storage, read> pp_a: array<f32>;
+@group(1) @binding(4) var<storage, read_write> pp_bout: array<f32>;
+@group(1) @binding(5) var<storage, read_write> pp_dout: array<f32>;
+@group(1) @binding(6) var<storage, read_write> pp_v: array<f32>;   // conv output [q heads | k heads | v]
+@group(1) @binding(7) var<uniform> pp_dn: DN;
+fn pp_l2(off: u32) {
+  var ss: f32 = 0.0;
+  for (var i: u32 = 0u; i < pp_dn.dState; i++) { let v = pp_v[off + i]; ss += v * v; }
+  let inv = 1.0 / max(sqrt(ss), pp_dn.eps2);
+  for (var i: u32 = 0u; i < pp_dn.dState; i++) { pp_v[off + i] *= inv; }
+}
+@compute @workgroup_size(128)
+fn dn_pre(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x; let nL2 = 2u * pp_dn.nKH;
+  if (t < nL2) { pp_l2(t * pp_dn.dState); }
+  else if (t < nL2 + pp_dn.nVH) {
+    let h = t - nL2;
+    pp_bout[h] = 1.0 / (1.0 + exp(-pp_beta[h]));
+    let av = pp_alpha[h] + pp_dt[h];
+    var sp: f32;
+    if (av > 20.0) { sp = av; } else { sp = log(1.0 + exp(av)); }
+    pp_dout[h] = exp(sp * pp_a[h]);
+  }
+}
+
+@group(1) @binding(0) var<storage, read> ppm_alpha: array<f32>;
+@group(1) @binding(1) var<storage, read> ppm_beta: array<f32>;
+@group(1) @binding(2) var<storage, read> ppm_dt: array<f32>;
+@group(1) @binding(3) var<storage, read> ppm_a: array<f32>;
+@group(1) @binding(4) var<storage, read_write> ppm_bout: array<f32>;
+@group(1) @binding(5) var<storage, read_write> ppm_dout: array<f32>;
+@group(1) @binding(6) var<storage, read_write> ppm_v: array<f32>;
+@group(1) @binding(7) var<uniform> ppm_mc: MC;          // s0 = gate column stride, s1 = conv-out column stride
+@group(1) @binding(8) var<uniform> ppm_dn: DN;
+fn ppm_l2(off: u32) {
+  var ss: f32 = 0.0;
+  for (var i: u32 = 0u; i < ppm_dn.dState; i++) { let v = ppm_v[off + i]; ss += v * v; }
+  let inv = 1.0 / max(sqrt(ss), ppm_dn.eps2);
+  for (var i: u32 = 0u; i < ppm_dn.dState; i++) { ppm_v[off + i] *= inv; }
+}
+@compute @workgroup_size(128)
+fn dn_pre_mc(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x; let col = wg.y; let nL2 = 2u * ppm_dn.nKH;
+  if (t < nL2) { ppm_l2(col * ppm_mc.s1 + t * ppm_dn.dState); }
+  else if (t < nL2 + ppm_dn.nVH) {
+    let h = t - nL2; let o = col * ppm_mc.s0;
+    ppm_bout[o + h] = 1.0 / (1.0 + exp(-ppm_beta[o + h]));
+    let av = ppm_alpha[o + h] + ppm_dt[h];
+    var sp: f32;
+    if (av > 20.0) { sp = av; } else { sp = log(1.0 + exp(av)); }
+    ppm_dout[o + h] = exp(sp * ppm_a[h]);
+  }
+}
+
 @group(1) @binding(0) var<storage, read> gnm_x: array<f32>;
 @group(1) @binding(1) var<storage, read> gnm_z: array<f32>;
 @group(1) @binding(2) var<storage, read> gnm_w: array<f32>;
@@ -531,11 +592,17 @@ export class Qwen35Engine {
       sigmoid_mul: ["rw", "ro", "u"],
       rmsnorm_mc: ["ro", "ro", "rw", "u"], add_res_mc: ["rw", "ro", "u"],
       dn_gates_mc: ["ro", "ro", "ro", "ro", "rw", "rw", "u"], dn_conv_mc: ["ro", "ro", "rw", "rw", "u", "rw"],
+      dn_pre: ["ro", "ro", "ro", "ro", "rw", "rw", "rw", "u"], dn_pre_mc: ["ro", "ro", "ro", "ro", "rw", "rw", "rw", "u", "u"],
       dn_l2_mc: ["rw", "u", "u"], dn_delta_mc: ["ro", "ro", "ro", "rw", "rw", "u", "u", "rw"],
       dn_gatenorm_mc: ["ro", "ro", "ro", "rw", "u", "u"], qsplit_mc: ["ro", "rw", "rw", "u", "u"],
       head_norm_mc: ["rw", "ro", "u"], rope_part_mc: ["rw", "u", "u"], sigmoid_mul_mc: ["rw", "ro", "u"],
       argmax: ["ro", "rw", "u"],
     };
+    if (batchCols > 4) Object.assign(G1, {   // 4-column set for verifies with <= 4 live columns
+      matvec_coop_b4: G1.matvec_coop_b, matvec_q8_coop_b4: G1.matvec_q8_coop_b, matvec_q4_coop_b4: G1.matvec_q4_coop_b,
+      matvec_coop_b4_acc: G1.matvec_coop_b, matvec_q8_coop_b4_acc: G1.matvec_q8_coop_b, matvec_q4_coop_b4_acc: G1.matvec_q4_coop_b,
+      matvec_gu_b4: G1.matvec_gu_b, matvec_q8_gu_b4: G1.matvec_q8_gu_b, matvec_q4_gu_b4: G1.matvec_q4_gu_b,
+    });
     const bufType = { u: "uniform", ro: "read-only-storage", rw: "storage" };
     this.pipes = {};
     // compile every pipeline in parallel (async): overlaps shader compilation
@@ -624,7 +691,9 @@ export class Qwen35Engine {
       const pipe = xB ? base + "_b" : base;
       const shp = xB ? this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4) : this._shapeB(dOut, dIn, 0, 0);
       const bufs = wg2.kind === "f32" ? [wg2.buf, wu2.buf, x, y, shp] : [wg2.qs, wg2.sc, wu2.qs, wu2.sc, x, y, shp];
-      return { pipe, wgs: Math.ceil(dOut / (xB ? this.coopRowsB : this.coopRows)), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      const op = { pipe, wgs: Math.ceil(dOut / (xB ? this.coopRowsB : this.coopRows)), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      if (xB && this.NC > 4) { op.pipe4 = base + "_b4"; op.bg4 = this._bg(this.pipes[op.pipe4], 1, bufs); }
+      return op;
     };
     this._guOp = guOp;
     const bgNorm = (x, w, y) => this._bg(this.pipes.rmsnorm, 1, [x, w.buf, y, this.uDim]);
@@ -675,6 +744,7 @@ export class Qwen35Engine {
         R.mvOut = coop ? mv(R.wOut, this.gated, this.x, dim, dInner, true) : mv(R.wOut, this.gated, this.tmpDim, dim, dInner);
         R.bgConv = this._bg(this.pipes.dn_conv, 1, [this.qkv, R.convW, R.convState, this.convOut, this.dnBuf]);
         R.bgGates = this._bg(this.pipes.dn_gates, 1, [this.alpha, this.betaRaw, R.dtBias, R.ssmA, this.beta, this.decay, this.dnBuf]);
+        R.bgPre = this._bg(this.pipes.dn_pre, 1, [this.alpha, this.betaRaw, R.dtBias, R.ssmA, this.beta, this.decay, this.convOut, this.dnBuf]);
         R.bgL2Q = this._bg2(this.pipes.dn_l2, [
           { buffer: this.convOut, offset: 0, size: keyDim * 4 },
           { buffer: this.uNKH }, { buffer: this.dnBuf }]);
@@ -776,12 +846,14 @@ export class Qwen35Engine {
     pass.setBindGroup(1, bg);
     pass.dispatchWorkgroups(Math.ceil(threads / wg));
   }
-  _dop(pass, op) {
+  _dop(pass, op, nCols = 0) {
     if (this.skip && this.skip.has(op.pipe)) return;
-    pass.setPipeline(this.pipes[op.pipe]);
-    pass.setBindGroup(0, this.bgCommonFor[op.pipe]);
-    pass.setBindGroup(1, op.bg);
-    pass.dispatchWorkgroups(op.wgs);
+    const four = this.b4 !== false && nCols > 0 && nCols <= 4 && op.pipe4;   // <= 4 live columns: 4-column kernel
+    const pipe = four ? op.pipe4 : op.pipe;
+    pass.setPipeline(this.pipes[pipe]);
+    pass.setBindGroup(0, this.bgCommonFor[pipe]);
+    pass.setBindGroup(1, four ? op.bg4 : op.bg);
+    if (op.wgs > 32768) pass.dispatchWorkgroups(32768, Math.ceil(op.wgs / 32768)); else pass.dispatchWorkgroups(op.wgs);   // > 65535 per dimension is silently dropped
   }
   _setFrame(pos, seqLen) {
     this.device.queue.writeBuffer(this.frameBuf, 0, new Uint32Array([pos, seqLen]));
@@ -824,10 +896,8 @@ export class Qwen35Engine {
       this._dop(p, L.mvZ);
       this._dop(p, L.mvBeta);
       this._dop(p, L.mvAlpha);
-      this._d(p, "dn_gates", L.bgGates, D.nVH);
       this._d(p, "dn_conv", L.bgConv, D.convDim);
-      this._d(p, "dn_l2", L.bgL2Q, D.nKH, 32);
-      this._d(p, "dn_l2", L.bgL2K, D.nKH, 32);
+      this._d(p, "dn_pre", L.bgPre, 128, 128);      // gates + L2(q,k) fused
       this._d(p, "dn_delta", L.bgDelta, D.nVH * 128, 128);
       this._d(p, "dn_gatenorm", L.bgGateNorm, D.nVH * 128, 128);
       this._dop(p, L.mvOut);
@@ -944,7 +1014,7 @@ export class Qwen35Engine {
     const colPipes = ["rmsnorm", "head_norm", "attn_scores", "attn_softmax", "attn_out",
       "silu_mul", "add_res", "rope_part", "qsplit", "sigmoid_mul",
       "dn_gates", "dn_conv", "dn_l2", "dn_delta", "dn_gatenorm",
-      "rmsnorm_mc", "add_res_mc", "dn_gates_mc", "dn_conv_mc", "dn_l2_mc", "dn_delta_mc", "dn_gatenorm_mc",
+      "rmsnorm_mc", "add_res_mc", "dn_gates_mc", "dn_conv_mc", "dn_l2_mc", "dn_pre_mc", "dn_delta_mc", "dn_gatenorm_mc",
       "qsplit_mc", "head_norm_mc", "rope_part_mc", "sigmoid_mul_mc"];
     this.bgCommonB = cix.map((c) => {
       const m = {};
@@ -957,7 +1027,9 @@ export class Qwen35Engine {
       const pipe = base + "_coop_b" + (acc ? "_acc" : "");
       const shp = this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4);
       const bufs = w.kind === "f32" ? [w.buf, xB.buf, yB.buf, shp] : [w.qs, w.sc, xB.buf, yB.buf, shp];
-      return { pipe, acc, wgs: Math.ceil(dOut / this.coopRowsB), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      const op = { pipe, acc, wgs: Math.ceil(dOut / this.coopRowsB), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      if (this.NC > 4) { op.pipe4 = base + "_coop_b4" + (acc ? "_acc" : ""); op.bg4 = this._bg(this.pipes[op.pipe4], 1, bufs); }
+      return op;
     };
     if (this.hasHead) {
       B.logits = mkB(D.vocab);
@@ -999,6 +1071,8 @@ export class Qwen35Engine {
         conv: this._bg2res(this.pipes.dn_conv_mc, [whole(B.qkv), { buffer: L.convW }, { buffer: L.convState }, whole(B.convOut),
           mcU(D.convDim, st(B.qkv), st(B.convOut)), { buffer: L.conv_shadow }]),
         l2: this._bg2res(this.pipes.dn_l2_mc, [whole(B.convOut), mcU(D.nKH, st(B.convOut), D.keyDim), dn]),
+        pre: this._bg2res(this.pipes.dn_pre_mc, [whole(B.alpha), whole(B.betaRaw), { buffer: L.dtBias }, { buffer: L.ssmA },
+          whole(B.beta), whole(B.decay), whole(B.convOut), mcU(0, st(B.alpha), st(B.convOut)), dn]),
         delta: this._bg2res(this.pipes.dn_delta_mc, [whole(B.convOut), whole(B.beta), whole(B.decay), { buffer: L.S }, whole(B.dOut),
           mcU(0, st(B.convOut), st(B.beta), st(B.dOut)), dn, { buffer: L.S_shadow }]),
         gatenorm: this._bg2res(this.pipes.dn_gatenorm_mc, [whole(B.dOut), whole(B.z), { buffer: L.ssmNorm }, whole(B.gated),
@@ -1067,7 +1141,7 @@ export class Qwen35Engine {
       {
         const p = enc.beginComputePass();
         this._dMC(p, "rmsnorm_mc", M.norm1, 256, 256, nCols);
-        for (const op of LB.qkvOps) this._dop(p, op);
+        for (const op of LB.qkvOps) this._dop(p, op, nCols);
         this._dMC(p, "qsplit_mc", M.qsplit, D.nH * D.hd, 64, nCols);
         this._dMC(p, "head_norm_mc", M.qNorm, D.nH, 32, nCols);
         this._dMC(p, "head_norm_mc", M.kNorm, D.nKV, 32, nCols);
@@ -1088,32 +1162,31 @@ export class Qwen35Engine {
           this._dCol(p, "attn_out", c, C.attnOut, D.qDim);
         }
         this._dMC(p, "sigmoid_mul_mc", M.sigMul, D.qDim, 64, nCols);
-        this._dop(p, LB.o);
+        this._dop(p, LB.o, nCols);
         if (!LB.o.acc) this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
         p.end();
       }
     } else {
       const p = enc.beginComputePass();
       this._dMC(p, "rmsnorm_mc", M.norm1, 256, 256, nCols);
-      for (const op of LB.dnOps) this._dop(p, op);
-      this._dMC(p, "dn_gates_mc", M.gates, D.nVH, 64, nCols);
+      for (const op of LB.dnOps) this._dop(p, op, nCols);
       this._dMC(p, "dn_conv_mc", M.conv, D.convDim, 64, 1);           // loops over columns
-      this._dMC(p, "dn_l2_mc", M.l2, D.nKH, 32, nCols, 2);            // z: q part, k part
+      this._dMC(p, "dn_pre_mc", M.pre, 128, 128, nCols);              // gates + L2(q,k) fused, one WG per column
       this._dMC(p, "dn_delta_mc", M.delta, D.nVH * 128, 128, 1);     // loops over columns
       this._dMC(p, "dn_gatenorm_mc", M.gatenorm, D.nVH * 128, 128, nCols);
-      this._dop(p, LB.out);
+      this._dop(p, LB.out, nCols);
       if (!LB.out.acc) this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
       p.end();
     }
     {
       const p = enc.beginComputePass();
       this._dMC(p, "rmsnorm_mc", M.norm2, 256, 256, nCols);
-      if (LB.gu) this._dop(p, LB.gu);
+      if (LB.gu) this._dop(p, LB.gu, nCols);
       else {
-        for (const op of LB.gateUp) this._dop(p, op);
+        for (const op of LB.gateUp) this._dop(p, op, nCols);
         for (let c = 0; c < nCols; c++) this._dCol(p, "silu_mul", c, LB.cols[c].silu, D.inter);
       }
-      this._dop(p, LB.down);
+      this._dop(p, LB.down, nCols);
       if (!LB.down.acc) this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
       p.end();
     }
@@ -1172,7 +1245,7 @@ export class Qwen35Engine {
     const enc = this.device.createCommandEncoder();
     const p = enc.beginComputePass();
     this._dMC(p, "rmsnorm_mc", this.bgFinalNormMC, 256, 256, n);
-    this._dop(p, this.headB);
+    this._dop(p, this.headB, n);
     p.end();
     for (let c = 0; c < n; c++) enc.copyBufferToBuffer(this.B.logits.buf, c * this.B.logits.stride, this.stageLogitsN, c * vocab * 4, vocab * 4);
     this.device.queue.submit([enc.finish()]);

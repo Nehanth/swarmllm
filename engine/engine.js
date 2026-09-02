@@ -549,7 +549,7 @@ fn matvec${kind === "f32" ? "" : "_" + kind}_gu${batched ? "_b" : ""}(@builtin(w
   let nb = dIn / 32u;
   let dIn4 = dIn / 4u;
   let rowWords = ${kind === "q4" ? "dIn / 8u" : "dIn / 4u"};
-  let row0 = wg.x * ${ROWS}u;
+  let row0 = (wg.y * 32768u + wg.x) * ${ROWS}u;
   let full = row0 + ${ROWS - 1}u < dOut;
 ${batched ? [0, 1, 2, 3].map(colBody).join("\n") : colBody(0)}
 }`;
@@ -557,10 +557,10 @@ ${batched ? [0, 1, 2, 3].map(colBody).join("\n") : colBody(0)}
   // batched gate/up: ONE pass over the weights; each g/u word is loaded and
   // decoded once and applied to all 4 columns (2*ROWS*4 accumulators), then
   // one reduction round per column.
-  const guKernelB = (kind) => {
+  const guKernelB = (kind, C = COLS) => {
     const P = kind === "f32" ? "guf" : kind === "q8" ? "gu8" : "gu4";
     const shape = `${P}_shape`;
-    const cols = Array.from({ length: COLS }, (_, m) => m), rows = Array.from({ length: ROWSB }, (_, r) => r);
+    const cols = Array.from({ length: C }, (_, m) => m), rows = Array.from({ length: ROWSB }, (_, r) => r);
     const xLoads = kind === "q4"
       ? cols.map((m) => `let xa${m} = ${P}_x[${m}u * xs4 + b * 8u + qt]; let xb${m} = ${P}_x[${m}u * xs4 + b * 8u + qt + 4u];`).join("\n      ")
       : cols.map((m) => `let xa${m} = ${P}_x[${m}u * xs4 + b * 8u + qt * 2u]; let xb${m} = ${P}_x[${m}u * xs4 + b * 8u + qt * 2u + 1u];`).join("\n      ");
@@ -598,7 +598,7 @@ ${batched ? [0, 1, 2, 3].map(colBody).join("\n") : colBody(0)}
     const K2 = 2 * ROWSB;
     return `
 @compute @workgroup_size(${WGB})
-fn matvec${kind === "f32" ? "" : "_" + kind}_gu_b(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn matvec${kind === "f32" ? "" : "_" + kind}_gu_b${C === COLS ? "" : "4"}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let t = lid.x;
   let qt = t & 3u;
   let bl = t >> 2u;
@@ -609,7 +609,7 @@ fn matvec${kind === "f32" ? "" : "_" + kind}_gu_b(@builtin(workgroup_id) wg: vec
   let nb = dIn / 32u;
   let dIn4 = dIn / 4u;
   let rowWords = ${kind === "q4" ? "dIn / 8u" : "dIn / 4u"};
-  let row0 = wg.x * ${ROWSB}u;
+  let row0 = (wg.y * 32768u + wg.x) * ${ROWSB}u;
   let full = row0 + ${ROWSB - 1}u < dOut;
   ${rows.map((r) => cols.map((m) => `var ag${r}_${m} = 0.0; var au${r}_${m} = 0.0;`).join(" ")).join("\n  ")}
   for (var b: u32 = bl; b < nb; b += ${LANESB}u) {
@@ -642,7 +642,8 @@ ${cols.map((m) => `
 var<workgroup> gu_res: array<f32, ${ROWS}>;
 var<workgroup> gub_part: array<f32, ${2 * ROWSB * WGB}>;
 ` + ["f32", "q8", "q4"].map((k) => guKernel(k, false)).join("\n")
-    + ["f32", "q8", "q4"].map((k) => guKernelB(k)).join("\n");
+    + ["f32", "q8", "q4"].map((k) => guKernelB(k)).join("\n")
+    + (COLS > 4 ? ["f32", "q8", "q4"].map((k) => guKernelB(k, 4)).join("\n") : "");
   const singleCoop = `@compute @workgroup_size(${WG})
 fn matvec_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let t = lid.x;
@@ -651,7 +652,7 @@ fn matvec_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
   let dIn = mv_shape.dIn;
   let nb = dIn / 32u;
   let dIn4 = dIn / 4u;
-  let row0 = wg.x * ${ROWS}u;
+  let row0 = (wg.y * 32768u + wg.x) * ${ROWS}u;
   let full = row0 + ${ROWS - 1}u < mv_shape.dOut;
   ${accDecl}
   for (var b: u32 = bl; b < nb; b += ${LANES}u) {
@@ -688,7 +689,7 @@ fn matvec_q8_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocatio
   let dIn = q8_shape.dIn;
   let nb = dIn / 32u;
   let rowWords = dIn / 4u;
-  let row0 = wg.x * ${ROWS}u;
+  let row0 = (wg.y * 32768u + wg.x) * ${ROWS}u;
   let full = row0 + ${ROWS - 1}u < q8_shape.dOut;
   ${accDecl}
   for (var b: u32 = bl; b < nb; b += ${LANES}u) {
@@ -724,7 +725,7 @@ fn matvec_q4_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocatio
   let dIn = q4_shape.dIn;
   let nb = dIn / 32u;
   let rowWords = dIn / 8u;   // 4 bits/weight -> dIn/8 u32 words per row
-  let row0 = wg.x * ${ROWS}u;
+  let row0 = (wg.y * 32768u + wg.x) * ${ROWS}u;
   let full = row0 + ${ROWS - 1}u < q4_shape.dOut;
   ${accDecl}
   for (var b: u32 = bl; b < nb; b += ${LANES}u) {
@@ -774,11 +775,11 @@ struct BShape { dOut: u32, dIn: u32, xs4: u32, ys: u32 };
 @group(1) @binding(3) var<uniform> mvb_shape: BShape;
 @group(1) @binding(4) var<uniform> qb_shape: BShape;
 var<workgroup> mvb_part: array<f32, ${2 * ROWSB * WGB}>;
-${[false, true].map((ACC) => ["", "_q8", "_q4"].map((kind) => {
+${[COLS, 4].filter((c, i) => i === 0 || c < COLS).map((C) => [false, true].map((ACC) => ["", "_q8", "_q4"].map((kind) => {
   const shp = kind === "" ? "mvb_shape" : "qb_shape";
   const xbuf = kind === "" ? "mv_x4" : kind === "_q8" ? "q8_x4" : "q4_x4";
   const ybuf = kind === "" ? "mv_y" : kind === "_q8" ? "q8_y" : "q4_y";
-  const cols = Array.from({ length: COLS }, (_, m) => m), rows = Array.from({ length: ROWSB }, (_, r) => r);
+  const cols = Array.from({ length: C }, (_, m) => m), rows = Array.from({ length: ROWSB }, (_, r) => r);
   const xLoads = kind === "_q4"
     ? cols.map((m) => `let xa${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt]; let xb${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt + 4u];`).join("\n    ")
     : cols.map((m) => `let xa${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt * 2u]; let xb${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt * 2u + 1u];`).join("\n    ");
@@ -804,7 +805,7 @@ ${[false, true].map((ACC) => ["", "_q8", "_q4"].map((kind) => {
     }`;
   return `
 @compute @workgroup_size(${WGB})
-fn matvec${kind}_coop_b${ACC ? "_acc" : ""}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn matvec${kind}_coop_b${C === COLS ? "" : "4"}${ACC ? "_acc" : ""}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let t = lid.x;
   let qt = t & 3u;
   let bl = t >> 2u;
@@ -814,7 +815,7 @@ fn matvec${kind}_coop_b${ACC ? "_acc" : ""}(@builtin(workgroup_id) wg: vec3<u32>
   let ys = ${shp}.ys;
   let nb = dIn / 32u;
   let rowWords = ${kind === "_q4" ? "dIn / 8u" : "dIn / 4u"};
-  let row0 = wg.x * ${ROWSB}u;
+  let row0 = (wg.y * 32768u + wg.x) * ${ROWSB}u;
   let full = row0 + ${ROWSB - 1}u < dOut;
   ${rows.map((r) => cols.map((m) => `var a${r}_${m} = 0.0;`).join(" ")).join("\n  ")}
   for (var b: u32 = bl; b < nb; b += ${LANESB}u) {
@@ -822,7 +823,7 @@ fn matvec${kind}_coop_b${ACC ? "_acc" : ""}(@builtin(workgroup_id) wg: vec3<u32>
     ${idx}
     ${rows.map(rowBlock).join("\n    ")}
   }
-${Array.from({ length: COLS / 2 }, (_, h) => h).map((h) => `
+${Array.from({ length: C / 2 }, (_, h) => h).map((h) => `
   ${rows.map((r) => `mvb_part[${r * WGB}u + t] = a${r}_${2 * h}; mvb_part[${(ROWSB + r) * WGB}u + t] = a${r}_${2 * h + 1};`).join(" ")}
   workgroupBarrier();
   {
@@ -841,7 +842,7 @@ ${Array.from({ length: COLS / 2 }, (_, h) => h).map((h) => `
   }
   workgroupBarrier();`).join("")}
 }`;
-}).join("\n")).join("\n")}
+}).join("\n")).join("\n")).join("\n")}
 ${guAll}
 `;
 }
@@ -1101,7 +1102,7 @@ export class BelloEngine {
     pass.setPipeline(this.pipes[op.pipe]);
     pass.setBindGroup(0, this.bgCommonFor[op.pipe]);
     pass.setBindGroup(1, op.bg);
-    pass.dispatchWorkgroups(op.wgs);
+    if (op.wgs > 32768) pass.dispatchWorkgroups(32768, Math.ceil(op.wgs / 32768)); else pass.dispatchWorkgroups(op.wgs);   // > 65535 per dimension is silently dropped
   }
 
   _setFrame(pos, seqLen) {

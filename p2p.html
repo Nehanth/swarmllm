@@ -1139,6 +1139,9 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
       device: ai.device, meta: G.meta, weights, vocab: G.tensors[GGML_EMBED]?.shape?.[0],
       layerRange: range, hasEmbed, hasHead, maxSeq: MAX_SEQ,
       coopWG: ai.tune?.wg, coopRows: ai.tune?.rows,
+      // 8 batch columns x 2 rows/WG: a K=5 speculative verify is ONE pass
+      // (same accumulators per thread as 4 columns x 4 rows)
+      batchCols: 8, coopRowsB: 2,
     });
   } else if (M.kind === "gguf") {
     aiStatus("reading model index\u2026");
