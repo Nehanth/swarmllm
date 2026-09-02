@@ -332,6 +332,32 @@ fn dn_delta_mc(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
   }
 }
 
+// --- argmax over n floats (single workgroup): out = [index, bitcast(value)] ---
+@group(1) @binding(0) var<storage, read> am_x: array<f32>;
+@group(1) @binding(1) var<storage, read_write> am_out: array<u32>;
+@group(1) @binding(2) var<uniform> am_n: vec4<u32>;
+var<workgroup> am_v: array<f32, 256>;
+var<workgroup> am_i: array<u32, 256>;
+@compute @workgroup_size(256)
+fn argmax(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x; let n = am_n.x;
+  var bv: f32 = -3.402823e38; var bi: u32 = 0xffffffffu;
+  for (var i: u32 = t; i < n; i += 256u) {
+    let v = am_x[i];
+    if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+  }
+  am_v[t] = bv; am_i[t] = bi;
+  workgroupBarrier();
+  for (var s: u32 = 128u; s > 0u; s >>= 1u) {
+    if (t < s) {
+      let ov = am_v[t + s]; let oi = am_i[t + s];
+      if (ov > am_v[t] || (ov == am_v[t] && oi < am_i[t])) { am_v[t] = ov; am_i[t] = oi; }
+    }
+    workgroupBarrier();
+  }
+  if (t == 0u) { am_out[0] = am_i[0]; am_out[1] = bitcast<u32>(am_v[0]); }
+}
+
 @group(1) @binding(0) var<storage, read> gnm_x: array<f32>;
 @group(1) @binding(1) var<storage, read> gnm_z: array<f32>;
 @group(1) @binding(2) var<storage, read> gnm_w: array<f32>;
@@ -505,6 +531,7 @@ export class Qwen35Engine {
       dn_l2_mc: ["rw", "u", "u"], dn_delta_mc: ["ro", "ro", "ro", "rw", "rw", "u", "u", "rw"],
       dn_gatenorm_mc: ["ro", "ro", "ro", "rw", "u", "u"], qsplit_mc: ["ro", "rw", "rw", "u", "u"],
       head_norm_mc: ["rw", "ro", "u"], rope_part_mc: ["rw", "u", "u"], sigmoid_mul_mc: ["rw", "ro", "u"],
+      argmax: ["ro", "rw", "u"],
     };
     const bufType = { u: "uniform", ro: "read-only-storage", rw: "storage" };
     this.pipes = {};
@@ -671,6 +698,10 @@ export class Qwen35Engine {
       }
       this.logits = device.createBuffer({ size: vocab * 4, usage: S });
       this.stageLogits = device.createBuffer({ size: vocab * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      // on-GPU argmax of the logits (draft chain): 8-byte readback instead of 1 MB
+      this.argBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+      this.stageArg = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      this.bgArgmax = this._bg(this.pipes.argmax, 1, [this.logits, this.argBuf, this._buf(new Uint32Array([vocab, 0, 0, 0]), GPUBufferUsage.UNIFORM)]);
       this.bgFinalNorm = bgNorm(this.x, this.finalNorm, this.xn);
       this.headOp = mv(this.headEntry, this.xn, this.logits, vocab, dim);
     }
@@ -1168,10 +1199,18 @@ export class Qwen35Engine {
       const p = enc.beginComputePass();
       this._d(p, "rmsnorm", M2.bgHeadNorm, 256, 256);
       this._dop(p, this.headOp);
+      if (wantLogits === "argmax") this._d(p, "argmax", this.bgArgmax, 256, 256);
       p.end();
     }
+    if (wantLogits === "argmax") enc.copyBufferToBuffer(this.argBuf, 0, this.stageArg, 0, 16);
     this.device.queue.submit([enc.finish()]);
     if (!wantLogits) return null;
+    if (wantLogits === "argmax") {
+      await this.stageArg.mapAsync(GPUMapMode.READ);
+      const id = new Uint32Array(this.stageArg.getMappedRange())[0];
+      this.stageArg.unmap();
+      return id;
+    }
     return await this._readback(this.logits, this.stageLogits, vocab);
   }
 
@@ -1222,9 +1261,7 @@ export class Qwen35Engine {
     for (let k = 0; k < K; k++) {
       // after the first call this.x holds the MTP block's own output hidden,
       // which is what chained drafting feeds back in
-      const lg = await this.mtpRun(null, k === 0 ? tNext : drafts[k - 1], pos + k, true);
-      let d = 0; for (let i = 1; i < lg.length; i++) if (lg[i] > lg[d]) d = i;
-      drafts.push(d);
+      drafts.push(await this.mtpRun(null, k === 0 ? tNext : drafts[k - 1], pos + k, "argmax"));
     }
     const { lgs, hs } = await this.verifyN([tNext, ...drafts], pos, runTrunk);
     const out = [];
