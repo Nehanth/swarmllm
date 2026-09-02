@@ -244,7 +244,7 @@ fn dn_gates_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(1) @binding(2) var<storage, read_write> cvm_st: array<f32>;
 @group(1) @binding(3) var<storage, read_write> cvm_y: array<f32>;
 @group(1) @binding(4) var<uniform> cvm_mc: MC;          // n = convDim, x stride, y stride
-@group(1) @binding(5) var<storage, read_write> cvm_shadow: array<f32>;   // [3][convDim*3]
+@group(1) @binding(5) var<storage, read_write> cvm_shadow: array<f32>;   // [7][convDim*3]
 @compute @workgroup_size(64)
 fn dn_conv_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
   let c = gid.x; let n = cvm_mc.n;
@@ -260,8 +260,9 @@ fn dn_conv_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
     acc += w2 * s2;
     cvm_y[col * cvm_mc.s1 + c] = acc / (1.0 + exp(-acc));
     s0 = s1; s1 = s2; s2 = x;
-    if (frame.snap != 0u && col + 1u < nCols) {
-      let so = col * n * 3u + c * 3u;
+    let cvSB = frame.snap & 0xffu;       // snapshot slot base + 1 (0 = off)
+    if (cvSB != 0u && cvSB + col < (frame.snap >> 8u)) {
+      let so = (cvSB - 1u + col) * n * 3u + c * 3u;
       cvm_shadow[so] = s0; cvm_shadow[so + 1u] = s1; cvm_shadow[so + 2u] = s2;
     }
   }
@@ -289,7 +290,7 @@ fn dn_l2_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(1) @binding(4) var<storage, read_write> dlm_o: array<f32>;
 @group(1) @binding(5) var<uniform> dlm_mc: MC;          // s0 conv stride, s1 gate stride, s2 out stride
 @group(1) @binding(6) var<uniform> dlm_dn: DN;
-@group(1) @binding(7) var<storage, read_write> dlm_shadow: array<f32>;   // [3][nVH*dState*dState]
+@group(1) @binding(7) var<storage, read_write> dlm_shadow: array<f32>;   // [7][nVH*dState*dState]
 @compute @workgroup_size(128)
 fn dn_delta_mc(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let h = wg.x; let j = lid.x; let dS = dlm_dn.dState;
@@ -323,8 +324,10 @@ fn dn_delta_mc(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
       dlm_s[idx] += dlm_c[ko + i] * d;
     }
     dlm_o[col * dlm_mc.s2 + vOff + j] = (sq + d * kq) * scale;
-    if (frame.snap != 0u && col + 1u < nCols) {
-      for (var i: u32 = 0u; i < dS; i++) { dlm_shadow[col * sSize + Sb + i * dS + j] = dlm_s[Sb + i * dS + j]; }
+    let dlSB = frame.snap & 0xffu;     // snapshot slot base + 1 (0 = off)
+    if (dlSB != 0u && dlSB + col < (frame.snap >> 8u)) {
+      let slot = dlSB - 1u + col;
+      for (var i: u32 = 0u; i < dS; i++) { dlm_shadow[slot * sSize + Sb + i * dS + j] = dlm_s[Sb + i * dS + j]; }
     }
   }
 }
@@ -893,8 +896,8 @@ export class Qwen35Engine {
     this.stageXB = dev.createBuffer({ size: 4 * D.dim * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     // rollback shadows for the recurrent layers (speculative decoding)
     for (const L of this.layers) if (!L.isFull && !L.S_shadow) {
-      L.S_shadow = dev.createBuffer({ size: 3 * L.S.size, usage: S });
-      L.conv_shadow = dev.createBuffer({ size: 3 * L.convState.size, usage: S });
+      L.S_shadow = dev.createBuffer({ size: 7 * L.S.size, usage: S });
+      L.conv_shadow = dev.createBuffer({ size: 7 * L.convState.size, usage: S });
     }
     this.stageLogitsN = dev.createBuffer({ size: 4 * D.vocab * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const slice = (b, c) => ({ buffer: b.buf, offset: c * b.stride, size: b.n * 4 });
@@ -1096,8 +1099,10 @@ export class Qwen35Engine {
     if (!this.B) this._initBatch();
     const n = ids.length;
     this.pos = basePos;
+    const sp = !snapshot ? 0 : typeof snapshot === "object"
+      ? ((snapshot.total << 8) | (snapshot.base + 1)) : ((n << 8) | 1);
     for (let c = 0; c < n; c++) {
-      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, n, snapshot ? 1 : 0]));
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, n, sp]));
       this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(ids[c]));
     }
     return this._runBatchAndRead(basePos, n);
@@ -1107,8 +1112,10 @@ export class Qwen35Engine {
     const { dim } = this.dims;
     const n = xs.length / dim;
     this.pos = basePos;
+    const sp = !snapshot ? 0 : typeof snapshot === "object"
+      ? ((snapshot.total << 8) | (snapshot.base + 1)) : ((n << 8) | 1);
     for (let c = 0; c < n; c++) {
-      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, n, snapshot ? 1 : 0]));
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, n, sp]));
       this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, xs.subarray(c * dim, (c + 1) * dim));
     }
     return this._runBatchAndRead(basePos, n);
@@ -1172,8 +1179,21 @@ export class Qwen35Engine {
   // pass with DeltaNet snapshots, or a caller-supplied runTrunk for a device
   // chain) then one batched head pass -> logits per column.
   async verifyN(tokens, pos, runTrunk = null) {
-    const hs = runTrunk ? await runTrunk(tokens, pos) : await this.embedRunBatch(tokens, pos, true);
-    return this.headBatch(hs, tokens.length);
+    const n = tokens.length, { dim } = this.dims;
+    let hs;
+    if (runTrunk) hs = await runTrunk(tokens, pos);
+    else if (n <= 4) hs = await this.embedRunBatch(tokens, pos, true);
+    else {
+      hs = new Float32Array(n * dim);
+      for (let c0 = 0; c0 < n; c0 += 4) {
+        const m = Math.min(4, n - c0);
+        hs.set(await this.embedRunBatch(tokens.slice(c0, c0 + m), pos + c0, { base: c0, total: n }), c0 * dim);
+      }
+    }
+    const lgs = [];
+    for (let c0 = 0; c0 < n; c0 += 4)
+      lgs.push(...await this.headBatch(hs.subarray(c0 * dim, Math.min(n, c0 + 4) * dim), Math.min(4, n - c0)));
+    return { lgs, hs };
   }
   _restoreDN(k) {   // recurrent state as it was after verify column k
     const enc = this.device.createCommandEncoder();
@@ -1196,8 +1216,8 @@ export class Qwen35Engine {
   // onReject(k) tells the other devices to roll their recurrent state back
   // to what it was after column k.
   async specStep(tNext, sample, K = 3, { runTrunk = null, onReject = null } = {}) {
-    const pos = this.pos, M2 = this.mtp;
-    K = Math.max(1, Math.min(3, K));
+    const pos = this.pos, M2 = this.mtp, { dim } = this.dims;
+    K = Math.max(1, Math.min(7, K));
     const drafts = [];
     for (let k = 0; k < K; k++) {
       // after the first call this.x holds the MTP block's own output hidden,
@@ -1206,7 +1226,7 @@ export class Qwen35Engine {
       let d = 0; for (let i = 1; i < lg.length; i++) if (lg[i] > lg[d]) d = i;
       drafts.push(d);
     }
-    const lgs = await this.verifyN([tNext, ...drafts], pos, runTrunk);
+    const { lgs, hs } = await this.verifyN([tNext, ...drafts], pos, runTrunk);
     const out = [];
     let a = 0;   // accepted drafts
     for (let k = 0; k <= K; k++) {
@@ -1217,8 +1237,11 @@ export class Qwen35Engine {
     M2.stats.drafts += K; M2.stats.accepted += a;
     if (a < K) { this._restoreDN(a); if (onReject) await onReject(a); }
     // re-fill the draft cache for the accepted positions with exact trunk hiddens
-    for (let j = 1; j <= a; j++) await this.mtpRun(j - 1, out[j - 1], pos + j, false);
-    this._adoptHidden(a);
+    for (let j = 1; j <= a; j++) {
+      this.setHidden(hs.subarray((j - 1) * dim, j * dim));
+      await this.mtpRun(null, out[j - 1], pos + j, false);
+    }
+    this.setHidden(hs.subarray(a * dim, (a + 1) * dim));
     this.pos = pos + a + 1;
     return out;
   }

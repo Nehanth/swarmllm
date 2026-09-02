@@ -1452,7 +1452,13 @@ async function aiGenerate(textArg, who) {
       // one batched trunk pass verifies them (byte-identical to plain decoding)
       const spec = ai.chain.length ? {
         runTrunk: async (tokens, pos) => {
-          const hb = await ai.engine.embedRunBatch(tokens, pos, true);
+          const tLap = performance.now();
+          const n = tokens.length, hdim = ai.engine.dims.dim;
+          const hb = new Float32Array(n * hdim);
+          for (let c = 0; c < n; c += 4) {
+            const m = Math.min(4, n - c);
+            hb.set(await ai.engine.embedRunBatch(tokens.slice(c, c + m), pos + c, { base: c, total: n }), c * hdim);
+          }
           if (badF32(hb)) throw new Error(`NaN after HOST layers (pos ${pos})`);
           const returned = new Promise((res, rej) => {
             ai.waiters.set("b" + pos, res);
@@ -1461,15 +1467,19 @@ async function aiGenerate(textArg, who) {
           sendTo(ai.chain[0], { t: "ai-hidden-b", basePos: pos, n: tokens.length, spec: 1, ...packWire(hb) });
           const h = await returned;
           if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos})`);
+          const dt = performance.now() - tLap;
+          ai.lapMs = ai.lapMs ? 0.7 * ai.lapMs + 0.3 * dt : dt;
           return h;
         },
         onReject: async (k) => { for (const id of ai.chain) sendTo(id, { t: "ai-rollback", k }); },
       } : {};
       if (ai.chain.length && ai.lastHidden) ai.engine.setHidden(ai.lastHidden);
       ai.engine.pos = ai.pos;
+      ai.lapMs = 0;
       let next = aiSample(logits), done = false;
       while (!done && count < 400) {
-        const toks = await ai.engine.specStep(next, aiSample, 3, spec);
+        const K = !ai.chain.length ? 3 : ai.lapMs > 260 ? 7 : ai.lapMs > 130 ? 5 : 3;
+        const toks = await ai.engine.specStep(next, aiSample, K, spec);
         for (const tk of toks) {
           if (tk === imEnd || tk === eot) { done = true; break; }
           emit(tk);
@@ -1478,7 +1488,7 @@ async function aiGenerate(textArg, who) {
       }
       ai.pos = ai.engine.pos;
       const st = ai.engine.mtp.stats;
-      if (st.drafts) crumb(`spec: ${st.accepted}/${st.drafts} drafts accepted`);
+      if (st.drafts) crumb(`spec: ${st.accepted}/${st.drafts} drafts accepted${ai.lapMs ? ` · lap ${Math.round(ai.lapMs)}ms` : ""}`);
     } else {
       for (let i = 0; i < 400; i++) {
         const next = aiSample(logits);
@@ -1562,7 +1572,7 @@ async function aiOnData(from, d) {
       const hb = new Float32Array(nTok * wdim);
       for (let c = 0; c < nTok; c += 4) {
         const m = Math.min(4, nTok - c);
-        hb.set(await ai.engine.runHiddenBatch(xs.subarray(c * wdim, (c + m) * wdim), d.basePos + c, !!d.spec), c * wdim);
+        hb.set(await ai.engine.runHiddenBatch(xs.subarray(c * wdim, (c + m) * wdim), d.basePos + c, d.spec ? { base: c, total: nTok } : false), c * wdim);
       }
       if (badF32(hb)) { aiStatus(`\u26a0 NaN in batched prefill on this device`); sendTo(ai.hostId, { t: "ai-error", message: "NaN in batched prefill" }); }
       const bmsg = { basePos: d.basePos, n: nTok, ...packWire(hb) };
