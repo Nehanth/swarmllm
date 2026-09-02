@@ -1414,23 +1414,24 @@ async function aiGenerate(textArg, who) {
       // split: up to 16 prompt tokens per network round (4 GPU passes of 4)
       let i = 0;
       const hdim = ai.engine.dims.dim;
-      while (ids.length - 1 - i >= 4) {
-        const nChunks = Math.min(4, Math.floor((ids.length - 1 - i) / 4));
+      const NC = ai.engine.NC || 4;   // columns per GPU pass; 16 tokens per network round
+      while (ids.length - 1 - i >= NC) {
+        const nChunks = Math.min(16 / NC, Math.floor((ids.length - 1 - i) / NC));
         const basePos = ai.pos;
-        const hb = new Float32Array(nChunks * 4 * hdim);
+        const hb = new Float32Array(nChunks * NC * hdim);
         for (let c = 0; c < nChunks; c++)
-          hb.set(await ai.engine.embedRunBatch(ids.slice(i + c * 4, i + (c + 1) * 4), basePos + c * 4), c * 4 * hdim);
+          hb.set(await ai.engine.embedRunBatch(ids.slice(i + c * NC, i + (c + 1) * NC), basePos + c * NC), c * NC * hdim);
         if (badF32(hb)) throw new Error(`NaN in batched prefill (pos ${basePos})`);
         if (ai.chain.length) {
           const returned = new Promise((res, rej) => {
             ai.waiters.set("b" + basePos, res);
             setTimeout(() => { ai.waiters.delete("b" + basePos); rej(new Error("pipeline timeout (batch prefill)")); }, 90000);
           });
-          sendTo(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * 4, ...packWire(hb) });
+          sendTo(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * NC, ...packWire(hb) });
           await returned;
         }
-        ai.pos = basePos + nChunks * 4;
-        i += nChunks * 4;
+        ai.pos = basePos + nChunks * NC;
+        i += nChunks * NC;
         aiStatus(`prefill: ${i}/${ids.length} tokens\u2026`);
       }
       for (; i < ids.length; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);
@@ -1453,10 +1454,10 @@ async function aiGenerate(textArg, who) {
       const spec = ai.chain.length ? {
         runTrunk: async (tokens, pos) => {
           const tLap = performance.now();
-          const n = tokens.length, hdim = ai.engine.dims.dim;
+          const n = tokens.length, hdim = ai.engine.dims.dim, NC = ai.engine.NC || 4;
           const hb = new Float32Array(n * hdim);
-          for (let c = 0; c < n; c += 4) {
-            const m = Math.min(4, n - c);
+          for (let c = 0; c < n; c += NC) {
+            const m = Math.min(NC, n - c);
             hb.set(await ai.engine.embedRunBatch(tokens.slice(c, c + m), pos + c, { base: c, total: n }), c * hdim);
           }
           if (badF32(hb)) throw new Error(`NaN after HOST layers (pos ${pos})`);
@@ -1476,10 +1477,29 @@ async function aiGenerate(textArg, who) {
       if (ai.chain.length && ai.lastHidden) ai.engine.setHidden(ai.lastHidden);
       ai.engine.pos = ai.pos;
       ai.lapMs = 0;
+      // draft depth: pick by MEASURED tokens/sec per depth (K=3 warm-up, probe
+      // 5 and 7 once, keep the best, re-probe now and then). Deep chains only
+      // pay when the network round-trip dominates the lap; a lap-time
+      // threshold can't tell GPU time from RTT and gets stuck deep.
+      const kc = { cand: [3, 5, 7], ema: {}, n: {}, step: 0, used: {} };
+      const pickK = () => {
+        if (!ai.chain.length) return 3;
+        kc.step++;
+        if (kc.step <= 3) return 3;
+        const untried = kc.cand.find((k) => !kc.n[k]);
+        if (untried) return untried;
+        let best = 3;
+        for (const k of kc.cand) if (kc.ema[k] > kc.ema[best]) best = k;
+        if (kc.step % 16 === 0) { const alt = kc.cand.filter((k) => k !== best); return alt[(kc.step / 16) % alt.length | 0]; }
+        return best;
+      };
       let next = aiSample(logits), done = false;
       while (!done && count < 400) {
-        const K = !ai.chain.length ? 3 : ai.lapMs > 260 ? 7 : ai.lapMs > 130 ? 5 : 3;
+        const K = pickK(), tStep = performance.now();
         const toks = await ai.engine.specStep(next, aiSample, K, spec);
+        const tps = toks.length / ((performance.now() - tStep) / 1000);
+        kc.ema[K] = kc.n[K] ? 0.6 * kc.ema[K] + 0.4 * tps : tps;
+        kc.n[K] = (kc.n[K] || 0) + 1; kc.used[K] = (kc.used[K] || 0) + toks.length;
         for (const tk of toks) {
           if (tk === imEnd || tk === eot) { done = true; break; }
           emit(tk);
@@ -1488,7 +1508,8 @@ async function aiGenerate(textArg, who) {
       }
       ai.pos = ai.engine.pos;
       const st = ai.engine.mtp.stats;
-      if (st.drafts) crumb(`spec: ${st.accepted}/${st.drafts} drafts accepted${ai.lapMs ? ` · lap ${Math.round(ai.lapMs)}ms` : ""}`);
+      if (st.drafts) crumb(`spec: ${st.accepted}/${st.drafts} drafts accepted${ai.lapMs ? ` · lap ${Math.round(ai.lapMs)}ms` : ""}`
+        + (ai.chain.length ? ` · K tok/s ${kc.cand.map((k) => `${k}:${kc.ema[k] ? kc.ema[k].toFixed(1) : "-"}`).join(" ")} · tokens by K ${JSON.stringify(kc.used)}` : ""));
     } else {
       for (let i = 0; i < 400; i++) {
         const next = aiSample(logits);
@@ -1570,8 +1591,9 @@ async function aiOnData(from, d) {
       const nTok = d.n || 4;
       const wdim = ai.engine.dims.dim;
       const hb = new Float32Array(nTok * wdim);
-      for (let c = 0; c < nTok; c += 4) {
-        const m = Math.min(4, nTok - c);
+      const NC = ai.engine.NC || 4;
+      for (let c = 0; c < nTok; c += NC) {
+        const m = Math.min(NC, nTok - c);
         hb.set(await ai.engine.runHiddenBatch(xs.subarray(c * wdim, (c + m) * wdim), d.basePos + c, d.spec ? { base: c, total: nTok } : false), c * wdim);
       }
       if (badF32(hb)) { aiStatus(`\u26a0 NaN in batched prefill on this device`); sendTo(ai.hostId, { t: "ai-error", message: "NaN in batched prefill" }); }
