@@ -408,7 +408,7 @@ fn add_res(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Scalar accumulators only: a dynamically-indexed local array spills to
 // scratch memory and ran 3x slower. Reduction is a portable shared-memory
 // halving tree (no subgroups: absent from shipping Safari 26).
-export function coopWGSL(WG = 256, ROWS = 4, WGB = 64) {
+export function coopWGSL(WG = 256, ROWS = 4, WGB = 64, COLS = 4, ROWSB = ROWS) {
   const LANES = WG / 4;
   const LANESB = WGB / 4;   // batched kernels: smaller workgroups amortize the reductions                  // 32-elem blocks in flight per iteration
   const accDecl = Array.from({ length: ROWS }, (_, r) => `var acc${r} = 0.0;`).join(" ");
@@ -541,7 +541,7 @@ ${batched ? [0, 1, 2, 3].map(colBody).join("\n") : colBody(0)}
   const guKernelB = (kind) => {
     const P = kind === "f32" ? "guf" : kind === "q8" ? "gu8" : "gu4";
     const shape = `${P}_shape`;
-    const cols = [0, 1, 2, 3], rows = Array.from({ length: ROWS }, (_, r) => r);
+    const cols = Array.from({ length: COLS }, (_, m) => m), rows = Array.from({ length: ROWSB }, (_, r) => r);
     const xLoads = kind === "q4"
       ? cols.map((m) => `let xa${m} = ${P}_x[${m}u * xs4 + b * 8u + qt]; let xb${m} = ${P}_x[${m}u * xs4 + b * 8u + qt + 4u];`).join("\n      ")
       : cols.map((m) => `let xa${m} = ${P}_x[${m}u * xs4 + b * 8u + qt * 2u]; let xb${m} = ${P}_x[${m}u * xs4 + b * 8u + qt * 2u + 1u];`).join("\n      ");
@@ -576,7 +576,7 @@ ${batched ? [0, 1, 2, 3].map(colBody).join("\n") : colBody(0)}
         ${acc("glo", "ghi", "ulo", "uhi", "gs * ", "us * ")}
       }`;
     };
-    const K2 = 2 * ROWS;
+    const K2 = 2 * ROWSB;
     return `
 @compute @workgroup_size(${WGB})
 fn matvec${kind === "f32" ? "" : "_" + kind}_gu_b(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -590,8 +590,8 @@ fn matvec${kind === "f32" ? "" : "_" + kind}_gu_b(@builtin(workgroup_id) wg: vec
   let nb = dIn / 32u;
   let dIn4 = dIn / 4u;
   let rowWords = ${kind === "q4" ? "dIn / 8u" : "dIn / 4u"};
-  let row0 = wg.x * ${ROWS}u;
-  let full = row0 + ${ROWS - 1}u < dOut;
+  let row0 = wg.x * ${ROWSB}u;
+  let full = row0 + ${ROWSB - 1}u < dOut;
   ${rows.map((r) => cols.map((m) => `var ag${r}_${m} = 0.0; var au${r}_${m} = 0.0;`).join(" ")).join("\n  ")}
   for (var b: u32 = bl; b < nb; b += ${LANESB}u) {
       ${xLoads}
@@ -599,7 +599,7 @@ fn matvec${kind === "f32" ? "" : "_" + kind}_gu_b(@builtin(workgroup_id) wg: vec
       ${rows.map(rowBlock).join("\n      ")}
   }
 ${cols.map((m) => `
-  ${rows.map((r) => `gub_part[${r * WGB}u + t] = ag${r}_${m}; gub_part[${(ROWS + r) * WGB}u + t] = au${r}_${m};`).join(" ")}
+  ${rows.map((r) => `gub_part[${r * WGB}u + t] = ag${r}_${m}; gub_part[${(ROWSB + r) * WGB}u + t] = au${r}_${m};`).join(" ")}
   workgroupBarrier();
   {
     var stride: u32 = ${WGB / 2}u;
@@ -609,11 +609,11 @@ ${cols.map((m) => `
       stride = stride >> 1u;
     }
   }
-  if (t < ${ROWS}u) {
+  if (t < ${ROWSB}u) {
     let row = row0 + t;
     if (row < dOut) {
       let g = gub_part[t * ${WGB}u];
-      ${P}_y[${m}u * ys + row] = (g / (1.0 + exp(-g))) * gub_part[(${ROWS}u + t) * ${WGB}u];
+      ${P}_y[${m}u * ys + row] = (g / (1.0 + exp(-g))) * gub_part[(${ROWSB}u + t) * ${WGB}u];
     }
   }
   workgroupBarrier();`).join("\n")}
@@ -621,7 +621,7 @@ ${cols.map((m) => `
   };
   const guAll = `
 var<workgroup> gu_res: array<f32, ${ROWS}>;
-var<workgroup> gub_part: array<f32, ${2 * ROWS * WGB}>;
+var<workgroup> gub_part: array<f32, ${2 * ROWSB * WGB}>;
 ` + ["f32", "q8", "q4"].map((k) => guKernel(k, false)).join("\n")
     + ["f32", "q8", "q4"].map((k) => guKernelB(k)).join("\n");
   return /* wgsl */ `
@@ -745,19 +745,19 @@ ${reduce}
   }
 }
 
-// ---- batched (4-column) variants for prefill / verify: each weight word is
-// loaded and decoded once and applied to 4 token columns. x is [4][xs4] vec4s,
+// ---- batched (COLS-column) variants for prefill / verify: each weight word is
+// loaded and decoded once and applied to COLS token columns (ROWSB rows per WG). x is [4][xs4] vec4s,
 // y is [4][ys] f32s (strides in BShape; slices are 256-byte aligned by the
 // engine). Workgroup ${WGB}: more loop work per thread, cheaper reductions.
 struct BShape { dOut: u32, dIn: u32, xs4: u32, ys: u32 };
 @group(1) @binding(3) var<uniform> mvb_shape: BShape;
 @group(1) @binding(4) var<uniform> qb_shape: BShape;
-var<workgroup> mvb_part: array<f32, ${2 * ROWS * WGB}>;
+var<workgroup> mvb_part: array<f32, ${2 * ROWSB * WGB}>;
 ${["", "_q8", "_q4"].map((kind) => {
   const shp = kind === "" ? "mvb_shape" : "qb_shape";
   const xbuf = kind === "" ? "mv_x4" : kind === "_q8" ? "q8_x4" : "q4_x4";
   const ybuf = kind === "" ? "mv_y" : kind === "_q8" ? "q8_y" : "q4_y";
-  const cols = [0, 1, 2, 3], rows = Array.from({ length: ROWS }, (_, r) => r);
+  const cols = Array.from({ length: COLS }, (_, m) => m), rows = Array.from({ length: ROWSB }, (_, r) => r);
   const xLoads = kind === "_q4"
     ? cols.map((m) => `let xa${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt]; let xb${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt + 4u];`).join("\n    ")
     : cols.map((m) => `let xa${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt * 2u]; let xb${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt * 2u + 1u];`).join("\n    ");
@@ -793,28 +793,28 @@ fn matvec${kind}_coop_b(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_inv
   let ys = ${shp}.ys;
   let nb = dIn / 32u;
   let rowWords = ${kind === "_q4" ? "dIn / 8u" : "dIn / 4u"};
-  let row0 = wg.x * ${ROWS}u;
-  let full = row0 + ${ROWS - 1}u < dOut;
+  let row0 = wg.x * ${ROWSB}u;
+  let full = row0 + ${ROWSB - 1}u < dOut;
   ${rows.map((r) => cols.map((m) => `var a${r}_${m} = 0.0;`).join(" ")).join("\n  ")}
   for (var b: u32 = bl; b < nb; b += ${LANESB}u) {
     ${xLoads}
     ${idx}
     ${rows.map(rowBlock).join("\n    ")}
   }
-${[0, 1].map((h) => `
-  ${rows.map((r) => `mvb_part[${r * WGB}u + t] = a${r}_${2 * h}; mvb_part[${(ROWS + r) * WGB}u + t] = a${r}_${2 * h + 1};`).join(" ")}
+${Array.from({ length: COLS / 2 }, (_, h) => h).map((h) => `
+  ${rows.map((r) => `mvb_part[${r * WGB}u + t] = a${r}_${2 * h}; mvb_part[${(ROWSB + r) * WGB}u + t] = a${r}_${2 * h + 1};`).join(" ")}
   workgroupBarrier();
   {
     var stride: u32 = ${WGB / 2}u;
     while (stride > 0u) {
-      if (t < stride) { ${Array.from({ length: 2 * ROWS }, (_, k) => `mvb_part[${k * WGB}u + t] += mvb_part[${k * WGB}u + t + stride];`).join(" ")} }
+      if (t < stride) { ${Array.from({ length: 2 * ROWSB }, (_, k) => `mvb_part[${k * WGB}u + t] += mvb_part[${k * WGB}u + t + stride];`).join(" ")} }
       workgroupBarrier();
       stride = stride >> 1u;
     }
   }
-  if (t < ${2 * ROWS}u) {
-    let r = t % ${ROWS}u;
-    let m = ${2 * h}u + t / ${ROWS}u;
+  if (t < ${2 * ROWSB}u) {
+    let r = t % ${ROWSB}u;
+    let m = ${2 * h}u + t / ${ROWSB}u;
     let row = row0 + r;
     if (row < dOut) { ${ybuf}[m * ys + row] = mvb_part[t * ${WGB}u]; }
   }

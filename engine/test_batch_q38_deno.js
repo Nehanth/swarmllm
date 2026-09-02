@@ -16,7 +16,8 @@ const tok = makeTokenizer(tokenizerFromGGUF(G.meta));
 const L = 6;
 const mk = async () => {
   const weights = await qwen35Weights(G, (i) => readAt(i.byteOffset, i.byteLength), { lo: 0, hi: L, hasEmbed: true, hasHead: true });
-  return Qwen35Engine.create({ device, meta: G.meta, weights, layerRange: [0, L], hasEmbed: true, hasHead: true, maxSeq: 64 });
+  return Qwen35Engine.create({ device, meta: G.meta, weights, layerRange: [0, L], hasEmbed: true, hasHead: true, maxSeq: 64,
+  batchCols: +(Deno.env.get("BCOLS") || 4), coopRowsB: +(Deno.env.get("ROWSB") || 4) });
 };
 const ids = tok.encode("The capital of France is Paris, and the capital of Germany is Berlin. The quick brown");
 console.log("prompt tokens:", ids.length);

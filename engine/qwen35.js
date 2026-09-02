@@ -467,10 +467,11 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4 }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows }) {
     this.device = device;
     this.mvVariant = matvecVariant;
     this.coopWG = coopWG; this.coopRows = coopRows;
+    this.NC = batchCols; this.coopRowsB = coopRowsB;   // batched (prefill/verify) column count, rows per WG
     const M = meta;
     const dim = M["qwen35.embedding_length"];
     const nH = M["qwen35.attention.head_count"];
@@ -497,7 +498,7 @@ export class Qwen35Engine {
     this.pos = 0;
 
     // ---- pipelines with explicit layouts ----
-    const mod = device.createShaderModule({ code: WGSL + coopWGSL(coopWG, coopRows) + WGSL2 });
+    const mod = device.createShaderModule({ code: WGSL + coopWGSL(coopWG, coopRows, 64, batchCols, coopRowsB) + WGSL2 });
     const C = GPUShaderStage.COMPUTE;
     const layout0 = device.createBindGroupLayout({
       entries: [
@@ -619,7 +620,7 @@ export class Qwen35Engine {
       const pipe = xB ? base + "_b" : base;
       const shp = xB ? this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4) : this._shapeB(dOut, dIn, 0, 0);
       const bufs = wg2.kind === "f32" ? [wg2.buf, wu2.buf, x, y, shp] : [wg2.qs, wg2.sc, wu2.qs, wu2.sc, x, y, shp];
-      return { pipe, wgs: Math.ceil(dOut / this.coopRows), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      return { pipe, wgs: Math.ceil(dOut / (xB ? this.coopRowsB : this.coopRows)), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
     this._guOp = guOp;
     const bgNorm = (x, w, y) => this._bg(this.pipes.rmsnorm, 1, [x, w.buf, y, this.uDim]);
@@ -914,8 +915,9 @@ export class Qwen35Engine {
     const D = this.dims;
     const dev = this.device;
     const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+    const NC = this.NC, cix = Array.from({ length: NC }, (_, c) => c);
     const al = (n) => Math.ceil(n * 4 / 256) * 256;
-    const mkB = (n) => ({ buf: dev.createBuffer({ size: 4 * al(n), usage: S }), stride: al(n), n });
+    const mkB = (n) => ({ buf: dev.createBuffer({ size: NC * al(n), usage: S }), stride: al(n), n });
     const B = this.B = {
       x: mkB(D.dim), xn: mkB(D.dim), tmpDim: mkB(D.dim), g: mkB(D.inter), u: mkB(D.inter),
       qkv: mkB(D.convDim), convOut: mkB(D.convDim), z: mkB(D.dInner),
@@ -924,22 +926,22 @@ export class Qwen35Engine {
       qFull: mkB(D.nH * D.hd * 2), q: mkB(D.qDim), gAttn: mkB(D.qDim),
       k: mkB(D.kvDim), v: mkB(D.kvDim), attnOut: mkB(D.qDim),
     };
-    this.stageXB = dev.createBuffer({ size: 4 * D.dim * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    this.stageXB = dev.createBuffer({ size: NC * D.dim * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     // rollback shadows for the recurrent layers (speculative decoding)
     for (const L of this.layers) if (!L.isFull && !L.S_shadow) {
       L.S_shadow = dev.createBuffer({ size: 7 * L.S.size, usage: S });
       L.conv_shadow = dev.createBuffer({ size: 7 * L.convState.size, usage: S });
     }
-    this.stageLogitsN = dev.createBuffer({ size: 4 * D.vocab * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    this.stageLogitsN = dev.createBuffer({ size: NC * D.vocab * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const slice = (b, c) => ({ buffer: b.buf, offset: c * b.stride, size: b.n * 4 });
     const part = (b, c, off, size) => ({ buffer: b.buf, offset: c * b.stride + off, size });
-    this.frameBufsB = [0, 1, 2, 3].map(() => dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
+    this.frameBufsB = cix.map(() => dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
     const colPipes = ["rmsnorm", "head_norm", "attn_scores", "attn_softmax", "attn_out",
       "silu_mul", "add_res", "rope_part", "qsplit", "sigmoid_mul",
       "dn_gates", "dn_conv", "dn_l2", "dn_delta", "dn_gatenorm",
       "rmsnorm_mc", "add_res_mc", "dn_gates_mc", "dn_conv_mc", "dn_l2_mc", "dn_delta_mc", "dn_gatenorm_mc",
       "qsplit_mc", "head_norm_mc", "rope_part_mc", "sigmoid_mul_mc"];
-    this.bgCommonB = [0, 1, 2, 3].map((c) => {
+    this.bgCommonB = cix.map((c) => {
       const m = {};
       for (const name of colPipes)
         m[name] = this._bg2g0(this.pipes[name], [{ buffer: this.cfgBuf }, { buffer: this.frameBufsB[c] }]);
@@ -950,14 +952,14 @@ export class Qwen35Engine {
       const pipe = base + "_coop_b";
       const shp = this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4);
       const bufs = w.kind === "f32" ? [w.buf, xB.buf, yB.buf, shp] : [w.qs, w.sc, xB.buf, yB.buf, shp];
-      return { pipe, wgs: Math.ceil(dOut / this.coopRows), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      return { pipe, wgs: Math.ceil(dOut / this.coopRowsB), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
     if (this.hasHead) {
       B.logits = mkB(D.vocab);
       this.headB = mvB(this.headEntry, B.xn, B.logits, D.vocab, D.dim);
-      this.bgFinalNormB = [0, 1, 2, 3].map((c) => this._bg2res(this.pipes.rmsnorm,
+      this.bgFinalNormB = cix.map((c) => this._bg2res(this.pipes.rmsnorm,
         [slice(B.x, c), { buffer: this.finalNorm.buf }, { buffer: this.xn }, { buffer: this.uDim }]));
-      if (this.mtp) this.mtp.bgHNormB = [0, 1, 2, 3].map((c) => this._bg2res(this.pipes.rmsnorm,
+      if (this.mtp) this.mtp.bgHNormB = cix.map((c) => this._bg2res(this.pipes.rmsnorm,
         [slice(B.x, c), { buffer: this.mtp.hnorm.buf }, { buffer: this.mtp.ehIn, offset: D.dim * 4, size: D.dim * 4 }, { buffer: this.uDim }]));
     }
     this._mcU = this._mcU || {};
@@ -1002,7 +1004,7 @@ export class Qwen35Engine {
         gateUp: [mvB(L.ffnGate, B.xn, B.g, D.inter, D.dim), mvB(L.ffnUp, B.xn, B.u, D.inter, D.dim)],
         gu: this._guOp(L.ffnGate, L.ffnUp, B.xn.buf, B.g.buf, D.inter, D.dim, B.xn, B.g),
         down: mvB(L.ffnDown, B.g, B.tmpDim, D.dim, D.inter),
-        cols: [0, 1, 2, 3].map((c) => ({
+        cols: cix.map((c) => ({
           norm1: bgNormC(L.attnNorm, c),
           norm2: bgNormC(L.postNorm, c),
           addTmp: this._bg2res(this.pipes.add_res, [slice(B.x, c), slice(B.tmpDim, c)]),
@@ -1013,7 +1015,7 @@ export class Qwen35Engine {
         R.qkvOps = [mvB(L.wq, B.xn, B.qFull, D.nH * D.hd * 2, D.dim),
           mvB(L.wk, B.xn, B.k, D.kvDim, D.dim), mvB(L.wv, B.xn, B.v, D.kvDim, D.dim)];
         R.o = mvB(L.wo, B.attnOut, B.tmpDim, D.dim, D.qDim);
-        for (let c = 0; c < 4; c++) Object.assign(R.cols[c], {
+        for (let c = 0; c < NC; c++) Object.assign(R.cols[c], {
           qsplit: this._bg2res(this.pipes.qsplit, [slice(B.qFull, c), slice(B.q, c), slice(B.gAttn, c), { buffer: this.dnBuf }]),
           qNorm: this._bg2res(this.pipes.head_norm, [slice(B.q, c), { buffer: L.qNorm.buf }, { buffer: this.uNH }]),
           kNorm: this._bg2res(this.pipes.head_norm, [slice(B.k, c), { buffer: L.kNorm.buf }, { buffer: this.uNKV }]),
@@ -1028,7 +1030,7 @@ export class Qwen35Engine {
         R.dnOps = [mvB(L.wqkv, B.xn, B.qkv, D.convDim, D.dim), mvB(L.wz, B.xn, B.z, D.dInner, D.dim),
           mvB(L.wBeta, B.xn, B.betaRaw, D.nVH, D.dim), mvB(L.wAlpha, B.xn, B.alpha, D.nVH, D.dim)];
         R.out = mvB(L.wOut, B.gated, B.tmpDim, D.dim, D.dInner);
-        for (let c = 0; c < 4; c++) Object.assign(R.cols[c], {
+        for (let c = 0; c < NC; c++) Object.assign(R.cols[c], {
           gates: this._bg2res(this.pipes.dn_gates, [slice(B.alpha, c), slice(B.betaRaw, c),
             { buffer: L.dtBias }, { buffer: L.ssmA }, slice(B.beta, c), slice(B.decay, c), { buffer: this.dnBuf }]),
           conv: this._bg2res(this.pipes.dn_conv, [slice(B.qkv, c), { buffer: L.convW },
@@ -1054,7 +1056,7 @@ export class Qwen35Engine {
   // dispatch over the live columns. snapshotDN (set through frame.snap) makes
   // the recurrent kernels save their state after each non-final column so a
   // rejected speculative suffix can be rolled back.
-  _encodeLayerBatch(enc, i, basePos, nCols = 4, snapshotDN = false) {
+  _encodeLayerBatch(enc, i, basePos, nCols = this.NC, snapshotDN = false) {
     const D = this.dims, L = this.layers[i], LB = this.layerB[i], B = this.B, M = LB.mc;
     if (L.isFull) {
       {
@@ -1112,7 +1114,7 @@ export class Qwen35Engine {
     }
   }
 
-  async _runBatchAndRead(basePos, n = 4) {
+  async _runBatchAndRead(basePos, n = this.NC) {
     const { dim } = this.dims;
     const enc = this.device.createCommandEncoder();
     for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos, n);
@@ -1157,7 +1159,7 @@ export class Qwen35Engine {
   // final norm + LM head for n hidden states (n*dim floats, or null to use the
   // columns already in B.x) -> array of n logits vectors. Leaves the hiddens
   // in B.x so the draft head can read them by column.
-  async headBatch(hs, n = hs ? hs.length / this.dims.dim : 4) {
+  async headBatch(hs, n = hs ? hs.length / this.dims.dim : this.NC) {
     if (!this.B) this._initBatch();
     const { dim, vocab } = this.dims;
     if (hs) for (let c = 0; c < n; c++) this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, hs.subarray(c * dim, (c + 1) * dim));
@@ -1221,17 +1223,17 @@ export class Qwen35Engine {
     const n = tokens.length, { dim } = this.dims;
     let hs;
     if (runTrunk) hs = await runTrunk(tokens, pos);
-    else if (n <= 4) hs = await this.embedRunBatch(tokens, pos, true);
+    else if (n <= this.NC) hs = await this.embedRunBatch(tokens, pos, true);
     else {
       hs = new Float32Array(n * dim);
-      for (let c0 = 0; c0 < n; c0 += 4) {
-        const m = Math.min(4, n - c0);
+      for (let c0 = 0; c0 < n; c0 += this.NC) {
+        const m = Math.min(this.NC, n - c0);
         hs.set(await this.embedRunBatch(tokens.slice(c0, c0 + m), pos + c0, { base: c0, total: n }), c0 * dim);
       }
     }
     const lgs = [];
-    for (let c0 = 0; c0 < n; c0 += 4)
-      lgs.push(...await this.headBatch(hs.subarray(c0 * dim, Math.min(n, c0 + 4) * dim), Math.min(4, n - c0)));
+    for (let c0 = 0; c0 < n; c0 += this.NC)
+      lgs.push(...await this.headBatch(hs.subarray(c0 * dim, Math.min(n, c0 + this.NC) * dim), Math.min(this.NC, n - c0)));
     return { lgs, hs };
   }
   _restoreDN(k) {   // recurrent state as it was after verify column k
@@ -1286,20 +1288,21 @@ export class Qwen35Engine {
   async prefillTokens(ids) {
     if (!this.B) this._initBatch();
     let i = 0, sinceSync = 0;
-    while (ids.length - i >= 4) {
+    const NC = this.NC;
+    while (ids.length - i >= NC) {
       const basePos = this.pos;
-      for (let c = 0; c < 4; c++) {
-        this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, 4, 0]));
+      for (let c = 0; c < NC; c++) {
+        this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, NC, 0]));
         this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(ids[i + c]));
       }
       const enc = this.device.createCommandEncoder();
-      for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos);
-      enc.copyBufferToBuffer(this.B.x.buf, 3 * this.B.x.stride, this.x, 0, this.dims.dim * 4);
+      for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos, NC);
+      enc.copyBufferToBuffer(this.B.x.buf, (NC - 1) * this.B.x.stride, this.x, 0, this.dims.dim * 4);
       this.device.queue.submit([enc.finish()]);
       if (this.mtp && this.mtpFill !== false)
-        for (let c = 0; c < 4; c++) if (i + c + 1 < ids.length) await this.mtpRun(c, ids[i + c + 1], basePos + c + 1, false);
-      this.pos += 4;
-      i += 4;
+        for (let c = 0; c < NC; c++) if (i + c + 1 < ids.length) await this.mtpRun(c, ids[i + c + 1], basePos + c + 1, false);
+      this.pos += NC;
+      i += NC;
       if (++sinceSync >= 4) { await this.device.queue.onSubmittedWorkDone(); sinceSync = 0; }
     }
     for (; i < ids.length; i++) {

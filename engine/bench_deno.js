@@ -41,7 +41,8 @@ if (MODEL === "q38") {
   const weights = await qwen35Weights(G, (i) => readAt(i.byteOffset, i.byteLength),
     { lo: 0, hi: L, hasEmbed: true, hasHead: true });
   eng = await Qwen35Engine.create({ device, meta: G.meta, weights, layerRange: [0, L],
-    hasEmbed: true, hasHead: true, maxSeq: 512, matvecVariant: VARIANT, coopWG: WG, coopRows: ROWS });
+    hasEmbed: true, hasHead: true, maxSeq: 512, matvecVariant: VARIANT, coopWG: WG, coopRows: ROWS,
+    batchCols: +(Deno.env.get("BCOLS") || 4), coopRowsB: +(Deno.env.get("ROWSB") || ROWS) });
 } else {
   const readAt = await openFile(Deno.env.get("GGUF") || "qwen/model.gguf");
   const G = parseGGUFHeader((await readAt(0, 64 << 20)).buffer, { skipTokenizer: true });
