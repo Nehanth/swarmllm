@@ -9,7 +9,7 @@ A SwarmLLM room is a set of browsers that split one model's layers and pass the 
 **What the design gives you**
 
 - **No counterparty.** There is no account, no API key, and no server that sees your conversation. The signaling broker only introduces browsers to each other and carries no model traffic.
-- **Text stays on the host.** The device that asks the question holds the tokenizer, the embedding table, the LM head, and the sampler. Other devices never receive your prompt text, the model's word scores, or the chosen tokens.
+- **The room is a shared conversation.** Everyone in a room sees the questions asked and the answers streamed, on their own screen; that is the product, not a leak. The host alone holds the tokenizer, embedding table, LM head and sampler, so the devices running layers receive activations and never make sampling decisions. Nothing leaves the room.
 - **Weights never move between peers.** Each device fetches only its own layer range from the public model repository.
 - **Transport encryption.** WebRTC data channels are encrypted with DTLS between the two browsers on each hop.
 
@@ -18,7 +18,7 @@ A SwarmLLM room is a set of browsers that split one model's layers and pass the 
 - **Activations are not encryption.** The hidden state that crosses each hop is a lossy transformation of your text. Published attacks reconstruct a large fraction of tokens from mid-model activations (see e.g. [arXiv 2503.09022](https://arxiv.org/abs/2503.09022)). **Assume anyone in your room can read your prompts.** The trust model is "people you would share a document link with", not "strangers".
 - **No verification of remote compute.** A peer could return wrong or manipulated activations. Nothing in the current design detects this. Spot-check auditing is on the roadmap and will be documented here when it ships.
 - **Noise or permutation "privacy" tricks are not used, deliberately.** They are known to be breakable and would give a false sense of safety.
-- **Peers learn metadata:** that a generation happened, its length, and timing.
+- **Peers learn metadata** beyond the shared transcript: device names, memory pledges, layer assignments, and timing, via the room roster.
 
 Consequently SwarmLLM does not, and will not, run open swarms of strangers by default, and does not claim to be "private", "encrypted end-to-end", or "verified".
 

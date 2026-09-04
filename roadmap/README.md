@@ -15,6 +15,20 @@ One file per item. Each has a status, the reason it matters, a design sketch, an
 | 09 | [Overlapping laps across the network (PipeInfer-style)](09-lap-overlap.md) | later | research |
 | 10 | [Expert-split mixture-of-experts across a room](10-moe-expert-split.md) | later | research |
 | 11 | [Native peer for headless GPUs](11-native-peer.md) | later | planned |
+| 12 | [Stop, fail fast, re-deal: the room survives launch day](12-room-survives-launch-day.md) | now | planned |
+| 13 | [Multi-turn conversation and an honest context limit](13-multi-turn-context.md) | now | planned |
+| 14 | [Pre-flight check, join links, and a model ladder that says what this room can run](14-preflight-and-join-links.md) | now | planned |
+| 15 | [Self-hosted signaling, vendored PeerJS, and a status canary](15-self-hosted-signaling-and-status.md) | now | planned |
+| 16 | [Fail loudly and legibly: actionable errors, a diagnostic report, build and protocol version](16-actionable-errors-and-versioning.md) | now | planned |
+| 17 | [Security sweep before Show HN: host-authoritative protocol, honest SECURITY.md, hardened page](17-security-sweep.md) | now | planned |
+| 18 | [Download path: Hugging Face backoff and mirrors, parallel range streams, phone cache](18-download-path.md) | now | planned |
+| 19 | [Pinned model revisions, weight integrity, and cache management](19-pinned-revisions-and-cache.md) | now | planned |
+| 20 | [Public demo room: ask-only guests, question queue, quotas](20-public-demo-room.md) | now | planned |
+| 21 | [Reproducible benchmarks and the paper's evidence: protocol, `/bench` page, device matrix, per-hop telemetry](21-reproducible-benchmarks.md) | next | planned |
+| 22 | [Extract the runtime: `engine/generate.js`, `room/pipeline.js`, request/stream contract, headless multi-peer driver](22-extract-the-runtime.md) | next | planned |
+| 23 | [Contributor on-ramp: labels, seeded issues, no-GPU track, hardware-verifier role](23-contributor-on-ramp.md) | now | planned |
+
+Items 12–23 came from the [roadmap gap review](../docs/roadmap-review.md); 12, 13 and 17 contain launch-week bug fixes and go first.
 
 **Explicitly not on the roadmap** (see [GOVERNANCE.md](../GOVERNANCE.md)): accounts, tokens or ads, open swarms of strangers by default, distributed training, noise/permutation "privacy" features, frontier-scale natives that cannot fit a room. Native and headless peers *are* on it (11); the browser path just never stops being enough on its own.
 

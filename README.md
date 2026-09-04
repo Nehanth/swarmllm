@@ -23,7 +23,7 @@ SwarmLLM runs large language models across the devices in a room, in their brows
 - **Native-competitive decode.** A from-scratch WebGPU engine (~50 WGSL kernels) at the memory roofline: 9.0 tok/s plain and 16 tok/s with speculative decoding on a GB10, where native llama.cpp measures 8.0 on the same file and GPU. ([bench log](docs/bench-log.md))
 - **Bit-exact by construction.** Every optimization is gated on golden tests; the speculative path produces the same stream as plain decoding.
 - **Cross-network.** Rooms span networks via WebRTC; prefill sends 16 tokens per round trip and decode chains speculative drafts so a slow link still moves several tokens per lap.
-- **Text stays on the host.** Peers see only mid-model activations (which are *not* private against a determined peer, see [SECURITY.md](SECURITY.md)).
+- **Nothing leaves the room.** A room is a shared conversation: everyone in it sees the questions and answers, by design. No server ever sees them, and the devices running layers work on mid-model activations, which are *not* private against a determined peer either (see [SECURITY.md](SECURITY.md)).
 
 ## Quick start
 
