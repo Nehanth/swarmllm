@@ -16,7 +16,7 @@ One file per item. Each has a status, the reason it matters, a design sketch, an
 | 10 | [Expert-split mixture-of-experts across a room](10-moe-expert-split.md) | later | research |
 | 11 | [Native peer for headless GPUs](11-native-peer.md) | later | planned |
 
-**Explicitly not on the roadmap** (see [GOVERNANCE.md](../GOVERNANCE.md)): accounts, tokens or ads, open swarms of strangers by default, distributed training, noise/permutation "privacy" features, frontier-scale natives that cannot fit a room.
+**Explicitly not on the roadmap** (see [GOVERNANCE.md](../GOVERNANCE.md)): accounts, tokens or ads, open swarms of strangers by default, distributed training, noise/permutation "privacy" features, frontier-scale natives that cannot fit a room. Native and headless peers *are* on it (11); the browser path just never stops being enough on its own.
 
 ## Status meanings
 - **research**: needs a design note before code; open an issue with the *Research / design proposal* template.

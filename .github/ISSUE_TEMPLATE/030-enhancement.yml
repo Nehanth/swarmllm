@@ -14,4 +14,4 @@ body:
     attributes:
       label: Scope check
       options:
-        - label: This keeps the project's non-negotiables (zero install, no accounts/tokens/ads, honest claims, bit-exact output by default) — see GOVERNANCE.md
+        - label: This keeps the project's non-negotiables (a browser link always works with nothing installed, no accounts/tokens/ads, honest claims, bit-exact output by default) — see GOVERNANCE.md

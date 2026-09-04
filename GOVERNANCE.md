@@ -23,7 +23,7 @@ SwarmLLM is a small open-source project with a single maintainer. This document 
 
 These are the project's design commitments. Proposals that conflict with them will be declined regardless of implementation quality:
 
-1. **Zero install.** A room link is the whole installer. Native clients may exist for headless hardware, but the browser path stays first-class.
+1. **Easy to join.** Opening a room link in a browser must always work with nothing installed, and it stays first-class. Native and headless peers (servers, Jetsons, gaming PCs, the CLI) are equally welcome; they extend the room, they never become a requirement for it.
 2. **No accounts, no tokens, no ads.** SwarmLLM has no counterparty and will not add one.
 3. **Honest claims.** Speed numbers come with the commit and hardware that produced them ([docs/bench-log.md](docs/bench-log.md)); privacy claims match [SECURITY.md](SECURITY.md).
 4. **Output correctness is bit-exact by default.** Optimizations must reproduce the reference output; approximations need an explicit, documented switch.
