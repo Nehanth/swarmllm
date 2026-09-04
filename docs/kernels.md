@@ -30,9 +30,9 @@ A generated token on the 27B = ~111 ms on the GB10: **82 ms streaming 15 GB of w
 8. **Device autotune (~1 s at load).** Times `(WG, ROWS)` candidates on the actual GPU and keeps the winner with a 3% noise guard. The GB10 prefers (64, 4).
 
 ### Fewer passes, fewer bytes moved
-9. **One command submit per token.** All ~1,100 dispatches of a token are encoded into a single command buffer.
+9. **One command submit per token.** All ~900 dispatches of a decode token (1,232 for an 8-column verify pass) are encoded into a single command buffer.
 10. **Fused gate/up + SiLU.** Both FFN projections read the same input, so one kernel computes both and applies `silu(g)·u` before writing. Per-buffer helper functions are generated instead of storage-pointer parameters, which are unsafe on Safari. Neutral on the GB10 (bandwidth-bound), aimed at Metal's dispatch cost.
-11. **Accumulate-into-residual matvecs (`_acc`).** `y[row] += W·x` folds the residual add into the o-proj, DeltaNet out-proj and FFN down-proj: 192 fewer dispatches per token. Measured neutral on Vulkan, which taught us small dispatches are nearly free there.
+11. **Accumulate-into-residual matvecs (`_acc`).** `y[row] += W·x` folds the residual add into the o-proj, DeltaNet out-proj and FFN down-proj: 128 fewer dispatches per token (two `add_res` sites per layer). Measured neutral on Vulkan, which taught us small dispatches are nearly free there.
 12. **Fused DeltaNet pre-pass (`dn_pre`).** Gates (sigmoid β, decay) and the per-head L2 norms of q and k run in one dispatch after the causal conv.
 13. **GPU argmax.** A single-workgroup reduction over the 248,320 logits with lowest-index tie-breaking (matches the CPU loop exactly) so the draft chain reads back 8 bytes instead of 1 MB per draft.
 

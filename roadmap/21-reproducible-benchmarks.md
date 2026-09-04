@@ -14,3 +14,7 @@ See the merged proposals in [docs/roadmap-review.md](../docs/roadmap-review.md) 
 ## Done when
 
 - Acceptance criteria to be written with the design note.
+
+## Update (Sep 2026 research round)
+
+Per-hop telemetry in the return frame is specified in [docs/research/network-scheduler.md](../docs/research/network-scheduler.md) SS2 and is a prerequisite for roadmap 09, 25 and 27.

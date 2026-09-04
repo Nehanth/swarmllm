@@ -27,8 +27,12 @@ One file per item. Each has a status, the reason it matters, a design sketch, an
 | 21 | [Reproducible benchmarks and the paper's evidence: protocol, `/bench` page, device matrix, per-hop telemetry](21-reproducible-benchmarks.md) | next | planned · [#21](https://github.com/Nehanth/swarmllm/issues/21) |
 | 22 | [Extract the runtime: `engine/generate.js`, `room/pipeline.js`, request/stream contract, headless multi-peer driver](22-extract-the-runtime.md) | next | planned · [#22](https://github.com/Nehanth/swarmllm/issues/22) |
 | 23 | [Contributor on-ramp: labels, seeded issues, no-GPU track, hardware-verifier role](23-contributor-on-ramp.md) | now | planned · [#23](https://github.com/Nehanth/swarmllm/issues/23) |
+| 24 | [Close the Mac gap](24-close-the-mac-gap.md) | now | planned · [#24](https://github.com/Nehanth/swarmllm/issues/24) |
+| 25 | [Cross-network quick wins: draft cache, frame chunking, prefill acks, per-hop telemetry](25-cross-network-quick-wins.md) | now | planned · [#25](https://github.com/Nehanth/swarmllm/issues/25) |
+| 26 | [Host-side overhead: encode-ahead, one-submit speculation, GPU sampling, fused glue](26-host-side-overhead.md) | next | planned · [#26](https://github.com/Nehanth/swarmllm/issues/26) |
+| 27 | [Placement, chain order and host election](27-placement-and-chain-order.md) | next | planned · [#27](https://github.com/Nehanth/swarmllm/issues/27) |
 
-Items 12–23 came from the [roadmap gap review](../docs/roadmap-review.md); 12, 13 and 17 contain launch-week bug fixes and go first.
+Items 12–23 came from the [roadmap gap review](../docs/roadmap-review.md); 12, 13 and 17 contain launch-week bug fixes and go first. Items 24–27 came from the [performance research round](../docs/research/), whose four designs live in `docs/research/`.
 
 **Explicitly not on the roadmap** (see [GOVERNANCE.md](../GOVERNANCE.md)): accounts, tokens or ads, open swarms of strangers by default, distributed training, noise/permutation "privacy" features, frontier-scale natives that cannot fit a room. Native and headless peers *are* on it (11); the browser path just never stops being enough on its own.
 

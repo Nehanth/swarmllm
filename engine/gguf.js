@@ -13,11 +13,12 @@ export const GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8;
 export const QK8_0 = 32;                 // elems per Q8_0 block
 export const Q8_0_BLOCK_BYTES = 34;      // f16 scale + 32 int8
 
+const _f16buf = new Float32Array(1), _f16u32 = new Uint32Array(_f16buf.buffer);
 export function f32ToF16(v) {
-  // IEEE f32 -> f16 bits (round-to-nearest via the standard bit trick)
-  const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
-  f32[0] = v;
-  const x = u32[0];
+  // IEEE f32 -> f16 bits, round-to-nearest-even. The scratch views are hoisted:
+  // this is called once per element of every wire frame and every quantized block.
+  _f16buf[0] = v;
+  const x = _f16u32[0];
   const sign = (x >>> 16) & 0x8000;
   let e = (x >>> 23) & 0xff, m = x & 0x7fffff;
   if (e === 0xff) return sign | 0x7c00 | (m ? 0x200 : 0);
@@ -28,7 +29,10 @@ export function f32ToF16(v) {
     m = (m | 0x800000) >> (1 - e);
     return sign | ((m + 0x1000) >> 13);
   }
-  return sign | (e << 10) | ((m + 0x1000) >> 13);
+  // '+' not '|': a mantissa that rounds up to 0x400 must CARRY into the
+  // exponent. With '|' the carry was dropped whenever the exponent's low bit
+  // was already set, silently halving ~0.03% of all values (e.g. -1.99999 -> -1).
+  return sign | ((e << 10) + ((m + 0x1000) >> 13));
 }
 
 export function f16ToF32(h) {

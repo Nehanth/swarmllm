@@ -13,3 +13,7 @@ Prompt processing is the biggest remaining gap to native: 27 tok/s vs 377 for ll
 
 ## Done when
 - Prefill ≥ 100 tok/s on the GB10 and a visible improvement on the Mac, bit-exact goldens intact, rows in `docs/bench-log.md`.
+
+## Update (Sep 2026 research round)
+
+A complete kernel design with code now exists in [docs/research/prefill-gemm-v2.md](../docs/research/prefill-gemm-v2.md): the prototype was missing double-buffered shared memory, a wider register tile and 16 columns, and the design projects a 2.5x matvec improvement (pass 37 to ~76 tok/s). Batching the prefill tail is a hard prerequisite: at 16 columns a prompt currently falls back to up to 15 single-token passes.

@@ -11,7 +11,8 @@ All notable changes to SwarmLLM. Format follows [Keep a Changelog](https://keepa
 - Device autotune for the cooperative GEMV shape at load.
 - Binary WebRTC frames and f16 wire format for activations (one third of the original bytes per hop).
 - Fused gate/up GEMV with in-kernel SiLU; fused DeltaNet gate + L2-norm pre-pass; accumulate-into-residual matvec variants.
-- Bench log, kernel-family profiler, GEMM prefill prototype, research plans under `docs/`.
+- Bench log, kernel-family profiler, GEMM prefill prototype, research plans and four implementation designs under `docs/` and `docs/research/`.
+- A roadmap (`roadmap/`) of 27 items, each mirrored by a tracking issue.
 
 ### Changed
 - Repository restructured for open source: `engine/` split into focused modules behind a compatible `engine.js` barrel (dense, qwen35, wgsl/*, gguf, tokenizer, sampling, quant, autotune, selftest, safetensors); the room page split into `p2p.html` (markup) + `room.js` + `room/*` helpers; tests, benchmarks, goldens and references moved under `tests/` and `benchmarks/`; `BelloEngine` renamed `DenseEngine`.
@@ -19,6 +20,7 @@ All notable changes to SwarmLLM. Format follows [Keep a Changelog](https://keepa
 - f16 block scales end to end; `unpack4x` dequantization with runtime probe.
 
 ### Fixed
+- **`f32ToF16` dropped the rounding carry**, silently halving ~0.03% of all values (e.g. -1.9999911 to -1.0): about 1.4 corrupted numbers per 5,120-float activation frame on every hop of a split room, plus occasional halved Q4/Q8 block scales. The carry now propagates into the exponent; all 65,536 representable f16 values round-trip exactly.
 - Tall matvec dispatches over 65,535 workgroups (the LM head at 2 rows per workgroup) were silently dropped; all matvecs now dispatch in 2-D.
 - Draft depth selection by lap time could lock a Mac-hosted room at maximum depth (1.5 tok/s); replaced by throughput-based selection.
 

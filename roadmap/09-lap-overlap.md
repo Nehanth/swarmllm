@@ -11,3 +11,7 @@ Cross-network decode pays one round trip per lap while every device waits. Specu
 
 ## Done when
 - Cross-internet decode improves measurably on a real two-network room without changing output.
+
+## Update (Sep 2026 research round)
+
+Design and expected-gain model in [docs/research/network-scheduler.md](../docs/research/network-scheduler.md) SS3: 1.29-1.52x at 100 ms RTT with K=3 and two laps in flight. Blocked on per-hop telemetry (roadmap 25).
