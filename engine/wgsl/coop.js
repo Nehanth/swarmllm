@@ -12,6 +12,9 @@ export async function probeUnpack(device) {
 }
 
 export function coopWGSL(WG = 256, ROWS = 4, WGB = 64, COLS = 4, ROWSB = ROWS, UNPACK = true) {
+  // Rows per workgroup for a C-column batched kernel: hold accumulators/thread
+  // constant, so the 8- and 4-column twins are not starved of rows when COLS=16.
+  const rowsFor = (C) => Math.max(1, Math.min(8, Math.round(ROWSB * COLS / C)));
   // dequant snippets: unpack4xU8/unpack4xI8 turn 4 packed bytes into a vec4 in
   // one instruction (Q4: two masked unpacks per word; Q8: one), vs 3 ALU ops
   // per element. Same values bit-for-bit; the GEMVs are instruction-bound.
@@ -153,7 +156,8 @@ ${batched ? [0, 1, 2, 3].map(colBody).join("\n") : colBody(0)}
   const guKernelB = (kind, C = COLS) => {
     const P = kind === "f32" ? "guf" : kind === "q8" ? "gu8" : "gu4";
     const shape = `${P}_shape`;
-    const cols = Array.from({ length: C }, (_, m) => m), rows = Array.from({ length: ROWSB }, (_, r) => r);
+    const RB = rowsFor(C), rows = Array.from({ length: RB }, (_, r) => r);
+    const cols = Array.from({ length: C }, (_, m) => m);
     const xLoads = kind === "q4"
       ? cols.map((m) => `let xa${m} = ${P}_x[${m}u * xs4 + b * 8u + qt]; let xb${m} = ${P}_x[${m}u * xs4 + b * 8u + qt + 4u];`).join("\n      ")
       : cols.map((m) => `let xa${m} = ${P}_x[${m}u * xs4 + b * 8u + qt * 2u]; let xb${m} = ${P}_x[${m}u * xs4 + b * 8u + qt * 2u + 1u];`).join("\n      ");
@@ -188,10 +192,10 @@ ${batched ? [0, 1, 2, 3].map(colBody).join("\n") : colBody(0)}
         ${acc("glo", "ghi", "ulo", "uhi", "gs * ", "us * ")}
       }`;
     };
-    const K2 = 2 * ROWSB;
+    const K2 = 2 * RB;
     return `
 @compute @workgroup_size(${WGB})
-fn matvec${kind === "f32" ? "" : "_" + kind}_gu_b${C === COLS ? "" : "4"}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn matvec${kind === "f32" ? "" : "_" + kind}_gu_b${C === COLS ? "" : C}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let t = lid.x;
   let qt = t & 3u;
   let bl = t >> 2u;
@@ -202,8 +206,8 @@ fn matvec${kind === "f32" ? "" : "_" + kind}_gu_b${C === COLS ? "" : "4"}(@built
   let nb = dIn / 32u;
   let dIn4 = dIn / 4u;
   let rowWords = ${kind === "q4" ? "dIn / 8u" : "dIn / 4u"};
-  let row0 = (wg.y * 32768u + wg.x) * ${ROWSB}u;
-  let full = row0 + ${ROWSB - 1}u < dOut;
+  let row0 = (wg.y * 32768u + wg.x) * ${RB}u;
+  let full = row0 + ${RB - 1}u < dOut;
   ${rows.map((r) => cols.map((m) => `var ag${r}_${m} = 0.0; var au${r}_${m} = 0.0;`).join(" ")).join("\n  ")}
   for (var b: u32 = bl; b < nb; b += ${LANESB}u) {
       ${xLoads}
@@ -211,7 +215,7 @@ fn matvec${kind === "f32" ? "" : "_" + kind}_gu_b${C === COLS ? "" : "4"}(@built
       ${rows.map(rowBlock).join("\n      ")}
   }
 ${cols.map((m) => `
-  ${rows.map((r) => `gub_part[${r * WGB}u + t] = ag${r}_${m}; gub_part[${(ROWSB + r) * WGB}u + t] = au${r}_${m};`).join(" ")}
+  ${rows.map((r) => `gub_part[${r * WGB}u + t] = ag${r}_${m}; gub_part[${(RB + r) * WGB}u + t] = au${r}_${m};`).join(" ")}
   workgroupBarrier();
   {
     var stride: u32 = ${WGB / 2}u;
@@ -221,11 +225,11 @@ ${cols.map((m) => `
       stride = stride >> 1u;
     }
   }
-  if (t < ${ROWSB}u) {
+  if (t < ${RB}u) {
     let row = row0 + t;
     if (row < dOut) {
       let g = gub_part[t * ${WGB}u];
-      ${P}_y[${m}u * ys + row] = (g / (1.0 + exp(-g))) * gub_part[(${ROWSB}u + t) * ${WGB}u];
+      ${P}_y[${m}u * ys + row] = (g / (1.0 + exp(-g))) * gub_part[(${RB}u + t) * ${WGB}u];
     }
   }
   workgroupBarrier();`).join("\n")}
@@ -233,9 +237,10 @@ ${cols.map((m) => `
   };
   const guAll = `
 var<workgroup> gu_res: array<f32, ${ROWS}>;
-var<workgroup> gub_part: array<f32, ${2 * ROWSB * WGB}>;
+var<workgroup> gub_part: array<f32, ${2 * rowsFor(4) * WGB}>;
 ` + ["f32", "q8", "q4"].map((k) => guKernel(k, false)).join("\n")
     + ["f32", "q8", "q4"].map((k) => guKernelB(k)).join("\n")
+    + (COLS > 8 ? ["f32", "q8", "q4"].map((k) => guKernelB(k, 8)).join("\n") : "")
     + (COLS > 4 ? ["f32", "q8", "q4"].map((k) => guKernelB(k, 4)).join("\n") : "");
   const singleCoop = `@compute @workgroup_size(${WG})
 fn matvec_coop(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -361,18 +366,19 @@ ${singleCoop}
 ${singleCoopAcc}
 
 // ---- batched (COLS-column) variants for prefill / verify: each weight word is
-// loaded and decoded once and applied to COLS token columns (ROWSB rows per WG). x is [4][xs4] vec4s,
+// loaded and decoded once and applied to C token columns (rowsFor(C) rows per WG). x is [C][xs4] vec4s,
 // y is [4][ys] f32s (strides in BShape; slices are 256-byte aligned by the
 // engine). Workgroup ${WGB}: more loop work per thread, cheaper reductions.
 struct BShape { dOut: u32, dIn: u32, xs4: u32, ys: u32 };
 @group(1) @binding(3) var<uniform> mvb_shape: BShape;
 @group(1) @binding(4) var<uniform> qb_shape: BShape;
-var<workgroup> mvb_part: array<f32, ${2 * ROWSB * WGB}>;
-${[COLS, 4].filter((c, i) => i === 0 || c < COLS).map((C) => [false, true].map((ACC) => ["", "_q8", "_q4"].map((kind) => {
+var<workgroup> mvb_part: array<f32, ${2 * rowsFor(4) * WGB}>;
+${[COLS, 8, 4].filter((c, i) => i === 0 || c < COLS).map((C) => [false, true].map((ACC) => ["", "_q8", "_q4"].map((kind) => {
   const shp = kind === "" ? "mvb_shape" : "qb_shape";
   const xbuf = kind === "" ? "mv_x4" : kind === "_q8" ? "q8_x4" : "q4_x4";
   const ybuf = kind === "" ? "mv_y" : kind === "_q8" ? "q8_y" : "q4_y";
-  const cols = Array.from({ length: C }, (_, m) => m), rows = Array.from({ length: ROWSB }, (_, r) => r);
+  const RB = rowsFor(C), rows = Array.from({ length: RB }, (_, r) => r);
+  const cols = Array.from({ length: C }, (_, m) => m);
   const xLoads = kind === "_q4"
     ? cols.map((m) => `let xa${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt]; let xb${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt + 4u];`).join("\n    ")
     : cols.map((m) => `let xa${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt * 2u]; let xb${m} = ${xbuf}[${m}u * xs4 + b * 8u + qt * 2u + 1u];`).join("\n    ");
@@ -398,7 +404,7 @@ ${[COLS, 4].filter((c, i) => i === 0 || c < COLS).map((C) => [false, true].map((
     }`;
   return `
 @compute @workgroup_size(${WGB})
-fn matvec${kind}_coop_b${C === COLS ? "" : "4"}${ACC ? "_acc" : ""}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn matvec${kind}_coop_b${C === COLS ? "" : C}${ACC ? "_acc" : ""}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let t = lid.x;
   let qt = t & 3u;
   let bl = t >> 2u;
@@ -408,8 +414,8 @@ fn matvec${kind}_coop_b${C === COLS ? "" : "4"}${ACC ? "_acc" : ""}(@builtin(wor
   let ys = ${shp}.ys;
   let nb = dIn / 32u;
   let rowWords = ${kind === "_q4" ? "dIn / 8u" : "dIn / 4u"};
-  let row0 = (wg.y * 32768u + wg.x) * ${ROWSB}u;
-  let full = row0 + ${ROWSB - 1}u < dOut;
+  let row0 = (wg.y * 32768u + wg.x) * ${RB}u;
+  let full = row0 + ${RB - 1}u < dOut;
   ${rows.map((r) => cols.map((m) => `var a${r}_${m} = 0.0;`).join(" ")).join("\n  ")}
   for (var b: u32 = bl; b < nb; b += ${LANESB}u) {
     ${xLoads}
@@ -417,19 +423,19 @@ fn matvec${kind}_coop_b${C === COLS ? "" : "4"}${ACC ? "_acc" : ""}(@builtin(wor
     ${rows.map(rowBlock).join("\n    ")}
   }
 ${Array.from({ length: C / 2 }, (_, h) => h).map((h) => `
-  ${rows.map((r) => `mvb_part[${r * WGB}u + t] = a${r}_${2 * h}; mvb_part[${(ROWSB + r) * WGB}u + t] = a${r}_${2 * h + 1};`).join(" ")}
+  ${rows.map((r) => `mvb_part[${r * WGB}u + t] = a${r}_${2 * h}; mvb_part[${(RB + r) * WGB}u + t] = a${r}_${2 * h + 1};`).join(" ")}
   workgroupBarrier();
   {
     var stride: u32 = ${WGB / 2}u;
     while (stride > 0u) {
-      if (t < stride) { ${Array.from({ length: 2 * ROWSB }, (_, k) => `mvb_part[${k * WGB}u + t] += mvb_part[${k * WGB}u + t + stride];`).join(" ")} }
+      if (t < stride) { ${Array.from({ length: 2 * RB }, (_, k) => `mvb_part[${k * WGB}u + t] += mvb_part[${k * WGB}u + t + stride];`).join(" ")} }
       workgroupBarrier();
       stride = stride >> 1u;
     }
   }
-  if (t < ${2 * ROWSB}u) {
-    let r = t % ${ROWSB}u;
-    let m = ${2 * h}u + t / ${ROWSB}u;
+  if (t < ${2 * RB}u) {
+    let r = t % ${RB}u;
+    let m = ${2 * h}u + t / ${RB}u;
     let row = row0 + r;
     if (row < dOut) { ${ybuf}[m * ys + row] ${ACC ? "+=" : "="} mvb_part[t * ${WGB}u]; }
   }

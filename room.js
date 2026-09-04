@@ -659,9 +659,11 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
       device: ai.device, meta: G.meta, weights, vocab: G.tensors[GGML_EMBED]?.shape?.[0],
       layerRange: range, hasEmbed, hasHead, maxSeq: MAX_SEQ,
       coopWG: ai.tune?.wg, coopRows: ai.tune?.rows,
-      // 8 batch columns x 2 rows/WG: a K=5 speculative verify is ONE pass
-      // (same accumulators per thread as 4 columns x 4 rows)
-      batchCols: 8, coopRowsB: 2,
+      // 16 batch columns: prefill passes go through the row-stationary GEMM
+      // (docs/research/prefill-gemm-v2.md). Speculative verifies are <= 8
+      // columns and drop to the 8- or 4-column GEMV twins automatically, so
+      // the generated stream is unchanged.
+      batchCols: 16, coopRowsB: 1,
     });
   } else if (M.kind === "gguf") {
     aiStatus("reading model index\u2026");
@@ -916,24 +918,28 @@ async function aiGenerate(textArg, who) {
       // split: up to 16 prompt tokens per network round (4 GPU passes of 4)
       let i = 0;
       const hdim = ai.engine.dims.dim;
-      const NC = ai.engine.NC || 4;   // columns per GPU pass; 16 tokens per network round
-      while (ids.length - 1 - i >= NC) {
-        const nChunks = Math.min(16 / NC, Math.floor((ids.length - 1 - i) / NC));
+      const NC = ai.engine.NC || 4;   // columns per GPU pass; up to 16 tokens per network round
+      // step down 16 -> 8 -> 4 on the tail: without this a remainder of up to
+      // NC-1 tokens costs one network lap each
+      const widths = [NC, ...[8, 4].filter((w) => w < NC)];
+      for (const W of widths) while (ids.length - 1 - i >= W) {
+        const nChunks = Math.max(1, Math.min(Math.floor(16 / W), Math.floor((ids.length - 1 - i) / W)));
+        const NCW = W;
         const basePos = ai.pos;
-        const hb = new Float32Array(nChunks * NC * hdim);
+        const hb = new Float32Array(nChunks * NCW * hdim);
         for (let c = 0; c < nChunks; c++)
-          hb.set(await ai.engine.embedRunBatch(ids.slice(i + c * NC, i + (c + 1) * NC), basePos + c * NC), c * NC * hdim);
+          hb.set(await ai.engine.embedRunBatch(ids.slice(i + c * NCW, i + (c + 1) * NCW), basePos + c * NCW), c * NCW * hdim);
         if (badF32(hb)) throw new Error(`NaN in batched prefill (pos ${basePos})`);
         if (ai.chain.length) {
           const returned = new Promise((res, rej) => {
             ai.waiters.set("b" + basePos, res);
             setTimeout(() => { ai.waiters.delete("b" + basePos); rej(new Error("pipeline timeout (batch prefill)")); }, 90000);
           });
-          sendTo(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * NC, ...packWire(hb) });
+          sendTo(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * NCW, ...packWire(hb) });
           await returned;
         }
-        ai.pos = basePos + nChunks * NC;
-        i += nChunks * NC;
+        ai.pos = basePos + nChunks * NCW;
+        i += nChunks * NCW;
         aiStatus(`prefill: ${i}/${ids.length} tokens\u2026`);
       }
       for (; i < ids.length; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);

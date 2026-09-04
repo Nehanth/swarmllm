@@ -3,7 +3,7 @@
 // Multi-config, single-process GEMM harness (all candidates timed round-robin under continuous queue
 // pressure, so the GB10 clock governor state is the same for every row; results reported relative to
 // the in-run streaming probe). Env: CFGS="T=64,R=2,KB=2,S=4;T=64,R=4,KB=2,S=8" DOUT=17408 ROUNDS=4 REPS=60
-import { WGSL, coopWGSL, probeUnpack } from "/home/nehanth/bello/engine/engine.js";
+import { WGSL, coopWGSL, probeUnpack } from "../engine/engine.js";
 const adapter = await navigator.gpu.requestAdapter();
 const device = await adapter.requestDevice({ requiredLimits: { maxBufferSize: adapter.limits.maxBufferSize, maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize, maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize } });
 console.log("maxComputeWorkgroupStorageSize", adapter.limits.maxComputeWorkgroupStorageSize);

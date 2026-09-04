@@ -5,6 +5,7 @@
 // inference, layer-shardable like DenseEngine. Golden reference: ref_q38.mjs
 // (validated line-by-line against llama.cpp eval-callback dumps).
 import { WGSL } from "./wgsl/base.js";
+import { gemmWGSL, GEMM_S, GEMM_TILE } from "./wgsl/gemm.js";
 import { coopWGSL, probeUnpack } from "./wgsl/coop.js";
 import { WGSL2 } from "./wgsl/qwen35.js";
 import { f16ToF32 } from "./gguf.js";
@@ -31,7 +32,7 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true }) {
     this.device = device;
     this.mvVariant = matvecVariant;
     this.coopWG = coopWG; this.coopRows = coopRows;
@@ -61,8 +62,29 @@ export class Qwen35Engine {
     this.hasEmbed = hasEmbed; this.hasHead = hasHead;
     this.pos = 0;
 
+    // ---- prefill GEMM plan (docs/research/prefill-gemm-v2.md) ----
+    // Only at the full batch width, only for Q4 weights, only for shapes with a
+    // pinned split-K factor. Narrower passes (decode, speculative verify, the
+    // prompt tail) stay on the GEMV ladder, so the speculative stream is
+    // structurally identical to plain decoding.
+    this._gemmShapes = new Map();
+    if (batchCols >= 16 && gemm !== false) {
+      for (const [dOut, dIn] of [[convDim, dim], [dInner, dim], [dim, dInner], [inter, dim], [dim, inter],
+                                 [nH * hd * 2, dim], [kvDim, dim], [dim, qDim]]) {
+        const S = GEMM_S[`${dOut}x${dIn}`];
+        if (S && dOut >= 256 && dIn % 64 === 0 && ((dIn / 32) / 2) % S === 0) this._gemmShapes.set(`${dOut}x${dIn}`, S);
+      }
+    }
+    this.gemmOn = this._gemmShapes.size > 0;
+    this._gemmDIns = [...new Set([...this._gemmShapes.keys()].map((k) => +k.split("x")[1]))];
+    this._gemmSplits = [...new Set(this._gemmShapes.values())];
+    this._gemmPairs = [...new Set([...this._gemmShapes].map(([k, S]) => `${k.split("x")[1]}:${S}`))].map((x) => x.split(":").map(Number));
+    this.gemm = this.gemmOn;   // runtime kill switch: engine.gemm = false reproduces the GEMV path
+
     // ---- pipelines with explicit layouts ----
-    const mod = device.createShaderModule({ code: WGSL + coopWGSL(coopWG, coopRows, 64, batchCols, coopRowsB, await probeUnpack(device)) + WGSL2 });
+    const unpack = await probeUnpack(device);
+    const mod = device.createShaderModule({ code: WGSL + coopWGSL(coopWG, coopRows, 64, batchCols, coopRowsB, unpack)
+      + (this.gemmOn ? gemmWGSL({ N: batchCols, pairs: this._gemmPairs, UNPACK: unpack }) : "") + WGSL2 });
     const C = GPUShaderStage.COMPUTE;
     const layout0 = device.createBindGroupLayout({
       entries: [
@@ -101,11 +123,19 @@ export class Qwen35Engine {
       head_norm_mc: ["rw", "ro", "u"], rope_part_mc: ["rw", "u", "u"], sigmoid_mul_mc: ["rw", "ro", "u"],
       argmax: ["ro", "rw", "u"],
     };
-    if (batchCols > 4) Object.assign(G1, {   // 4-column set for verifies with <= 4 live columns
-      matvec_coop_b4: G1.matvec_coop_b, matvec_q8_coop_b4: G1.matvec_q8_coop_b, matvec_q4_coop_b4: G1.matvec_q4_coop_b,
-      matvec_coop_b4_acc: G1.matvec_coop_b, matvec_q8_coop_b4_acc: G1.matvec_q8_coop_b, matvec_q4_coop_b4_acc: G1.matvec_q4_coop_b,
-      matvec_gu_b4: G1.matvec_gu_b, matvec_q8_gu_b4: G1.matvec_q8_gu_b, matvec_q4_gu_b4: G1.matvec_q4_gu_b,
+    // narrower twins: a verify or tail pass with w live columns pays for w, not batchCols
+    for (const W of [8, 4]) if (batchCols > W) Object.assign(G1, {
+      [`matvec_coop_b${W}`]: G1.matvec_coop_b, [`matvec_q8_coop_b${W}`]: G1.matvec_q8_coop_b, [`matvec_q4_coop_b${W}`]: G1.matvec_q4_coop_b,
+      [`matvec_coop_b${W}_acc`]: G1.matvec_coop_b, [`matvec_q8_coop_b${W}_acc`]: G1.matvec_q8_coop_b, [`matvec_q4_coop_b${W}_acc`]: G1.matvec_q4_coop_b,
+      [`matvec_gu_b${W}`]: G1.matvec_gu_b, [`matvec_q8_gu_b${W}`]: G1.matvec_q8_gu_b, [`matvec_q4_gu_b${W}`]: G1.matvec_q4_gu_b,
     });
+    // the prefill GEMM and its split-K reduce / transpose all reuse the
+    // matvec_q4_coop_b layout (qs, sc, x, y, shape) verbatim
+    if (this.gemmOn) {
+      for (const [dIn, S] of this._gemmPairs) G1[`gemm_q4_${dIn}_s${S}`] = G1.matvec_q4_coop_b;
+      for (const S of this._gemmSplits) { G1[`gemm_red_s${S}`] = G1.matvec_q4_coop_b; G1[`gemm_red_s${S}_acc`] = G1.matvec_q4_coop_b; }
+      G1.gemm_xpose = G1.matvec_q4_coop_b;
+    }
     const bufType = { u: "uniform", ro: "read-only-storage", rw: "storage" };
     this.pipes = {};
     // compile every pipeline in parallel (async): overlaps shader compilation
@@ -194,8 +224,12 @@ export class Qwen35Engine {
       const pipe = xB ? base + "_b" : base;
       const shp = xB ? this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4) : this._shapeB(dOut, dIn, 0, 0);
       const bufs = wg2.kind === "f32" ? [wg2.buf, wu2.buf, x, y, shp] : [wg2.qs, wg2.sc, wu2.qs, wu2.sc, x, y, shp];
-      const op = { pipe, wgs: Math.ceil(dOut / (xB ? this.coopRowsB : this.coopRows)), bg: this._bg(this.pipes[pipe], 1, bufs) };
-      if (xB && this.NC > 4) { op.pipe4 = base + "_b4"; op.bg4 = this._bg(this.pipes[op.pipe4], 1, bufs); }
+      const op = { pipe, wgs: Math.ceil(dOut / (xB ? this._rowsFor(this.NC) : this.coopRows)), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      if (xB) for (const W of [8, 4]) if (this.NC > W) {
+        op[`pipe${W}`] = `${base}_b${W}`;
+        op[`bg${W}`] = this._bg(this.pipes[op[`pipe${W}`]], 1, bufs);
+        op[`wgs${W}`] = Math.ceil(dOut / this._rowsFor(W));
+      }
       return op;
     };
     this._guOp = guOp;
@@ -351,12 +385,25 @@ export class Qwen35Engine {
   }
   _dop(pass, op, nCols = 0) {
     if (this.skip && this.skip.has(op.pipe)) return;
-    const four = this.b4 !== false && nCols > 0 && nCols <= 4 && op.pipe4;   // <= 4 live columns: 4-column kernel
-    const pipe = four ? op.pipe4 : op.pipe;
+    // full-width prefill passes go through the row-stationary GEMM; anything
+    // narrower (decode, speculative verify, prompt tail) uses the GEMV ladder
+    if (op.gemm && nCols === this.NC && this.gemm !== false) {
+      const g = op.gemm, z = (this._gz ^= 1);
+      this._d3(pass, g.pipe, g.bg[z], g.wgs);
+      this._d3(pass, g.red, g.redBg[z], g.redWgs);
+      return;
+    }
+    const w = this.b4 === false ? this.NC : (nCols > 0 ? nCols : this.NC);
+    const W = w <= 4 && op.pipe4 ? 4 : w <= 8 && op.pipe8 ? 8 : 0;
+    this._d3(pass, W ? op[`pipe${W}`] : op.pipe, W ? op[`bg${W}`] : op.bg, W ? (op[`wgs${W}`] ?? op.wgs) : op.wgs);
+  }
+  // rows per workgroup for a W-column batched kernel; mirrors rowsFor() in coop.js
+  _rowsFor(W) { return Math.max(1, Math.min(8, Math.round(this.coopRowsB * this.NC / W))); }
+  _d3(pass, pipe, bg, wgs) {
     pass.setPipeline(this.pipes[pipe]);
     pass.setBindGroup(0, this.bgCommonFor[pipe]);
-    pass.setBindGroup(1, four ? op.bg4 : op.bg);
-    if (op.wgs > 32768) pass.dispatchWorkgroups(32768, Math.ceil(op.wgs / 32768)); else pass.dispatchWorkgroups(op.wgs);   // > 65535 per dimension is silently dropped
+    pass.setBindGroup(1, bg);
+    if (wgs > 32768) pass.dispatchWorkgroups(32768, Math.ceil(wgs / 32768)); else pass.dispatchWorkgroups(wgs);   // > 65535 per dimension is silently dropped
   }
   _setFrame(pos, seqLen) {
     this.device.queue.writeBuffer(this.frameBuf, 0, new Uint32Array([pos, seqLen]));
@@ -505,6 +552,21 @@ export class Qwen35Engine {
       k: mkB(D.kvDim), v: mkB(D.kvDim), attnOut: mkB(D.qDim),
     };
     this.stageXB = dev.createBuffer({ size: NC * D.dim * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    if (this.gemmOn) {
+      // column-major copies of the three activation tensors the GEMM reads, and
+      // two partials buffers so consecutive GEMMs in one pass do not alias
+      const T = (n) => dev.createBuffer({ size: n * NC * 4, usage: S });
+      B.xnT = T(D.dim); B.gT = T(D.inter); B.aoT = T(Math.max(D.qDim, D.dInner));
+      const maxPart = Math.max(...[...this._gemmShapes].map(([k, sp]) => sp * NC * +k.split("x")[0]));
+      this.gemmP = [0, 1].map(() => dev.createBuffer({ size: maxPart * 4, usage: S }));
+      this._gz = 0;
+      const xp = (src, dst, dIn) => ({ pipe: "gemm_xpose", wgs: Math.ceil(dIn * NC / 64),
+        bg: this._bg(this.pipes.gemm_xpose, 1, [src.buf, src.buf, src.buf, dst, this._shapeB(0, dIn, src.stride / 16, 0)]) });
+      this.xposeXn = xp(B.xn, B.xnT, D.dim);
+      this.xposeG = xp(B.g, B.gT, D.inter);
+      this.xposeGated = xp(B.gated, B.aoT, D.dInner);
+      this.xposeAttnOut = xp(B.attnOut, B.aoT, D.qDim);
+    }
     // rollback shadows for the recurrent layers (speculative decoding)
     for (const L of this.layers) if (!L.isFull && !L.S_shadow) {
       L.S_shadow = dev.createBuffer({ size: 7 * L.S.size, usage: S });
@@ -525,13 +587,27 @@ export class Qwen35Engine {
         m[name] = this._bg2g0(this.pipes[name], [{ buffer: this.cfgBuf }, { buffer: this.frameBufsB[c] }]);
       return m;
     });
-    const mvB = (w, xB, yB, dOut, dIn, acc = false) => {
+    const mvB = (w, xB, yB, dOut, dIn, acc = false, xT = null) => {
       const base = w.kind === "q8" ? "matvec_q8" : w.kind === "q4" ? "matvec_q4" : "matvec";
       const pipe = base + "_coop_b" + (acc ? "_acc" : "");
       const shp = this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4);
       const bufs = w.kind === "f32" ? [w.buf, xB.buf, yB.buf, shp] : [w.qs, w.sc, xB.buf, yB.buf, shp];
-      const op = { pipe, acc, wgs: Math.ceil(dOut / this.coopRowsB), bg: this._bg(this.pipes[pipe], 1, bufs) };
-      if (this.NC > 4) { op.pipe4 = base + "_coop_b4" + (acc ? "_acc" : ""); op.bg4 = this._bg(this.pipes[op.pipe4], 1, bufs); }
+      const op = { pipe, acc, wgs: Math.ceil(dOut / this._rowsFor(this.NC)), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      for (const W of [8, 4]) if (this.NC > W) {
+        op[`pipe${W}`] = `${base}_coop_b${W}${acc ? "_acc" : ""}`;
+        op[`bg${W}`] = this._bg(this.pipes[op[`pipe${W}`]], 1, bufs);
+        op[`wgs${W}`] = Math.ceil(dOut / this._rowsFor(W));   // narrower twins carry more rows per workgroup
+      }
+      const S2 = this._gemmShapes.get(`${dOut}x${dIn}`);
+      if (S2 && w.kind === "q4" && xT) {
+        const gp = `gemm_q4_${dIn}_s${S2}`, rp = `gemm_red_s${S2}${acc ? "_acc" : ""}`;
+        op.gemm = {
+          pipe: gp, wgs: Math.ceil(dOut / GEMM_TILE) * S2,
+          bg: [0, 1].map((z) => this._bg(this.pipes[gp], 1, [w.qs, w.sc, xT, this.gemmP[z], shp])),
+          red: rp, redBg: [0, 1].map((z) => this._bg(this.pipes[rp], 1, [this.gemmP[z], w.sc, w.sc, yB.buf, shp])),
+          redWgs: Math.ceil(this.NC * dOut / 64),
+        };
+      }
       return op;
     };
     if (this.hasHead) {
@@ -583,9 +659,9 @@ export class Qwen35Engine {
       });
       const R = {
         mc,
-        gateUp: [mvB(L.ffnGate, B.xn, B.g, D.inter, D.dim), mvB(L.ffnUp, B.xn, B.u, D.inter, D.dim)],
+        gateUp: [mvB(L.ffnGate, B.xn, B.g, D.inter, D.dim, false, this.gemmOn ? B.xnT : null), mvB(L.ffnUp, B.xn, B.u, D.inter, D.dim, false, this.gemmOn ? B.xnT : null)],
         gu: this._guOp(L.ffnGate, L.ffnUp, B.xn.buf, B.g.buf, D.inter, D.dim, B.xn, B.g),
-        down: mvB(L.ffnDown, B.g, B.x, D.dim, D.inter, true),
+        down: mvB(L.ffnDown, B.g, B.x, D.dim, D.inter, true, this.gemmOn ? B.gT : null),
         cols: cix.map((c) => ({
           norm1: bgNormC(L.attnNorm, c),
           norm2: bgNormC(L.postNorm, c),
@@ -594,9 +670,9 @@ export class Qwen35Engine {
         })),
       };
       if (L.isFull) {
-        R.qkvOps = [mvB(L.wq, B.xn, B.qFull, D.nH * D.hd * 2, D.dim),
-          mvB(L.wk, B.xn, B.k, D.kvDim, D.dim), mvB(L.wv, B.xn, B.v, D.kvDim, D.dim)];
-        R.o = mvB(L.wo, B.attnOut, B.x, D.dim, D.qDim, true);
+        R.qkvOps = [mvB(L.wq, B.xn, B.qFull, D.nH * D.hd * 2, D.dim, false, this.gemmOn ? B.xnT : null),
+          mvB(L.wk, B.xn, B.k, D.kvDim, D.dim, false, this.gemmOn ? B.xnT : null), mvB(L.wv, B.xn, B.v, D.kvDim, D.dim, false, this.gemmOn ? B.xnT : null)];
+        R.o = mvB(L.wo, B.attnOut, B.x, D.dim, D.qDim, true, this.gemmOn ? B.aoT : null);
         for (let c = 0; c < NC; c++) Object.assign(R.cols[c], {
           qsplit: this._bg2res(this.pipes.qsplit, [slice(B.qFull, c), slice(B.q, c), slice(B.gAttn, c), { buffer: this.dnBuf }]),
           qNorm: this._bg2res(this.pipes.head_norm, [slice(B.q, c), { buffer: L.qNorm.buf }, { buffer: this.uNH }]),
@@ -609,9 +685,9 @@ export class Qwen35Engine {
           sigMul: this._bg2res(this.pipes.sigmoid_mul, [slice(B.attnOut, c), slice(B.gAttn, c), { buffer: this.uQDim }]),
         });
       } else {
-        R.dnOps = [mvB(L.wqkv, B.xn, B.qkv, D.convDim, D.dim), mvB(L.wz, B.xn, B.z, D.dInner, D.dim),
+        R.dnOps = [mvB(L.wqkv, B.xn, B.qkv, D.convDim, D.dim, false, this.gemmOn ? B.xnT : null), mvB(L.wz, B.xn, B.z, D.dInner, D.dim, false, this.gemmOn ? B.xnT : null),
           mvB(L.wBeta, B.xn, B.betaRaw, D.nVH, D.dim), mvB(L.wAlpha, B.xn, B.alpha, D.nVH, D.dim)];
-        R.out = mvB(L.wOut, B.gated, B.x, D.dim, D.dInner, true);
+        R.out = mvB(L.wOut, B.gated, B.x, D.dim, D.dInner, true, this.gemmOn ? B.aoT : null);
         for (let c = 0; c < NC; c++) Object.assign(R.cols[c], {
           gates: this._bg2res(this.pipes.dn_gates, [slice(B.alpha, c), slice(B.betaRaw, c),
             { buffer: L.dtBias }, { buffer: L.ssmA }, slice(B.beta, c), slice(B.decay, c), { buffer: this.dnBuf }]),
@@ -640,10 +716,12 @@ export class Qwen35Engine {
   // rejected speculative suffix can be rolled back.
   _encodeLayerBatch(enc, i, basePos, nCols = this.NC, snapshotDN = false) {
     const D = this.dims, L = this.layers[i], LB = this.layerB[i], B = this.B, M = LB.mc;
+    const G = this.gemmOn && this.gemm !== false && nCols === this.NC;   // full-width pass: GEMM needs transposed activations
     if (L.isFull) {
       {
         const p = enc.beginComputePass();
         this._dMC(p, "rmsnorm_mc", M.norm1, 256, 256, nCols);
+        if (G) this._dop(p, this.xposeXn);
         for (const op of LB.qkvOps) this._dop(p, op, nCols);
         this._dMC(p, "qsplit_mc", M.qsplit, D.nH * D.hd, 64, nCols);
         this._dMC(p, "head_norm_mc", M.qNorm, D.nH, 32, nCols);
@@ -665,6 +743,7 @@ export class Qwen35Engine {
           this._dCol(p, "attn_out", c, C.attnOut, D.qDim);
         }
         this._dMC(p, "sigmoid_mul_mc", M.sigMul, D.qDim, 64, nCols);
+        if (G) this._dop(p, this.xposeAttnOut);
         this._dop(p, LB.o, nCols);
         if (!LB.o.acc) this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
         p.end();
@@ -672,11 +751,13 @@ export class Qwen35Engine {
     } else {
       const p = enc.beginComputePass();
       this._dMC(p, "rmsnorm_mc", M.norm1, 256, 256, nCols);
+      if (G) this._dop(p, this.xposeXn);
       for (const op of LB.dnOps) this._dop(p, op, nCols);
       this._dMC(p, "dn_conv_mc", M.conv, D.convDim, 64, 1);           // loops over columns
       this._dMC(p, "dn_pre_mc", M.pre, 128, 128, nCols);              // gates + L2(q,k) fused, one WG per column
       this._dMC(p, "dn_delta_mc", M.delta, D.nVH * 128, 128, 1);     // loops over columns
       this._dMC(p, "dn_gatenorm_mc", M.gatenorm, D.nVH * 128, 128, nCols);
+      if (G) this._dop(p, this.xposeGated);
       this._dop(p, LB.out, nCols);
       if (!LB.out.acc) this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
       p.end();
@@ -684,11 +765,13 @@ export class Qwen35Engine {
     {
       const p = enc.beginComputePass();
       this._dMC(p, "rmsnorm_mc", M.norm2, 256, 256, nCols);
-      if (LB.gu) this._dop(p, LB.gu, nCols);
-      else {
+      if (G) this._dop(p, this.xposeXn);
+      if (LB.gu && !G) this._dop(p, LB.gu, nCols);
+      else {   // the GEMM has no fused gate/up: run them separately, then SiLU
         for (const op of LB.gateUp) this._dop(p, op, nCols);
         for (let c = 0; c < nCols; c++) this._dCol(p, "silu_mul", c, LB.cols[c].silu, D.inter);
       }
+      if (G) this._dop(p, this.xposeG);
       this._dop(p, LB.down, nCols);
       if (!LB.down.acc) this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
       p.end();
@@ -885,6 +968,26 @@ export class Qwen35Engine {
       this.pos += NC;
       i += NC;
       if (++sinceSync >= 4) { await this.device.queue.onSubmittedWorkDone(); sinceSync = 0; }
+    }
+    // step the tail down through the narrower twins (16 -> 8 -> 4) before
+    // falling back to single tokens: at NC=16 a 15-token remainder would
+    // otherwise cost 15 full single-token passes (~1.7 s on a 27B).
+    for (const W of [8, 4].filter((w) => w < NC)) {
+      while (ids.length - i >= W) {
+        const basePos = this.pos;
+        for (let c = 0; c < W; c++) {
+          this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, W, 0]));
+          this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(ids[i + c]));
+        }
+        const enc = this.device.createCommandEncoder();
+        for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos, W);
+        enc.copyBufferToBuffer(this.B.x.buf, (W - 1) * this.B.x.stride, this.x, 0, this.dims.dim * 4);
+        this.device.queue.submit([enc.finish()]);
+        if (this.mtp && this.mtpFill !== false)
+          for (let c = 0; c < W; c++) if (i + c + 1 < ids.length) await this.mtpRun(c, ids[i + c + 1], basePos + c + 1, false);
+        this.pos += W; i += W;
+        await this.device.queue.onSubmittedWorkDone();
+      }
     }
     for (; i < ids.length; i++) {
       await this.prefillToken(ids[i]);
