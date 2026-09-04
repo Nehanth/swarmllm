@@ -5,7 +5,7 @@ One file per item. Each has a status, the reason it matters, a design sketch, an
 | # | Item | Phase | Status |
 |---|---|---|---|
 | 01 | [Relay fallback for strict NATs](01-relay-fallback.md) | now | planned · [#1](https://github.com/Nehanth/swarmllm/issues/1) |
-| 02 | [Prefill GEMM](02-prefill-gemm.md) | now | in progress (prototype at 1.25×) · [#2](https://github.com/Nehanth/swarmllm/issues/2) |
+| 02 | [Prefill GEMM](02-prefill-gemm.md) | now | landed (Q4) · Q8 variant next · [#2](https://github.com/Nehanth/swarmllm/issues/2) |
 | 03 | [Spare layer copies and swarm recovery](03-swarm-recovery.md) | next | planned · [#3](https://github.com/Nehanth/swarmllm/issues/3) |
 | 04 | [`npx swarmllm serve`: an OpenAI-compatible local endpoint](04-local-endpoint.md) | next | planned · [#4](https://github.com/Nehanth/swarmllm/issues/4) |
 | 05 | [Offline rooms: hotspot + QR signaling + peer weight sharing](05-offline-rooms.md) | next | planned · [#5](https://github.com/Nehanth/swarmllm/issues/5) |

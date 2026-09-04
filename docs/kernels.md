@@ -11,8 +11,9 @@ A generated token on the 27B = ~111 ms on the GB10: **82 ms streaming 15 GB of w
 | Family | Entry points | Role |
 |---|---|---|
 | Cooperative GEMV | `matvec[_q8|_q4]_coop[_acc]` | decode: `ROWS` rows per workgroup of `WG` threads; 64 threads sweep one row together |
-| Batched GEMV | `matvec*_coop_b[4][_acc]` | prefill / speculative verify: `COLS` columns per weight read; `_b4` twin for ≤4 live columns |
-| Fused gate/up | `matvec*_gu[_b[4]]` | FFN gate and up in one weight sweep, SiLU applied in the epilogue |
+| Batched GEMV | `matvec*_coop_b[8|4][_acc]` | speculative verify and prefill tails: `_b8`/`_b4` twins for ≤8 / ≤4 live columns, each with rows-per-workgroup chosen to keep 16 accumulators per thread |
+| Fused gate/up | `matvec*_gu[_b[8|4]]` | FFN gate and up in one weight sweep, SiLU applied in the epilogue (GEMV path only) |
+| Prefill GEMM | `gemm_q4_<dIn>_s<S>`, `gemm_red_s<S>[_acc]`, `gemm_xpose` | row-stationary Q4_0 GEMM for 16-column prefill passes: packed-nibble weight tile in shared memory, broadcast activations, pinned split-K, fixed-order reduce |
 | Glue | `rmsnorm`, `qsplit`, `head_norm`, `rope_part`, `attn_scores/softmax/out`, `sigmoid_mul`, `silu_mul`, `add_res`, `argmax` + `_mc` multi-column forms | normalization, attention, activations, sampling prep |
 | DeltaNet | `dn_pre` (gates + L2), `dn_conv`, `dn_delta`, `dn_gatenorm` + `_mc` forms | the gated delta-rule recurrence, with snapshot slots for speculative rollback |
 | Legacy | `matvec[_q8|_q4]` | one thread per row; kept as the correctness reference and fallback |
@@ -46,6 +47,9 @@ A generated token on the 27B = ~111 ms on the GB10: **82 ms streaming 15 GB of w
 18. **Multi-token prediction with exact rollback (9 → 16 tok/s).** The model's `nextn` layer drafts up to 7 tokens; one batched trunk pass verifies them; DeltaNet states are snapshotted after every non-final column into per-layer shadow slots (7 of them), written inside the recurrence kernel; a rejection copies the right slot back. KV caches need no rollback (position-capped). Any sampler stays lossless because the trunk decides.
 19. **Snapshot slot base packed into the frame uniform.** `frame.snap` carries `(total << 8) | (base + 1)` so an 8-column verify split into chunks on any device writes global slot indices.
 20. **Draft depth by measured throughput.** A lap-time threshold locked a Mac-hosted room at depth 7 (1.5 tok/s); the room now probes depths 3/5/7 and keeps the fastest measured tokens per second.
+
+30. **Row-stationary prefill GEMM (1.64× on the whole-model pass, 34.6 → 56.7 tok/s).** The batched GEMV is column-stationary and re-reads the activation tile per row group; at 16 columns it is worse than at 8. The GEMM gives each thread R rows × all 16 columns, keeps the weight tile as packed nibbles in shared memory (4 KB, never dequantized there), broadcast-reads activations from a transposed staging copy, and prefetches the next block pair into registers. Split-K (pinned per shape, so every peer computes identical hidden states) keeps tall tiles occupied; partials reduce in fixed order. It fires only at the full batch width, so decode and speculative verify never touch it. `ffn_down` and `ssm_out` are Q8_0 in the 27B and stay on the GEMV: a Q8 variant is the next step.
+31. **Width-dependent rows per workgroup for the twins.** With 16 batch columns the narrow twins would inherit one row per workgroup and speculative decode fell 15.5 → 12.8 tok/s; each twin now uses `16 / C` rows so every batched kernel carries 16 accumulators per thread. A twin is byte-identical to the kernel generated natively at its width (checked in `tests/test_twins.js`).
 
 ### Correctness and portability hacks
 21. **2-D dispatch for tall matvecs.** WebGPU silently drops a dispatch over 65,535 workgroups in one dimension; the LM head at 2 rows per workgroup needs 124,160. Kernels derive `row0` from `(wg.y * 32768 + wg.x)`.
