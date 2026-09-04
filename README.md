@@ -2,7 +2,7 @@
   <a href="https://swarmllm.ai"><img src="favicon.svg" width="72" alt="SwarmLLM"></a>
 </p>
 <h1 align="center">SwarmLLM</h1>
-<p align="center"><b>Your phone can't run a 27B model. Your room can.</b></p>
+<p align="center"><b>Every device brings a slice. Together they run the whole model.</b></p>
 <p align="center">
   <a href="https://swarmllm.ai">Site</a> ·
   <a href="https://swarmllm.ai/room">Start a swarm</a> ·
@@ -14,7 +14,6 @@
 <p align="center">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-2b4eff">
   <img alt="runtime" src="https://img.shields.io/badge/runs%20on-WebGPU%20%2B%20WebRTC-16171c">
-  <img alt="install" src="https://img.shields.io/badge/install-none-8b877a">
 </p>
 
 SwarmLLM runs large language models across the devices in a room, in their browser tabs. Each device holds a slice of the model; a 10 KB activation vector passes between them over direct WebRTC connections. Nothing to install, no accounts, no server does any thinking.
