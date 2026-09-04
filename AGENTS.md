@@ -8,7 +8,7 @@ A from-scratch WebGPU inference engine (`engine/`) and a browser room runtime (`
 ## Non-negotiables (from GOVERNANCE.md)
 - Output must stay **bit-exact**: golden tests must pass, and the speculative stream must equal plain decoding (`tests/test_mtp.js`). Approximations need a default-off switch.
 - Every performance claim gets a row in `docs/bench-log.md` with hardware + commit, including neutral results.
-- Easy to join (a browser link always works; native/headless peers welcome), no accounts/tokens/ads, honest privacy claims (`SECURITY.md`).
+- Easy to use (a browser link always works; native/headless peers welcome), no accounts/tokens/ads, honest privacy claims (`SECURITY.md`).
 
 ## How to run things
 ```bash
