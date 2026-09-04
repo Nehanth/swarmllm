@@ -1,7 +1,8 @@
 # Docs
 
 - [architecture.md](architecture.md): how a token flows through the engine and the room.
-- [kernels.md](kernels.md): the WebGPU engine, kernel families, and the rules learned from measurement.
+- [tech-stack.md](tech-stack.md): what SwarmLLM is built from and why.
+- [kernels.md](kernels.md): the WebGPU engine: kernel families and every trick with its measured effect.
 - [protocol.md](protocol.md): room lifecycle and compute frames.
 - [models.md](models.md): supported models and how to add one.
 - [bench-log.md](bench-log.md): every performance change with hardware, commit and numbers.

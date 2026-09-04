@@ -84,11 +84,17 @@ Prefill is the known gap (27 tok/s vs 377 native on the GB10); a tiled GEMM for 
 ## Repository layout
 
 ```
-engine/        the runtime: engine.js (WGSL generator, dense engine), qwen35.js (hybrid engine), gguf.js (loader)
-index.html     landing page      p2p.html  the room (served at /room)
-tests/         GPU golden tests, tests/unit (no GPU), goldens, reference implementations
-benchmarks/    tok/s harnesses, kernel-family profiler, GEMM prototype
-docs/          architecture, kernels, protocol, models, bench log, research plans
+engine/            the runtime (ES modules; engine.js re-exports the public API)
+  dense.js         DenseEngine: dense Llama-architecture models (Qwen3, SmolLM)
+  qwen35.js        Qwen35Engine: hybrid Gated-DeltaNet + attention, batched paths, MTP speculation
+  gguf.js          GGUF parsing, quantization repacking, streaming upload
+  wgsl/            base.js (shared kernels) · coop.js (generated GEMV family) · qwen35.js (DeltaNet kernels)
+  tokenizer.js · sampling.js · quant.js · autotune.js · selftest.js · safetensors.js
+room.js + room/    the room: signaling, mesh, weight streaming, generation loop; wire/markdown/sampling/models helpers
+index.html         landing page          p2p.html   the room's markup (served at /room)
+tests/             GPU golden tests · unit/ (no GPU) · golden/ · reference/ · run.sh
+benchmarks/        tok/s harnesses, kernel-family profiler, GEMM prototype
+docs/              architecture · tech-stack · kernels (every trick, measured) · protocol · models · bench log · research
 ```
 
 ## Contributing

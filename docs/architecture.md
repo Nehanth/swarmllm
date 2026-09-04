@@ -46,7 +46,9 @@ Decode is at the memory roofline on this GPU; speculation is what raises tokens 
 
 ## Files
 
-- `engine/engine.js`: base WGSL, the cooperative-GEMV generator (`coopWGSL`), the dense `DenseEngine` (Qwen3, SmolLM), autotune, self-tests.
-- `engine/qwen35.js`: `Qwen35Engine` for the hybrid DeltaNet/attention family, batched paths, MTP speculation.
-- `engine/gguf.js`: GGUF header/tensor parsing, tokenizer extraction, quantization/repacking, streaming upload.
-- `p2p.html`: the room: signaling, WebRTC mesh, layer assignment, download orchestration, the generation loop.
+- `engine/engine.js`: public entry point; re-exports the modules below.
+- `engine/dense.js`: `DenseEngine` for dense models (Qwen3, SmolLM); `engine/qwen35.js`: `Qwen35Engine` for the hybrid family, batched paths and MTP speculation.
+- `engine/wgsl/`: `base.js` (shared kernels), `coop.js` (the cooperative-GEMV generator), `qwen35.js` (DeltaNet and attention glue).
+- `engine/gguf.js`: GGUF header/tensor parsing, tokenizer extraction, quantization/repacking, streaming upload. `engine/safetensors.js`: the SmolLM path.
+- `engine/tokenizer.js`, `sampling.js`, `quant.js`, `autotune.js`, `selftest.js`: what their names say.
+- `room.js` (+ `room/wire.js`, `markdown.js`, `sampling.js`, `models.js`): the room: signaling, WebRTC mesh, layer assignment, download orchestration, the generation loop. `p2p.html` holds its markup and styles.

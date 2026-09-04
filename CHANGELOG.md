@@ -14,6 +14,7 @@ All notable changes to SwarmLLM. Format follows [Keep a Changelog](https://keepa
 - Bench log, kernel-family profiler, GEMM prefill prototype, research plans under `docs/`.
 
 ### Changed
+- Repository restructured for open source: `engine/` split into focused modules behind a compatible `engine.js` barrel (dense, qwen35, wgsl/*, gguf, tokenizer, sampling, quant, autotune, selftest, safetensors); the room page split into `p2p.html` (markup) + `room.js` + `room/*` helpers; tests, benchmarks, goldens and references moved under `tests/` and `benchmarks/`; `BelloEngine` renamed `DenseEngine`.
 - Cooperative GEMV kernels (64 threads per row, coalesced loads, shared-memory reduction): 27B decode 3.6 → 9.0 tok/s plain, 16 tok/s with speculation on a GB10.
 - f16 block scales end to end; `unpack4x` dequantization with runtime probe.
 
