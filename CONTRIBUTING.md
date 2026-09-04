@@ -37,7 +37,7 @@ To run the site locally, serve the repository root with any static server (`npx 
 **Preparing your PR**
 
 - Kernel and engine changes must keep the golden tests passing **bit-exactly**. The speculative decoding path must produce a stream identical to plain decoding (`tests/test_mtp.js`). If a change is intentionally approximate, it needs a switch that defaults to off, and a note in the PR.
-- Performance changes must add a row to [docs/bench-log.md](docs/bench-log.md) with the hardware, commit, and before/after numbers, including neutral results. "Faster" without a number is not reviewable.
+- Performance changes must add a row to [docs/bench-log.md](docs/bench-log.md) with the hardware, commit, and before/after numbers, including neutral results. "Faster" without a number is not reviewable. Room measurements name the devices and one of the standard prompts listed in the bench log, so rows stay comparable across PRs.
 - Protocol changes must keep older peers failing loudly rather than silently (bump the message version).
 - Add or update a test. GPU tests live in `tests/`, unit tests that need no GPU in `tests/unit/`.
 - Keep the diff readable: no reformatting of untouched code, no drive-by renames.
