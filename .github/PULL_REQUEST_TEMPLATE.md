@@ -10,6 +10,7 @@
 ## Performance (delete if not applicable)
 
 - [ ] Added a row to `docs/bench-log.md` with hardware, commit, and before/after numbers (neutral results included).
+- [ ] Room-tested on real devices: added a row to the "Room benchmarks by PR" table naming the devices and the standard prompt used (`hello`, `meaning` or `japan`).
 
 ## Tested on
 
