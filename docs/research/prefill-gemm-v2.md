@@ -339,7 +339,7 @@ The contract this change must keep, and how it keeps it:
 
 ## 6. Validation plan
 
-Ordered; each step gates the next. Harnesses used in this document are at `/tmp/claude-1000/-home-nehanth/2df9b1f2-d21a-4923-88fe-fb9684f1f115/scratchpad/` (`rs.js` per-shape sweep, `full.js` whole-inventory, `gemm/gemm.js` + `gemm/check.js` correctness). Promote `full.js` into `benchmarks/bench_gemm_inventory.js` — it is the only harness that measures the shape mix the engine actually runs.
+Ordered; each step gates the next. Harnesses used in this document are at a scratch directory (not committed) (`rs.js` per-shape sweep, `full.js` whole-inventory, `gemm/gemm.js` + `gemm/check.js` correctness). Promote `full.js` into `benchmarks/bench_gemm_inventory.js` — it is the only harness that measures the shape mix the engine actually runs.
 
 **6.1 Kernel correctness (done, reproduce before landing).** `gemm/check.js`: compile the full module (`base + coop(COLS=16,ROWSB=1) + gemm + qwen35`), run the GEMM and `matvec_q4_coop_b` on the same weights with the engine's aligned strides, assert `relDiff < 5e-6` on all seven shapes. Add the missing case: **`gemm_red_s*_acc` into a pre-filled `y`**, compared against `matvec_q4_coop_b_acc` — the residual-accumulate path is load-bearing for `wo`, `wOut` and `ffn_down` and is the one branch not yet exercised.
 

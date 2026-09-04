@@ -1,6 +1,6 @@
 # SwarmLLM — the cross-network plan
 
-Implementation-ready design for (A) transport and telemetry, (B) lap overlap / speculative pipelining against the actual protocol, and (C) same-network placement for 2–6 devices. Everything is grounded in the code as it stands at `/home/nehanth/bello` (`room.js` 1179 lines, `engine/qwen35.js` 963 lines, `docs/protocol.md`, `docs/kernel-plan-3.md` §"Continuous Speculation"). Numbers that are not measured in-repo are marked **UNCERTAIN** and carry the instrumentation that closes them.
+Implementation-ready design for (A) transport and telemetry, (B) lap overlap / speculative pipelining against the actual protocol, and (C) same-network placement for 2–6 devices. Everything is grounded in the code as it stands at `bello` (`room.js` 1179 lines, `engine/qwen35.js` 963 lines, `docs/protocol.md`, `docs/kernel-plan-3.md` §"Continuous Speculation"). Numbers that are not measured in-repo are marked **UNCERTAIN** and carry the instrumentation that closes them.
 
 **Headline:** the overlap design in `kernel-plan-3` is sound and should ship, but it is *not* the first thing to build. Three days of transport and draft-cache work are modeled at 2.0–2.5× cross-internet; overlap adds a further 1.3–1.7× on top and costs weeks. Do them in that order, and let the telemetry from step 1 decide whether overlap is still worth the weeks.
 

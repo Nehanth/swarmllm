@@ -4,7 +4,7 @@ I have measured evidence. Writing the design now.
 
 # SwarmLLM: the 30 ms and the wire — implementation-ready design
 
-All numbers below marked **[M]** were measured this session on the GB10 (DGX Spark, Deno 2.9.5 / wgpu / Vulkan, GPU otherwise idle, Qwen 3.8 27B Q4_0, full 64 layers). Probe scripts are at `/tmp/claude-1000/-home-nehanth/2df9b1f2-d21a-4923-88fe-fb9684f1f115/scratchpad/{probe30.js,probe31.js,probe32.js,probe33.js,wire_err.js,wire_gate2.js}` and should be committed under `benchmarks/` before any of these numbers go in a paper. Numbers marked **[E]** are estimates. Numbers marked **UNCERTAIN** are not derivable from the repo or this session.
+All numbers below marked **[M]** were measured this session on the GB10 (DGX Spark, Deno 2.9.5 / wgpu / Vulkan, GPU otherwise idle, Qwen 3.8 27B Q4_0, full 64 layers). Probe scripts are at a scratch directory (not committed) and should be committed under `benchmarks/` before any of these numbers go in a paper. Numbers marked **[E]** are estimates. Numbers marked **UNCERTAIN** are not derivable from the repo or this session.
 
 ---
 
