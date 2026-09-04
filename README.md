@@ -8,6 +8,7 @@
   <a href="https://swarmllm.ai/room">Start a swarm</a> ·
   <a href="docs/architecture.md">Architecture</a> ·
   <a href="docs/bench-log.md">Benchmarks</a> ·
+  <a href="roadmap/">Roadmap</a> ·
   <a href="SECURITY.md">Threat model</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
@@ -94,6 +95,7 @@ index.html         landing page          p2p.html   the room's markup (served at
 tests/             GPU golden tests · unit/ (no GPU) · golden/ · reference/ · run.sh
 benchmarks/        tok/s harnesses, kernel-family profiler, GEMM prototype
 docs/              architecture · tech-stack · kernels (every trick, measured) · protocol · models · bench log · research
+roadmap/           one file per planned item with status, design and done-criteria
 ```
 
 ## Contributing
