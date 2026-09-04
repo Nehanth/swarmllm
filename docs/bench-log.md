@@ -1,8 +1,8 @@
 # Bench log
 
 Every kernel/engine change gets a row. All 27B numbers are Qwen 3.8 27B Q4_0,
-greedy, bit-identical output verified by the test suite (`test_mtp_deno.js`,
-`test_batch_*_deno.js`). GB10 = DGX Spark via Deno/wgpu (Vulkan, no subgroups,
+greedy, bit-identical output verified by the test suite (`tests/test_mtp.js`,
+`tests/test_batch*.js`). GB10 = DGX Spark via Deno/wgpu (Vulkan, no subgroups,
 shader-f16 available). Mac = user's MacBook, Chrome, staging site.
 
 | Date | Change | Commit | GB10 decode plain | GB10 decode spec K=3 | GB10 spec K=7 | GB10 prefill (batched) | Mac decode | Mac prefill | Notes |

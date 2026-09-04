@@ -1,0 +1,23 @@
+name: "Benchmark report"
+description: Share tok/s numbers from hardware we do not have. These feed docs/bench-log.md.
+labels: ["benchmark"]
+body:
+  - type: input
+    id: hw
+    attributes: { label: Hardware, placeholder: "MacBook Pro M4 Max 64 GB / RTX 4090 / Pixel 9" }
+    validations: { required: true }
+  - type: input
+    id: sw
+    attributes: { label: Browser or runtime and version }
+    validations: { required: true }
+  - type: input
+    id: commit
+    attributes: { label: Commit or site build, placeholder: "git sha, or 'swarmllm.ai on 2026-09-07'" }
+    validations: { required: true }
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Numbers
+      description: "Model, room size, same/different network, prefill tok/s, decode tok/s (plain and speculative if shown), and the breadcrumb line."
+      render: text
+    validations: { required: true }

@@ -1,0 +1,22 @@
+name: "Bug: a room does not connect or stalls"
+description: Devices fail to join, generation hangs, or a peer drops.
+labels: ["bug", "room"]
+body:
+  - type: input
+    id: url
+    attributes: { label: Site, placeholder: "swarmllm.ai or swarmllm-dev.vercel.app (staging)" }
+    validations: { required: true }
+  - type: textarea
+    id: devices
+    attributes: { label: Devices in the room, description: "One line per device: browser + version, OS, GPU/RAM, same Wi-Fi or different network, role (host/peer)." }
+    validations: { required: true }
+  - type: input
+    id: model
+    attributes: { label: Model chosen }
+  - type: textarea
+    id: what
+    attributes: { label: What happened, description: "Steps, what you expected, what you saw. Paste the status line and any breadcrumb (e.g. `spec: ... · lap ...ms`)." }
+    validations: { required: true }
+  - type: textarea
+    id: console
+    attributes: { label: Browser console output, render: text }

@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+title: "SwarmLLM: peer-to-peer LLM inference across browser tabs"
+message: "If you use SwarmLLM in your work, please cite it as below."
+type: software
+authors:
+  - family-names: Narendrula
+    given-names: Nehanth
+repository-code: "https://github.com/Nehanth/swarmllm"
+url: "https://swarmllm.ai"
+license: MIT
+date-released: 2026-09-07

@@ -1,3 +1,6 @@
+// GGUF loading: header and tensor parsing, tokenizer extraction, Q4_0/Q8_0
+// repacking into GPU-friendly layouts (packed nibbles + f16 scales), and
+// streaming upload straight into GPU buffers. See docs/models.md.
 // GGUF (v2/v3) parser + Q8_0 dequant. Shared by the CPU reference and the
 // WebGPU engine. Returns tensor byte ranges so browser peers can range-fetch
 // only their layers, same trick as the safetensors path.

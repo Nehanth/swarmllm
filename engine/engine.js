@@ -1,3 +1,6 @@
+// SwarmLLM engine core: base WGSL kernels, the cooperative-GEMV generator
+// (coopWGSL), the dense BelloEngine (Qwen3, SmolLM), device autotune and
+// self-tests. Runs in browsers (Chrome, Safari 26+) and Deno. See docs/kernels.md.
 // bello engine — WebGPU Llama-architecture inference, layer-shardable.
 import { quantizeQ8, f16ToF32, f32ToF16 } from "./gguf.js";
 // Runs identically in browsers and Deno. The golden reference is ref.js.

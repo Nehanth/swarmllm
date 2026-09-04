@@ -1,3 +1,6 @@
+// Qwen35Engine: the hybrid Gated-DeltaNet + attention engine (Qwen 3.5/3.6/3.8),
+// with batched prefill/verify paths and multi-token-prediction speculation.
+// See docs/architecture.md.
 // bello Qwen3.5/3.8 engine — hybrid Gated-DeltaNet + gated-attention WebGPU
 // inference, layer-shardable like BelloEngine. Golden reference: ref_q38.mjs
 // (validated line-by-line against llama.cpp eval-callback dumps).

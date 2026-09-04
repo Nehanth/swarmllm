@@ -1,0 +1,20 @@
+// two generations on one engine: after reset(), the second must equal a fresh engine's output
+import { Qwen35Engine } from "../engine/qwen35.js";
+import { parseGGUFHeader, qwen35Weights, tokenizerFromGGUF } from "../engine/gguf.js";
+import { makeTokenizer, argmax } from "../engine/engine.js";
+const path = "../models/q38/model.gguf";
+const fh = await Deno.open(path);
+const readAt = async (off, len) => { await fh.seek(off, Deno.SeekMode.Start); const out = new Uint8Array(len); let got = 0; while (got < len) { const n = await fh.read(out.subarray(got)); if (n === null) break; got += n; } return out; };
+const G = parseGGUFHeader((await readAt(0, 64 << 20)).buffer);
+const tok = makeTokenizer(tokenizerFromGGUF(G.meta));
+const adapter = await navigator.gpu.requestAdapter();
+const device = await adapter.requestDevice({ requiredLimits: { maxBufferSize: adapter.limits.maxBufferSize, maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize } });
+const L = 6;
+const weights = await qwen35Weights(G, (info) => readAt(info.byteOffset, info.byteLength), { lo: 0, hi: L, hasEmbed: true, hasHead: true });
+const eng = await Qwen35Engine.create({ device, meta: G.meta, weights, layerRange: [0, L], hasEmbed: true, hasHead: true, maxSeq: 64 });
+const run = async (text) => { const ids = tok.encode(text); let out = []; for (const id of ids) { const lg = await eng.forwardToken(id); out.push(argmax(lg)); } return out.join(","); };
+const a = await run("The capital of France is");
+await run("Completely different text to pollute the state, and more of it.");
+eng.reset();
+const b = await run("The capital of France is");
+console.log(a === b ? "RESET PASS ✓" : "RESET FAIL\n" + a + "\n" + b);

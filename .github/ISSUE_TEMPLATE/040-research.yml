@@ -1,0 +1,18 @@
+name: "Research / design proposal"
+description: A design note for a substantial change (protocol, new architecture, kernels that change output, security-relevant work).
+labels: ["research"]
+body:
+  - type: textarea
+    id: summary
+    attributes: { label: Summary, description: "What and why, in a paragraph." }
+    validations: { required: true }
+  - type: textarea
+    id: design
+    attributes: { label: Design, description: "Data flow, message or kernel changes, what stays bit-exact, expected gain and how it will be measured." }
+    validations: { required: true }
+  - type: textarea
+    id: alternatives
+    attributes: { label: Alternatives considered }
+  - type: textarea
+    id: refs
+    attributes: { label: References, description: "Papers, prior implementations, existing docs/ pages." }

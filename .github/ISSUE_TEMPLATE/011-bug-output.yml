@@ -1,0 +1,22 @@
+name: "Bug: wrong or garbled output"
+description: The model produces garbage, NaNs, or output that differs from a reference.
+labels: ["bug", "engine"]
+body:
+  - type: input
+    id: model
+    attributes: { label: Model and quantization, placeholder: "Qwen 3.8 27B Q4_0" }
+    validations: { required: true }
+  - type: input
+    id: hw
+    attributes: { label: Browser or runtime, OS, GPU, placeholder: "Chrome 140, macOS 26, M4 Pro" }
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes: { label: Prompt and output, description: "Exact prompt, what came out, and what a reference (llama.cpp, the golden tests) produces." }
+    validations: { required: true }
+  - type: checkboxes
+    id: tests
+    attributes:
+      label: Tests
+      options:
+        - label: I ran `npm run test:gpu` (or `test:q38`) and pasted the result below

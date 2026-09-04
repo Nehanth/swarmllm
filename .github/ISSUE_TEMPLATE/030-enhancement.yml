@@ -1,0 +1,17 @@
+name: "Enhancement"
+description: A feature request or improvement.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes: { label: Problem, description: "What is hard or impossible today?" }
+    validations: { required: true }
+  - type: textarea
+    id: proposal
+    attributes: { label: Proposal }
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This keeps the project's non-negotiables (zero install, no accounts/tokens/ads, honest claims, bit-exact output by default) — see GOVERNANCE.md

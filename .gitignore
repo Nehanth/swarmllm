@@ -12,3 +12,4 @@ engine/q38/
 .gstack/
 node_modules/
 local-server/
+models/
