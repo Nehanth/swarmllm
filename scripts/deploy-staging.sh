@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Deploy the working tree as a Vercel preview and point swarmllm-dev.vercel.app at it.
-# Production (swarmllm.ai) only changes via: npx vercel deploy --prod --yes  (from main)
+# Manual fallback only: Vercel's git integration now deploys every branch push automatically
+# (swarmllm-dev.vercel.app follows faster-kernels; main deploys production).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT=$(npx -y vercel deploy --yes 2>/dev/null)

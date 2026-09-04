@@ -6,5 +6,5 @@ See [AGENTS.md](AGENTS.md) for the full agent guide; the short version:
 - One GPU job at a time. Model files are in `models/`; GPU tests run from the `tests/` directory.
 - Performance changes add a row to `docs/bench-log.md` (hardware, commit, before/after, neutral results included).
 - Kernel rules: no dynamically indexed local arrays, barriers outside conditionals, f32 accumulation, 2-D dispatch for tall matvecs, feature-probe anything not in core WebGPU.
-- Never push to `main` or deploy production without being asked; staging is `scripts/deploy-staging.sh`.
+- Never push to `main` without being asked (it deploys production). Branch pushes get automatic preview URLs.
 - Commit author email must be the GitHub email or Vercel blocks the deploy.

@@ -44,7 +44,7 @@ To run the site locally, serve the repository root with any static server (`npx 
 
 **Commit messages**: imperative subject line under 72 characters, a body that says *why*, and the measured effect for performance work.
 
-**After submitting**: CI runs syntax checks and the unit tests. GPU tests run on the maintainer's hardware before merge; say which tests you ran locally and on what GPU.
+**After submitting**: CI runs syntax checks and the unit tests, and Vercel posts a preview URL for your branch on the PR (every branch gets `swarmllm-git-<branch>-nehanths-projects.vercel.app`). GPU tests run on the maintainer's hardware before merge; say which tests you ran locally and on what GPU. Merging to `main` deploys production.
 
 ## Coding guidelines
 
