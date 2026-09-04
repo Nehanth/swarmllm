@@ -23,7 +23,7 @@ export function quantizeQ4(data) {
   return { qs, scales };
 }
 const scOf = (q, b) => f16ToF32((q.scales[b >> 1] >>> ((b & 1) * 16)) & 0xFFFF);
-function dequantQ4(q, n) {
+export function dequantQ4(q, n) {
   const out = new Float32Array(n);
   for (let b = 0; b < n / 32; b++) for (let j = 0; j < 16; j++) {
     const byte = q.qs[b * 16 + j];
@@ -32,7 +32,7 @@ function dequantQ4(q, n) {
   }
   return out;
 }
-function dequantQ8(q, n) {
+export function dequantQ8(q, n) {
   const out = new Float32Array(n);
   for (let i = 0; i < n; i++) { const v = q.qs[i]; out[i] = scOf(q, (i / 32) | 0) * (v > 127 ? v - 256 : v); }
   return out;

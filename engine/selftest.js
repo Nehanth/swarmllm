@@ -1,6 +1,6 @@
 // GPU self-test and kernel micro-tests run at load to catch broken drivers early.
 import { DenseEngine } from "./dense.js";
-import { quantizeQ4 } from "./quant.js";
+import { quantizeQ4, dequantQ4, dequantQ8 } from "./quant.js";
 import { quantizeQ8 } from "./gguf.js";
 
 export async function gpuSelfTest(device) {
