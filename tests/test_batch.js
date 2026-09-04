@@ -1,6 +1,6 @@
 // Batched-prefill equivalence: prefillTokens(chunked 4) must leave the engine
 // in a state where the next forwardToken's logits match the all-sequential run.
-import { BelloEngine, makeTokenizer, argmax } from "../engine/engine.js";
+import { DenseEngine, makeTokenizer, argmax } from "../engine/engine.js";
 import { parseGGUFHeader, ggufWeights } from "../engine/gguf.js";
 const openFile = async (path) => {
   const fh = await Deno.open(path);
@@ -15,7 +15,7 @@ const tok = makeTokenizer(JSON.parse(await Deno.readTextFile("../models/qwen/tok
 const cfg = JSON.parse(await Deno.readTextFile("../models/qwen/config.json"));
 const mk = async () => {
   const weights = await ggufWeights(G, (i) => readAt(i.byteOffset, i.byteLength), { lo: 0, hi: cfg.num_hidden_layers, hasEmbed: true, hasHead: true });
-  return BelloEngine.create({ device, cfg, weights, layerRange: [0, cfg.num_hidden_layers], hasEmbed: true, hasHead: true, maxSeq: 128 });
+  return DenseEngine.create({ device, cfg, weights, layerRange: [0, cfg.num_hidden_layers], hasEmbed: true, hasHead: true, maxSeq: 128 });
 };
 const ids = tok.encode("The capital of France is Paris, and the capital of Germany is Berlin. The quick brown fox");
 console.log("prompt tokens:", ids.length);

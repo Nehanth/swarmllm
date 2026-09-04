@@ -1,7 +1,7 @@
 // SwarmLLM engine core: base WGSL kernels, the cooperative-GEMV generator
-// (coopWGSL), the dense BelloEngine (Qwen3, SmolLM), device autotune and
+// (coopWGSL), the dense DenseEngine (Qwen3, SmolLM), device autotune and
 // self-tests. Runs in browsers (Chrome, Safari 26+) and Deno. See docs/kernels.md.
-// bello engine — WebGPU Llama-architecture inference, layer-shardable.
+// DenseEngine: WebGPU inference for dense Llama-architecture models (Qwen3, SmolLM), layer-shardable.
 import { quantizeQ8, f16ToF32, f32ToF16 } from "./gguf.js";
 // Runs identically in browsers and Deno. The golden reference is ref.js.
 //
@@ -880,12 +880,12 @@ export function weightsFromSafetensors(tensors, { lo, hi, hasEmbed, hasHead }) {
 }
 
 // ---------- engine ----------
-export class BelloEngine {
+export class DenseEngine {
   // opts: { device, cfg, tensors?|weights?, layerRange, hasEmbed, hasHead, maxSeq }
   reset() { this.pos = 0; }   // fresh context; the KV cache is overwritten from position 0
 
   static async create(opts) {
-    const e = new BelloEngine();
+    const e = new DenseEngine();
     await e._init(opts);
     return e;
   }
@@ -1655,7 +1655,7 @@ export async function gpuSelfTest(device) {
     const ref = cpuForward(deq);
     let gpu = null, err = null;
     try {
-      const eng = await BelloEngine.create({ device, cfg, weights, maxSeq: 8 });
+      const eng = await DenseEngine.create({ device, cfg, weights, maxSeq: 8 });
       for (const id of ids) gpu = await eng.forwardToken(id);
     } catch (e) { err = e.message; }
     let maxDiff = Infinity, nan = false;
@@ -1691,7 +1691,7 @@ export async function kernelMicroTests(device) {
     inNorm: { kind: "f32", data: inNorm }, postNorm: { kind: "f32", data: postNorm },
     qNorm: { kind: "f32", data: qNorm }, kNorm: { kind: "f32", data: kNorm },
     q: Wq.entry, k: Wk.entry, v: Wv.entry, o: Wo.entry, gate: Wg.entry, up: Wu.entry, down: Wd.entry }] };
-  const eng = await BelloEngine.create({ device, cfg, weights, maxSeq: 8 });
+  const eng = await DenseEngine.create({ device, cfg, weights, maxSeq: 8 });
   const BG = eng.layerBGs[0];
   const stage = (n) => device.createBuffer({ size: n * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const run = (fn) => { const enc = device.createCommandEncoder(); const p = enc.beginComputePass(); fn(p); p.end(); device.queue.submit([enc.finish()]); };

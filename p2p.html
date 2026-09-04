@@ -385,7 +385,7 @@
 
 <div id="toasts"></div>
 <script type="module">
-import { autotuneCoop, makeTokenizer, BelloEngine, argmax, fetchModelShard, shardTensorNames, gpuSelfTest, kernelMicroTests }
+import { autotuneCoop, makeTokenizer, DenseEngine, argmax, fetchModelShard, shardTensorNames, gpuSelfTest, kernelMicroTests }
   from "./engine/engine.js";
 import { f32ToF16, f16ToF32, parseGGUFHeader, ggufWeights, ggufShardBytes, GGML_EMBED, GGML_OUTPUT, GGML_FINAL_NORM,
   ggmlLayerNames, qwen35Weights, qwen35ShardBytes, qwen35MtpBytes, qwen35LayerNames, tokenizerFromGGUF, gpuUploadEntry, streamEntryToGPU }
@@ -1153,7 +1153,7 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
     const weights = await ggufWeights(G, rangeBytesOf(M.gguf), opts, (done) => onProg(done, total),
       (e, name) => gpuUploadEntry(ai.device, e, name === GGML_EMBED));
     aiStatus("building GPU pipelines\u2026");
-    ai.engine = await BelloEngine.create({
+    ai.engine = await DenseEngine.create({
       coopWG: ai.tune?.wg, coopRows: ai.tune?.rows,
       device: ai.device, cfg: ai.cfg, weights,
       layerRange: range, hasEmbed, hasHead, maxSeq: MAX_SEQ,
@@ -1162,7 +1162,7 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
     const names = shardTensorNames(ai.cfg, range, hasEmbed, hasHead);
     const tensors = await fetchModelShard(M.st, names, (p, done, total) => onProg(done, total));
     aiStatus("building GPU pipelines\u2026");
-    ai.engine = await BelloEngine.create({
+    ai.engine = await DenseEngine.create({
       coopWG: ai.tune?.wg, coopRows: ai.tune?.rows,
       device: ai.device, cfg: ai.cfg, tensors,
       layerRange: range, hasEmbed, hasHead, maxSeq: MAX_SEQ,

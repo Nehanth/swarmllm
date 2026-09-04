@@ -1,4 +1,4 @@
-// bello engine — reference implementation (Node, CPU, fp32).
+// Reference implementation (Node, CPU, fp32).
 // Llama-architecture forward pass over safetensors weights. This is the golden
 // reference the WebGPU kernels must match, and the spec for the layer-split:
 // everything between `embed` and `head` is what gets sharded across peers.

@@ -1,6 +1,6 @@
 // Deno test: run the WebGPU engine against ref.js golden vectors.
 // usage: deno run --unstable-webgpu --allow-read test_deno.js
-import { parseSafetensors, makeTokenizer, BelloEngine, argmax } from "../engine/engine.js";
+import { parseSafetensors, makeTokenizer, DenseEngine, argmax } from "../engine/engine.js";
 
 const dir = new URL(".", import.meta.url).pathname;
 const cfg = JSON.parse(await Deno.readTextFile(dir + "../models/model/config.json"));
@@ -15,7 +15,7 @@ device.addEventListener?.("uncapturederror", (e) => console.error("GPU ERROR:", 
 
 console.log("building engine…");
 let t0 = performance.now();
-const eng = await BelloEngine.create({ device, cfg, tensors });
+const eng = await DenseEngine.create({ device, cfg, tensors });
 console.log(`engine ready in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
 
 // --- forward the golden prompt, capture per-layer hiddens on last token ---

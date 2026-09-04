@@ -2,7 +2,7 @@
 
 # Spec: feature-gated subgroup reduction for the coop Q4_0/Q8_0 GEMV family
 
-Status: implementation-ready. Everything below is derived from the verified findings and from the current generator (`/home/nehanth/bello/engine/engine.js` `coopWGSL` L411-826, `autotuneCoop` L1460-1511, pipeline table L900-921; `/home/nehanth/bello/engine/qwen35.js` L501, L610-624; `/home/nehanth/bello/p2p.html` L1052, L1078, L1141). Items marked UNCERTAIN are not backed by a verified finding and must be checked before relying on them.
+Status: implementation-ready. Everything below is derived from the verified findings and from the current generator (`engine/engine.js` `coopWGSL` L411-826, `autotuneCoop` L1460-1511, pipeline table L900-921; `engine/qwen35.js` L501, L610-624; `p2p.html` L1052, L1078, L1141). Items marked UNCERTAIN are not backed by a verified finding and must be checked before relying on them.
 
 ## 0. Expectations (so nobody builds this for the wrong reason)
 
@@ -501,7 +501,7 @@ this.sgSingle = coopVariant === "sgrow" ? "_sgrow" : this.sgSuffix;   // single-
 this.sgRow = sgRow;
 ```
 
-(For `BelloEngine`, `coopWGSL(coopWG, coopRows, 64, 4, coopRows, {...})`.)
+(For `DenseEngine`, `coopWGSL(coopWG, coopRows, 64, 4, coopRows, {...})`.)
 
 Pipeline table `G1` (engine.js:900-921, qwen35.js:509-530): add entries only when the entry points exist, otherwise `createComputePipelineAsync` fails on a missing entry point:
 
@@ -875,7 +875,7 @@ Only ops whose x is `xn`/`B.xn` resolve to `_h`: `mvQ/mvK/mvV`, `mvQKV/mvZ/mvBet
 
 Implement only if you want the autotune knob for non-NVIDIA devices; ship it default-off. Portable zero-gate alternative with identical measured performance and no `enable f16;` at all: keep xn as f32 and skip this entirely (variant C - u32 pairs + `unpack2x16float` - also measured at parity, so it buys nothing either). For GB10 tok/s, the measured order of levers is: (1) more weight bytes in flight per thread (2x-4x unrolled block loop, vec2/vec4<u32> weight loads; target 17408x5120 from ~120 to >=180 GB/s, worth ~+40% decode), (2) dispatch fusion against the ~0.05 ms x 640 per-token floor, (3) DP4a Q8_1 activations for the batched `_b`/`_gu_b` verify/prefill kernels, (4) f16/bf16 KV cache for the 16 attention layers at long context. f16 GEMV input is not on that list.
 
-Files referenced: `/home/nehanth/bello/engine/engine.js` (coopWGSL 411-826, module 890, autotune 1460), `/home/nehanth/bello/engine/qwen35.js` (rmsnorm_mc 190-211, module 501, mv/guOp 610-624, xn alloc 574, batched mvB 951, norm bind groups 974-981, dispatch sites 793/818/836/1065/1093/1106/1170/1196), `/home/nehanth/bello/p2p.html` (requestDevice 1052).
+Files referenced: `engine/engine.js` (coopWGSL 411-826, module 890, autotune 1460), `engine/qwen35.js` (rmsnorm_mc 190-211, module 501, mv/guOp 610-624, xn alloc 574, batched mvB 951, norm bind groups 974-981, dispatch sites 793/818/836/1065/1093/1106/1170/1196), `p2p.html` (requestDevice 1052).
 
 ---
 
@@ -1566,7 +1566,7 @@ Files touched: `engine/qwen35.js` (Sec 3), new `engine/specpipe.js` (Sec 5.1), `
 
 # Spec: 8-wide prefill (assessment + exact change) and 2-pass GPU argmax for the 248320-logit LM head
 
-Scope: Bello engine (`/home/nehanth/bello/engine/qwen35.js`, `engine.js`), Qwen3.8-27B Q4_0 on GB10 (Deno/wgpu/Vulkan) with Chrome + Safari 26 portability. Everything below is drawn from the verified findings and the engine code as it exists today; anything not directly measured is marked UNCERTAIN.
+Scope: SwarmLLM engine (`engine/qwen35.js`, `engine.js`), Qwen3.8-27B Q4_0 on GB10 (Deno/wgpu/Vulkan) with Chrome + Safari 26 portability. Everything below is drawn from the verified findings and the engine code as it exists today; anything not directly measured is marked UNCERTAIN.
 
 ---
 
@@ -1828,4 +1828,4 @@ async headArgmaxBatch(hs, n = hs ? hs.length / this.dims.dim : this.NC) {
 | 8/16-wide DP4a | Build, after dn_delta_mc register-resident rewrite; NC=8 default, NC=16 shape-dependent | measured ranges; prefill projection UNCERTAIN |
 | Argmax | Ship 2-pass kernel (B.3) + batched greedy head (B.4.5); keep single-WG kernel behind `ARGMAX2=0` | design verified; speed delta vs single-WG UNCERTAIN until benchmarked |
 
-Files touched: `/home/nehanth/bello/engine/qwen35.js` (WGSL2 string, `G1` table, `_init` head block, `_initBatch`, `_d2`, `mtpRun`, new `headArgmaxBatch`, `verifyN`), `/home/nehanth/bello/engine/engine.js` (`coopWGSL` DP4a variants, Part A only), `/home/nehanth/bello/engine/test_mtp_deno.js` (argmax cross-check).
+Files touched: `engine/qwen35.js` (WGSL2 string, `G1` table, `_init` head block, `_initBatch`, `_d2`, `mtpRun`, new `headArgmaxBatch`, `verifyN`), `engine/engine.js` (`coopWGSL` DP4a variants, Part A only), `engine/test_mtp_deno.js` (argmax cross-check).

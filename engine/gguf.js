@@ -155,7 +155,7 @@ export function q8Repack(info, bytes) {
   return { qs, scales };
 }
 
-// map ggml tensor names -> bello's internal names for llama/qwen-family models
+// map ggml tensor names -> the engine's internal names for llama/qwen-family models
 export function ggmlLayerNames(i) {
   const p = `blk.${i}.`;
   return {

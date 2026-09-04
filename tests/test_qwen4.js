@@ -1,5 +1,5 @@
 // Qwen3-0.6B Q8_0 on the WebGPU engine vs the CPU golden reference.
-import { makeTokenizer, BelloEngine, argmax } from "../engine/engine.js";
+import { makeTokenizer, DenseEngine, argmax } from "../engine/engine.js";
 import { parseGGUFHeader, ggufWeights } from "../engine/gguf.js";
 
 const dir = new URL(".", import.meta.url).pathname;
@@ -23,7 +23,7 @@ device.addEventListener?.("uncapturederror", (e) => console.error("GPU ERROR:", 
 const bytesOf = (info) => new Uint8Array(buf, info.byteOffset, info.byteLength);
 const L = cfg.num_hidden_layers;
 const weights = await ggufWeights(G, bytesOf, { lo: 0, hi: L, hasEmbed: true, hasHead: true });
-const eng = await BelloEngine.create({ device, cfg, weights });
+const eng = await DenseEngine.create({ device, cfg, weights });
 console.log("engine ready (q8)");
 
 let logits = null, capture = null;

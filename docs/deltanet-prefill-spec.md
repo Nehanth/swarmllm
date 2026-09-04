@@ -4,7 +4,7 @@
 
 ## 0. Premise and honest ceiling (verified)
 
-- `dn_delta_mc` (`/home/nehanth/bello/engine/qwen35.js:294-333`) is 48 WGs x 128 threads = 6144 threads (~8% occupancy on GB10), and does two global read-modify-write sweeps of S per token per column (4 x 64 KB per head-token, L2-resident, latency-bound).
+- `dn_delta_mc` (`engine/qwen35.js:294-333`) is 48 WGs x 128 threads = 6144 threads (~8% occupancy on GB10), and does two global read-modify-write sweeps of S per token per column (4 x 64 KB per head-token, L2-resident, latency-bound).
 - It is NOT what bounds prefill: matvec_*_b is ~91 ms of a 132.7 ms 4-col pass and ~170 ms of a ~222 ms 8-col pass; dn_delta_mc is 9.2 ms (4 col) / 14.1 ms (8 col) measured in isolation, 1.3 / 14.3 ms by skip-timing. Ceiling of this change end-to-end: ~4% of a prefill pass, ~2% of a decode token. Do it because it is ~100 lines, bit-identical (RG=1) or bit-close (RG=2), and gives 1.7-2.9x on the kernel itself; do not expect it to move tok/s much.
 
 ## 1. Design
@@ -89,7 +89,7 @@ fn ${name}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l
 }
 ```
 
-Expanded shape for RG=2: `workgroup_size(256)`, `var s: array<f32, 64>`, 64 load / 64 loop1 / 64 loop2 / 64 shadow / 64 store statements, `dlt2_pv`/`dlt2_pq` of 256 f32 each, three barriers per column. Full source used for the measurements below: `/tmp/claude-1000/-home-nehanth/2df9b1f2-d21a-4923-88fe-fb9684f1f115/scratchpad/verify_delta_tile.js` (also contains the shipped kernel verbatim as reference and the bit-compare).
+Expanded shape for RG=2: `workgroup_size(256)`, `var s: array<f32, 64>`, 64 load / 64 loop1 / 64 loop2 / 64 shadow / 64 store statements, `dlt2_pv`/`dlt2_pq` of 256 f32 each, three barriers per column. Full source used for the measurements below: `scratch/verify_delta_tile.js` (also contains the shipped kernel verbatim as reference and the bit-compare).
 
 ## 3. Integration (qwen35.js)
 
@@ -147,11 +147,11 @@ Numerics (nCols=8, snapshots on, S/out/all 8 shadow slots vs shipped kernel):
 - UNCERTAIN: bit-identity (RG=1) depends on both compilers making the same FMA-contraction choices for `a += b*c`; that is already the case for today's kernel across platforms, and the new kernel uses identical expression shapes.
 - Not covered: `dn_conv_mc` (still a serial column loop; separable per (channel, column) as verified, but out of scope here), `dn_pre_mc` (1.1-1.2 ms/pass, fine).
 
-Files: harness `/tmp/claude-1000/-home-nehanth/2df9b1f2-d21a-4923-88fe-fb9684f1f115/scratchpad/verify_delta_tile.js`; target `/home/nehanth/bello/engine/qwen35.js` (kernel 294-333, bind group 1076-1077, dispatch 1175, dims 545-554); device request `/home/nehanth/bello/p2p.html:1052` (unchanged for RG<=2).
+Files: harness `scratch/verify_delta_tile.js`; target `engine/qwen35.js` (kernel 294-333, bind group 1076-1077, dispatch 1175, dims 545-554); device request `p2p.html:1052` (unchanged for RG<=2).
 
 ---
 
-# Spec: Chunkwise-parallel Gated DeltaNet prefill (C = 4..16 tokens per pass) for the bello WebGPU engine
+# Spec: Chunkwise-parallel Gated DeltaNet prefill (C = 4..16 tokens per pass) for the SwarmLLM WebGPU engine
 
 Scope: replaces the token loop of `dn_delta_mc` (engine/qwen35.js:294-333, 48 WGs x 128 threads, S in a read_write storage buffer) with a single-dispatch chunk kernel. Everything else in the DeltaNet block (conv, L2 norm, beta/decay, gated RMSNorm) is per-token and stays. Only verified findings are used; items not established by measurement or source are marked UNCERTAIN.
 
@@ -401,7 +401,7 @@ End-to-end: an 8-col pass is 210-222 ms with matvec_b at ~170 ms; the recurrence
 ## 7. Implementation checklist / risks
 
 - Codegen: emit the kernel from a JS template per C with literal indices for every private-array access; verify no `local memory` spill by timing against the register-resident sequential (a 2x slowdown = spilled).
-- Limits: request `maxComputeWorkgroupStorageSize` (32768) and, for P>=4, `maxComputeInvocationsPerWorkgroup`/`maxComputeWorkgroupSizeX` in `requestDevice`; pick variant A/B/C=8 fallback from `device.limits` at pipeline creation. bello's requestDevice currently raises only buffer limits.
+- Limits: request `maxComputeWorkgroupStorageSize` (32768) and, for P>=4, `maxComputeInvocationsPerWorkgroup`/`maxComputeWorkgroupSizeX` in `requestDevice`; pick variant A/B/C=8 fallback from `device.limits` at pipeline creation. SwarmLLM's requestDevice currently raises only buffer limits.
 - Uniformity: remove the early return; guard nothing that precedes a barrier on `local_invocation_id`.
 - Pitch 129 for Ks/Qs; scale from the uniform; alpha from `dlm_decay`, not recomputed with exp().
 - Snapshots (S7) must be computed before S6 overwrites the S_0 registers; snapshot slot semantics (`frame.snap`, slot index per column) UNCERTAIN -- mirror the shipped kernel's stores exactly and verify with the shadow bit-compare harness.

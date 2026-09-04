@@ -2,7 +2,7 @@
 // each, hidden states hop between them — the exact protocol phase 2 runs over
 // WebRTC. Output must match the golden reference token-for-token.
 // usage: deno run --unstable-webgpu --allow-read test_split_deno.js
-import { parseSafetensors, makeTokenizer, BelloEngine, argmax } from "../engine/engine.js";
+import { parseSafetensors, makeTokenizer, DenseEngine, argmax } from "../engine/engine.js";
 
 const dir = new URL(".", import.meta.url).pathname;
 const cfg = JSON.parse(await Deno.readTextFile(dir + "../models/model/config.json"));
@@ -16,8 +16,8 @@ device.addEventListener?.("uncapturederror", (e) => console.error("GPU ERROR:", 
 
 const mid = Math.floor(cfg.num_hidden_layers / 2);
 console.log(`host: embed + layers [0,${mid}) + head · worker: layers [${mid},${cfg.num_hidden_layers})`);
-const host = await BelloEngine.create({ device, cfg, tensors, layerRange: [0, mid], hasEmbed: true, hasHead: true });
-const worker = await BelloEngine.create({ device, cfg, tensors, layerRange: [mid, cfg.num_hidden_layers], hasEmbed: false, hasHead: false });
+const host = await DenseEngine.create({ device, cfg, tensors, layerRange: [0, mid], hasEmbed: true, hasHead: true });
+const worker = await DenseEngine.create({ device, cfg, tensors, layerRange: [mid, cfg.num_hidden_layers], hasEmbed: false, hasHead: false });
 
 async function pipelineToken(id, pos) {
   const h1 = await host.embedRun(id, pos);       // "peer 1"

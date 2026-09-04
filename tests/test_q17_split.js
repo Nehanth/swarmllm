@@ -1,5 +1,5 @@
 // Reproduce the user's 2-Mac scenario: Qwen3-0.6B q8 GGUF split across two shards.
-import { makeTokenizer, BelloEngine, argmax } from "../engine/engine.js";
+import { makeTokenizer, DenseEngine, argmax } from "../engine/engine.js";
 import { parseGGUFHeader, ggufWeights } from "../engine/gguf.js";
 
 const dir = new URL(".", import.meta.url).pathname;
@@ -22,8 +22,8 @@ device.addEventListener?.("uncapturederror", (e) => console.error("GPU ERROR:", 
 const L = cfg.num_hidden_layers, mid = 14;
 const wHost = await ggufWeights(G, bytesOf, { lo: 0, hi: mid, hasEmbed: true, hasHead: true });
 const wWork = await ggufWeights(G, bytesOf, { lo: mid, hi: L, hasEmbed: false, hasHead: false });
-const host = await BelloEngine.create({ device, cfg, weights: wHost, layerRange: [0, mid], hasEmbed: true, hasHead: true });
-const work = await BelloEngine.create({ device, cfg, weights: wWork, layerRange: [mid, L], hasEmbed: false, hasHead: false });
+const host = await DenseEngine.create({ device, cfg, weights: wHost, layerRange: [0, mid], hasEmbed: true, hasHead: true });
+const work = await DenseEngine.create({ device, cfg, weights: wWork, layerRange: [mid, L], hasEmbed: false, hasHead: false });
 console.log("shards ready");
 
 let pos = 0;

@@ -1,6 +1,6 @@
 // Fetch ONLY layers [15,30) from HF via Range requests, run them as a worker
 // shard against locally-loaded host shard. Must match golden.
-import { parseSafetensors, makeTokenizer, BelloEngine, argmax, fetchModelShard, shardTensorNames } from "../engine/engine.js";
+import { parseSafetensors, makeTokenizer, DenseEngine, argmax, fetchModelShard, shardTensorNames } from "../engine/engine.js";
 const dir = new URL(".", import.meta.url).pathname;
 const cfg = JSON.parse(await Deno.readTextFile(dir + "../models/model/config.json"));
 const golden = JSON.parse(await Deno.readTextFile(dir + "./golden/golden.json"));
@@ -18,8 +18,8 @@ console.log(`fetched ${mb.toFixed(1)} MB in ${((performance.now() - t0) / 1000).
 const localTensors = parseSafetensors((await Deno.readFile(dir + "../models/model/model.safetensors")).buffer);
 const adapter = await navigator.gpu.requestAdapter();
 const device = await adapter.requestDevice();
-const host = await BelloEngine.create({ device, cfg, tensors: localTensors, layerRange: [0, mid] });
-const worker = await BelloEngine.create({ device, cfg, tensors: remoteTensors, layerRange: [mid, L], hasEmbed: false, hasHead: false });
+const host = await DenseEngine.create({ device, cfg, tensors: localTensors, layerRange: [0, mid] });
+const worker = await DenseEngine.create({ device, cfg, tensors: remoteTensors, layerRange: [mid, L], hasEmbed: false, hasHead: false });
 
 let pos = 0, logits = null;
 const pipe = async (id) => {

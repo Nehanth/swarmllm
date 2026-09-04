@@ -7,8 +7,8 @@ SwarmLLM ships no weights. Browsers fetch tensors by HTTP range request from pub
 | Model | File | Engine | Notes |
 |---|---|---|---|
 | Qwen 3.8 27B | GGUF Q4_0 (~15 GB), includes the `nextn` draft layer | `Qwen35Engine` | 64 layers: 48 Gated DeltaNet + 16 attention; MTP speculation |
-| Qwen3 4B / 1.7B / 0.6B | GGUF Q4_0 / Q8_0 | `BelloEngine` | dense; 0.6B is the golden-test model |
-| SmolLM2 135M | safetensors f32 | `BelloEngine` | smallest demo; quantized to Q8 at load |
+| Qwen3 4B / 1.7B / 0.6B | GGUF Q4_0 / Q8_0 | `DenseEngine` | dense; 0.6B is the golden-test model |
+| SmolLM2 135M | safetensors f32 | `DenseEngine` | smallest demo; quantized to Q8 at load |
 
 Architectures sharing Qwen 3.5/3.6/3.8's hybrid layout (e.g. Qwen 3.5 2B/9B) need only a config entry; see `p2p.html` `MODELS`.
 

@@ -5,7 +5,7 @@
 //   MODEL=qwen|q38     (default qwen: 0.6B Q8_0; q38: 27B Q4_0, full 64 layers)
 //   TOKENS=<n>         decode tokens to time (default 32)
 //   VARIANT=coop|legacy  matvec kernel variant (default coop once it exists)
-import { BelloEngine, makeTokenizer, argmax } from "../engine/engine.js";
+import { DenseEngine, makeTokenizer, argmax } from "../engine/engine.js";
 import { Qwen35Engine } from "../engine/qwen35.js";
 import { parseGGUFHeader, ggufWeights, qwen35Weights, tokenizerFromGGUF } from "../engine/gguf.js";
 
@@ -51,7 +51,7 @@ if (MODEL === "q38") {
   const L = cfg.num_hidden_layers;
   const weights = await ggufWeights(G, (i) => readAt(i.byteOffset, i.byteLength),
     { lo: 0, hi: L, hasEmbed: true, hasHead: true });
-  eng = await BelloEngine.create({ device, cfg, weights, layerRange: [0, L],
+  eng = await DenseEngine.create({ device, cfg, weights, layerRange: [0, L],
     hasEmbed: true, hasHead: true, maxSeq: 512, matvecVariant: VARIANT, coopWG: WG, coopRows: ROWS });
 }
 console.log(`load: ${((performance.now() - t0) / 1000).toFixed(1)}s  model=${MODEL} variant=${VARIANT}`);
