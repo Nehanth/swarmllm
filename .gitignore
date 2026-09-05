@@ -14,3 +14,4 @@ node_modules/
 local-server/
 models/
 presentation/
+.claude/
