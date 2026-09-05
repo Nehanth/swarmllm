@@ -10,6 +10,12 @@ import { WIRE_F16, badF32, f32ToB64, packF16, unpackF16, asU16, packWire, unpack
 import { esc, md } from "./room/markdown.js";
 import { aiSample } from "./room/sampling.js";
 import { MODELS, NEED_GB, MAX_SEQ } from "./room/models.js";
+import { makeLink, attachWire, wireReady, sendFrame } from "./room/transport.js";
+
+// Hidden-state transport (room/transport.js). ?wire=off falls back to PeerJS messages;
+// ?wire=slice uses one sliced channel; ?wire=stripeN spreads slices over N peer connections.
+const WIRE = (new URLSearchParams(location.search).get("wire") || "stripe4").toLowerCase();
+const WIRE_STRIPES = WIRE === "off" ? 0 : WIRE.startsWith("stripe") ? Math.max(1, Math.min(8, parseInt(WIRE.slice(6), 10) || 1)) : 1;
 
 const $ = (id) => document.getElementById(id);
 function toast(text) {
@@ -182,9 +188,20 @@ function enterRoom() {
 }
 
 // --- connection wiring ---
-function wire(conn, name, meta) {
-  const entry = { conn, name: name || conn.peer, meta: meta || {}, rtt: null, card: null };
+function wire(conn, name, meta, initiator = false) {
+  const entry = { conn, name: name || conn.peer, meta: meta || {}, rtt: null, card: null, link: makeLink(), stripes: [] };
   conns.set(conn.peer, entry);
+  if (WIRE_STRIPES > 0) {
+    attachWire(entry.link, conn, (m) => onData(conn.peer, m));
+    // extra associations for striping: the side that dialed opens them, the other side accepts
+    // them in peer.on("connection") by label and attaches its end of the wire channel
+    if (initiator) for (let i = 1; i < WIRE_STRIPES; i++) {
+      const sc = peer.connect(conn.peer, { reliable: true, label: "stripe" });
+      sc.on("open", () => { attachWire(entry.link, sc, (m) => onData(conn.peer, m)); });
+      sc.on("error", () => {});
+      entry.stripes.push(sc);
+    }
+  }
 
   conn.on("data", (d) => onData(conn.peer, d));
   conn.on("close", () => {
@@ -211,6 +228,14 @@ function ensureCard(id) {
 }
 
 function sendTo(id, obj) { conns.get(id)?.conn.send(obj); }
+// debug: per-peer wire state (channels open, frames sent/received) — `swarmDebug()` in the console
+window.swarmDebug = () => [...conns].map(([id, e]) => ({ id, name: e.name, chans: e.link?.chans.filter((c) => c.readyState === "open").length ?? 0, sent: e.link?.sent ?? 0, recv: e.link?.recv ?? 0 }));
+// activations go over the sliced wire channel when it is up, else as a normal message
+function sendHidden(id, msg) {
+  const e = conns.get(id);
+  if (e?.link && wireReady(e.link) && sendFrame(e.link, msg)) return;
+  sendTo(id, msg);
+}
 function broadcastAll(obj) { for (const [id] of conns) sendTo(id, obj); }
 
 // bandwidth test state
@@ -287,7 +312,7 @@ function broadcastRoster() {
 function meshConnect(targetId) {
   const conn = peer.connect(targetId, { reliable: true });
   conn.on("open", () => {
-    wire(conn);
+    wire(conn, undefined, undefined, true);
     conn.send({ t: "hello", name: myName, meta: myMeta });
   });
 }
@@ -356,7 +381,7 @@ async function start(create) {
     }, 15000);
     conn.on("open", () => {
       clearTimeout(timeout);
-      wire(conn, "host");
+      wire(conn, "host", undefined, true);
       let died = null;
       try { const c = JSON.parse(localStorage.getItem("swarm-crumb") || "null"); if (c && Date.now() - c.t < 10 * 60 * 1000) died = { during: c.s, ago: Math.round((Date.now() - c.t) / 1000) }; } catch {}
       conn.send({ t: "hello", name: myName, meta: myMeta, died });
@@ -366,6 +391,11 @@ async function start(create) {
 
   peer.on("connection", (conn) => {
     conn.on("open", () => {
+      if (conn.label === "stripe") {   // extra association for the hidden-state wire, not a new peer
+        const e = conns.get(conn.peer);
+        if (e) { attachWire(e.link, conn, (m) => onData(conn.peer, m)); e.stripes.push(conn); }
+        return;
+      }
       wire(conn);
       conn.send({ t: "hello", name: myName, meta: myMeta });
     });
@@ -866,7 +896,7 @@ async function aiPipeToken(id, needLogits = true) {
       ai.waiters.set(pos, res);
       setTimeout(() => { ai.waiters.delete(pos); rej(new Error("pipeline timeout (peer gone?)")); }, 30000);
     });
-    sendTo(ai.chain[0], { t: "ai-hidden", pos, ...packWire(h) });
+    sendHidden(ai.chain[0], { t: "ai-hidden", pos, ...packWire(h) });
     h = await returned;
     if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos}) — check peer status lines`);
     ai.lastHidden = h;
@@ -935,7 +965,7 @@ async function aiGenerate(textArg, who) {
             ai.waiters.set("b" + basePos, res);
             setTimeout(() => { ai.waiters.delete("b" + basePos); rej(new Error("pipeline timeout (batch prefill)")); }, 90000);
           });
-          sendTo(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * NCW, ...packWire(hb) });
+          sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * NCW, ...packWire(hb) });
           await returned;
         }
         ai.pos = basePos + nChunks * NCW;
@@ -973,7 +1003,7 @@ async function aiGenerate(textArg, who) {
             ai.waiters.set("b" + pos, res);
             setTimeout(() => { ai.waiters.delete("b" + pos); rej(new Error("pipeline timeout (verify)")); }, 90000);
           });
-          sendTo(ai.chain[0], { t: "ai-hidden-b", basePos: pos, n: tokens.length, spec: 1, ...packWire(hb) });
+          sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos: pos, n: tokens.length, spec: 1, ...packWire(hb) });
           const h = await returned;
           if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos})`);
           const dt = performance.now() - tLap;
@@ -1106,8 +1136,8 @@ async function aiOnData(from, d) {
       }
       if (badF32(hb)) { aiStatus(`\u26a0 NaN in batched prefill on this device`); sendTo(ai.hostId, { t: "ai-error", message: "NaN in batched prefill" }); }
       const bmsg = { basePos: d.basePos, n: nTok, ...packWire(hb) };
-      if (ai.next === "host") sendTo(ai.hostId, { t: "ai-hiddenret-b", ...bmsg });
-      else sendTo(ai.next, { t: "ai-hidden-b", ...bmsg });
+      if (ai.next === "host") sendHidden(ai.hostId, { t: "ai-hiddenret-b", ...bmsg });
+      else sendHidden(ai.next, { t: "ai-hidden-b", ...bmsg });
       break;
     }
     case "ai-rollback": {
@@ -1128,8 +1158,8 @@ async function aiOnData(from, d) {
       const h = await ai.engine.runHidden(hin, d.pos);
       if (badF32(h)) { aiStatus(`\u26a0 NaN PRODUCED by this device (pos ${d.pos}, layers ${ai.range[0]}\u2013${ai.range[1] - 1}) — GPU kernel issue here`); sendTo(ai.hostId, { t: "ai-error", message: `NaN produced on worker layers ${ai.range[0]}\u2013${ai.range[1] - 1}` }); }
       const msg = { pos: d.pos, ...packWire(h) };
-      if (ai.next === "host") sendTo(ai.hostId, { t: "ai-hiddenret", ...msg });
-      else sendTo(ai.next, { t: "ai-hidden", ...msg });
+      if (ai.next === "host") sendHidden(ai.hostId, { t: "ai-hiddenret", ...msg });
+      else sendHidden(ai.next, { t: "ai-hidden", ...msg });
       if (d.pos % 8 === 0) aiStatus(`serving layers ${ai.range[0]}–${ai.range[1] - 1} — pos ${d.pos}`);
       break;
     }

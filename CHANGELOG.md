@@ -5,6 +5,7 @@ All notable changes to SwarmLLM. Format follows [Keep a Changelog](https://keepa
 ## [Unreleased]
 
 ### Added
+- Hidden-state wire (`room/transport.js`): activations travel on a dedicated data channel as ≤4.6 KB slices, striped over several peer connections (`?wire=stripeN`, default 4; `?wire=off` to disable). On a 100 ms link a token's hidden state now crosses a hop in 51 ms instead of 152, and a depth-5 verify block in 52 ms instead of 355 (docs/bench-log.md, transport section). Bytes only, output unchanged.
 - Multi-token-prediction speculative decoding using the model's built-in draft layer; output is bit-identical to plain decoding. Solo host and device chains.
 - Adaptive draft depth (3/5/7) chosen by measured tokens per second; 8 batch columns so a depth-5 verify is a single pass.
 - Batched prefill: 4 (now up to 8) tokens per GPU pass, 16 tokens per network round.
