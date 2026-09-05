@@ -44,3 +44,26 @@ One row per merged PR that changes speed, measured in the room on real devices, 
 | Date | PR | Devices | Prompt | Prefill before → after | Decode before → after | Notes |
 |---|---|---|---|---|---|---|
 | Sep 4 | #29 prefill GEMM | MacBook (Chrome, Metal) 62 layers + embed/head, iPhone 2 layers | `japan` | 13.8 s → **8.5 s** (1.62×) | 7.3 → 7.7 tok/s (unchanged, within noise) | first answer in each room; both runs hit the 512-token context overflow (#31) after ~300 generated tokens, which does not affect the prefill number |
+
+## Hidden-state transport (data channel)
+
+Measured 2026-09-04 on the GB10: two headless Chromium 131 tabs on one machine, loopback shaped with netem to a 100 ms round trip (50 ms each way), one-way delay of one message, p50 over 10 samples, 1 s apart, RTCDataChannel ordered+reliable unless noted. Harness: two RTCPeerConnections over host candidates, sender stamps `performance.timeOrigin + now` in a 16-byte header.
+
+| message | what it is | plain, one send | sliced ≤4.6 KB sends | striped over 5 associations |
+|---|---|---|---|---|
+| 1 KB | token id, ping | 51 ms | 51 | 52 |
+| 5 KB | | 153 | 51 | 51 |
+| 10 KB | one token's hidden state (5120 × f16) | 152 | 51 | 52 |
+| 20 KB | | 254 | 52 (p90 152) | 52 |
+| 30 KB | K=3 verify block | 255 | 52 (p90 155) | 51 |
+| 50 KB | K=5 verify block | 355 | 152 | 52 (p90 153) |
+| 70 KB | K=7 verify block | 458 | 152 | 52 (p90 153) |
+| 164 KB | 16-token prefill chunk | 562 (p90 664) | 153 | — |
+
+Reading: 51 ms is the physical one-way time. On a plain channel every ~4 packets beyond the first burst cost one more round trip (dcSCTP `max_burst` 4, initial cwnd 10 MTU): a single token paid 1.5 round trips per hop, a K=5 verify block 3.5, a K=7 block 4.5, a prefill chunk 5.5. Slicing every send under four packets removes the burst penalty and fixes everything up to ~30 KB; blocks above the initial window still pay one round trip on one association, and striping over five associations removes that too.
+
+With 1 % packet loss on the same link (12 samples): plain 10 KB p50 153 / p90 356 ms, plain 164 KB p50 1373 / p90 1979 ms; sliced 10 KB p50 152 / p90 253, sliced 70 KB p50 359 / p90 771. Loss recovery costs a round trip per event on a reliable channel, so forward error correction on an unordered channel is the next lever (issue #34, step 3).
+
+Room change: `room/transport.js`, a negotiated data channel per peer link that PeerJS never sees, slicing at 4,600 bytes and round-robin over `?wire=stripeN` associations (default `stripe4`); `?wire=off` restores PeerJS messages. Exact by construction: bytes only. Unit test `tests/unit/transport_test.js` (byte-exact reassembly under reordering and duplicates).
+
+End-to-end on the GB10 (two headless Chromium tabs, real PeerJS signaling and WebRTC on loopback, Qwen3 0.6B Q8 split 18+10 layers): `?wire=off` 41.4 / 42.9 tok/s, `?wire=stripe4` 53.5 / 52.0 tok/s, 4 channels open per link, 127 frames sent = 127 received each way, no console errors. The loopback gain is the PeerJS serializer and its 16 KB chunking leaving the path; the round-trip gain needs a real network and is the table above.
