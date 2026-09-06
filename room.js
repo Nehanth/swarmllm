@@ -9,7 +9,7 @@ import { Qwen35Engine } from "./engine/qwen35.js";
 import { WIRE_F16, badF32, f32ToB64, packF16, unpackF16, asU16, packWire, unpackWire, asF32, b64ToF32 } from "./room/wire.js";
 import { esc, md } from "./room/markdown.js";
 import { aiSample } from "./room/sampling.js";
-import { MODELS, NEED_GB, MAX_SEQ } from "./room/models.js";
+import { MODELS, NEED_GB, MAX_SEQ, MAX_NEW, MIN_ROOM } from "./room/models.js";
 
 const $ = (id) => document.getElementById(id);
 function toast(text) {
@@ -906,6 +906,11 @@ async function aiGenerate(textArg, who) {
   aiStatus(`prefill: ${ids.length} tokens…`);
 
   try {
+    // the prompt must fit the context with room for an answer; never silently truncate
+    if (ids.length > MAX_SEQ - MIN_ROOM)
+      throw new Error(`prompt is ${ids.length} tokens; this room's context is ${MAX_SEQ} tokens and an answer needs at least ${MIN_ROOM}. Shorten the prompt.`);
+    const maxNew = Math.min(MAX_NEW, MAX_SEQ - ids.length);   // answer cap for this prompt
+    let capped = false;   // set when generation stops because the context filled up
     let logits = null;
     const tPre = performance.now();
     if (!ai.chain.length && ai.engine.prefillTokens && ids.length > 1) {
@@ -1002,32 +1007,41 @@ async function aiGenerate(textArg, who) {
         return best;
       };
       let next = aiSample(logits), done = false;
-      while (!done && count < 400) {
-        const K = pickK(), tStep = performance.now();
+      while (!done && count < maxNew) {
+        // a speculative step touches positions pos .. pos+K (K drafts verified in one pass) and
+        // drafts one more; shrink K near the end of the context and stop before it overflows
+        let K = pickK();
+        const roomLeft = MAX_SEQ - ai.engine.pos - 2;
+        if (roomLeft < 1) { capped = true; break; }
+        K = Math.min(K, roomLeft, maxNew - count + 1);
+        const tStep = performance.now();
         const toks = await ai.engine.specStep(next, aiSample, K, spec);
         const tps = toks.length / ((performance.now() - tStep) / 1000);
         kc.ema[K] = kc.n[K] ? 0.6 * kc.ema[K] + 0.4 * tps : tps;
         kc.n[K] = (kc.n[K] || 0) + 1; kc.used[K] = (kc.used[K] || 0) + toks.length;
         for (const tk of toks) {
           if (tk === imEnd || tk === eot) { done = true; break; }
+          if (count >= maxNew) { done = true; capped = maxNew < MAX_NEW; break; }
           emit(tk);
         }
         next = toks[toks.length - 1];
       }
+      if (!done && count >= maxNew) capped = maxNew < MAX_NEW;
       ai.pos = ai.engine.pos;
       const st = ai.engine.mtp.stats;
       if (st.drafts) crumb(`spec: ${st.accepted}/${st.drafts} drafts accepted${ai.lapMs ? ` · lap ${Math.round(ai.lapMs)}ms` : ""}`
         + (ai.chain.length ? ` · K tok/s ${kc.cand.map((k) => `${k}:${kc.ema[k] ? kc.ema[k].toFixed(1) : "-"}`).join(" ")} · tokens by K ${JSON.stringify(kc.used)}` : ""));
     } else {
-      for (let i = 0; i < 400; i++) {
+      for (let i = 0; i < maxNew; i++) {
         const next = aiSample(logits);
         if (next === imEnd || next === eot) { await aiPipeToken(next, false); break; }
         emit(next);
+        if (ai.pos >= MAX_SEQ - 1) { capped = true; break; }   // no position left for another token
         logits = await aiPipeToken(next);
       }
     }
     const secs = (performance.now() - t0) / 1000;
-    const stats = `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices`;
+    const stats = `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices${capped ? ` · stopped: context full (${MAX_SEQ} tokens)` : ""}`;
     chatBotEnd(reply, stats);
     broadcastAll({ t: "ai-gendone", stats });
     mascot("Done. Anyone in the room can ask the next one.");
