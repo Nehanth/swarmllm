@@ -20,6 +20,7 @@ All notable changes to SwarmLLM. Format follows [Keep a Changelog](https://keepa
 - f16 block scales end to end; `unpack4x` dequantization with runtime probe.
 
 ### Fixed
+- Generation no longer runs past the context window (#31): the room stops before the KV cache would overflow and says "stopped: context full", refuses prompts that leave no room for an answer, and the context is 2048 tokens (was 512). Cache size does not change logits (`tests/test_ctx.js`, bit-identical).
 - **`f32ToF16` dropped the rounding carry**, silently halving ~0.03% of all values (e.g. -1.9999911 to -1.0): about 1.4 corrupted numbers per 5,120-float activation frame on every hop of a split room, plus occasional halved Q4/Q8 block scales. The carry now propagates into the exponent; all 65,536 representable f16 values round-trip exactly.
 - Tall matvec dispatches over 65,535 workgroups (the LM head at 2 rows per workgroup) were silently dropped; all matvecs now dispatch in 2-D.
 - Draft depth selection by lap time could lock a Mac-hosted room at maximum depth (1.5 tok/s); replaced by throughput-based selection.

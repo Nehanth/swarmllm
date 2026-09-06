@@ -23,4 +23,9 @@ export const MODELS = {
     tok: "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/tokenizer.json" },
 };
 
-export const MAX_SEQ = 512;
+// Context window per room, in tokens: prompt + answer. Each full-attention layer keeps K and V
+// for this many positions (4 KB per position each for the 27B, so 16 MiB per attention layer at
+// 2048); the kernels only use it as a stride. Generation stops before the cache would overflow.
+export const MAX_SEQ = 2048;
+export const MAX_NEW = 400;    // longest answer, tokens
+export const MIN_ROOM = 32;    // a prompt must leave at least this many tokens for the answer
