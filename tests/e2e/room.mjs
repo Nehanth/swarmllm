@@ -6,6 +6,8 @@
 //   npm run e2e -- --wire off              old PeerJS message path
 //   npm run e2e -- --model qwen3-1.7b --prompt "..." --rounds 3
 //   npm run e2e -- --phone --model qwen3.8-27b   27B from models/q38/model.gguf, pledges 14+2+0.5 GB
+//   npm run e2e -- --devices 16 --phones 8 --model qwen3.8-27b   16 tabs, half phone-shaped, 1 GB / 0.5 GB pledges
+//   Signaling runs on a local PeerServer (node_modules/.bin/peerjs) unless --signal cloud.
 //
 // The phone tab gets a mobile user agent (the room then treats it as a phone: 0.5 GB pledge,
 // 256 MB buffer cap, no weight cache) and a 4x CPU throttle. Needs `npm install` (playwright)
@@ -19,9 +21,18 @@ const arg = (k, d) => { const i = process.argv.indexOf("--" + k); return i > 0 ?
 const flag = (k) => process.argv.includes("--" + k);
 const WIRE = arg("wire", "stripe4"), MODEL = arg("model", "qwen3-0.6b"), ROUNDS = +arg("rounds", 2);
 const PROMPT = arg("prompt", "Write three sentences about the ocean.");
-const PHONE = flag("phone"), PORT = +arg("port", 8123);
+const PORT = +arg("port", 8123);
+// --devices N: total tabs including the host; --phones K: how many of the joiners are phone-shaped
+const DEVICES = Math.max(2, +arg("devices", flag("phone") ? 3 : 2));
+const PHONES = Math.min(DEVICES - 1, +arg("phones", flag("phone") ? 1 : 0));
+const PHONE = PHONES > 0;
+// signaling: our own PeerServer on this machine (default), or the public PeerJS cloud with --signal cloud
+const SIGNAL_PORT = +arg("signal-port", 9000);
+const CLOUD = arg("signal", "local") === "cloud";
 // pledges in GB: host,worker,phone. The 27B needs 16.5 GB in the room.
-const PLEDGES = (arg("pledges", MODEL === "qwen3.8-27b" ? "14,2,0.5" : "2,1,0.5")).split(",");
+// host pledge: whatever the joiners (1 GB desktop, 0.5 GB phone) leave of the model's need, at least 2 GB
+const NEED = { "qwen3.8-27b": 16.5, "qwen3-4b": 4.6, "qwen3-1.7b": 2.0, "qwen3-0.6b": 0.8 }[MODEL] || 2;
+const HOST_GB = arg("host-gb", String(Math.max(2, Math.ceil(NEED + 0.5 - (DEVICES - 1 - PHONES) * 1 - PHONES * 0.5))));
 // GGUF files already on this machine stand in for Hugging Face (Range requests served from disk)
 const LOCAL = { "Qwen3.8-27B-Q4_0.gguf": "models/q38/model.gguf", "Qwen3-0.6B-Q8_0.gguf": "models/qwen/model.gguf", "Qwen3-1.7B-Q8_0.gguf": "models/qwen17/model.gguf" };
 const ROOT = path.resolve(new URL(".", import.meta.url).pathname, "../..");
@@ -33,7 +44,13 @@ const srv = http.createServer((q, r) => {
   if (!p.startsWith(ROOT) || !fs.existsSync(p) || fs.statSync(p).isDirectory()) { r.statusCode = 404; r.end(); return; }
   r.setHeader("content-type", MIME[path.extname(p)] || "application/octet-stream"); fs.createReadStream(p).pipe(r);
 }).listen(PORT, "127.0.0.1");
-const BASE = `http://127.0.0.1:${PORT}/p2p.html?wire=${WIRE}`;
+const BASE = `http://127.0.0.1:${PORT}/p2p.html?wire=${WIRE}` + (CLOUD ? "" : `&signal=127.0.0.1:${SIGNAL_PORT}`);
+import { spawn } from "child_process";
+let peerServer = null;
+if (!CLOUD) {
+  peerServer = spawn(path.join(ROOT, "node_modules/.bin/peerjs"), ["--port", String(SIGNAL_PORT), "--path", "/"], { stdio: "ignore" });
+  await new Promise((r) => setTimeout(r, 1500));
+}
 
 const args = ["--no-sandbox", "--headless=new", "--enable-unsafe-webgpu", "--use-gl=angle", "--use-angle=gl-egl", "--enable-features=Vulkan", "--ignore-gpu-blocklist", "--allow-loopback-in-peer-connection"];
 const browser = await chromium.launch({ headless: false, args });
@@ -66,13 +83,17 @@ async function localWeights(context) {
 }
 const ctx = await browser.newContext({ userAgent: UA_DESKTOP, ignoreHTTPSErrors: true });
 if (!flag("no-local-weights")) await localWeights(ctx);
-const tabs = { host: await ctx.newPage(), worker: await ctx.newPage() };
+const tabs = { host: await ctx.newPage() };
+const nDesk = DEVICES - 1 - PHONES;
+for (let i = 0; i < nDesk; i++) tabs[nDesk === 1 ? "worker" : "worker" + (i + 1)] = await ctx.newPage();
 if (PHONE) {
   const pctx = await browser.newContext({ userAgent: UA_PHONE, viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, ignoreHTTPSErrors: true });
   if (!flag("no-local-weights")) await localWeights(pctx);
-  tabs.phone = await pctx.newPage();
-  const cdp = await pctx.newCDPSession(tabs.phone);
-  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
+  for (let i = 0; i < PHONES; i++) {
+    const pg = await pctx.newPage(); tabs[PHONES === 1 ? "phone" : "phone" + (i + 1)] = pg;
+    const cdp = await pctx.newCDPSession(pg);
+    await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
+  }
 }
 const errs = Object.fromEntries(Object.keys(tabs).map((k) => [k, []]));
 for (const [name, p] of Object.entries(tabs)) {
@@ -86,23 +107,25 @@ const status = (p) => p.evaluate(() => [document.getElementById("ai-status").tex
 try {
   for (const p of Object.values(tabs)) await p.goto(BASE);
   for (const p of Object.values(tabs)) await p.waitForFunction(() => document.getElementById("join-gb").value !== "", null, { timeout: 60000 });
-  const pledges = { host: PLEDGES[0], worker: PLEDGES[1], phone: PLEDGES[2] };
-  for (const [name, p] of Object.entries(tabs)) { await p.fill("#name-input", name + "-e2e"); await p.fill("#join-gb", pledges[name]); }
-  if (PHONE) log("phone tab reports:", await tabs.phone.evaluate(() => navigator.userAgent.includes("iPhone") ? "iPhone UA, phone rules apply" : "not a phone"));
+  for (const [name, p] of Object.entries(tabs)) { await p.fill("#name-input", name + "-e2e"); await p.fill("#join-gb", name === "host" ? HOST_GB : name.startsWith("phone") ? "0.5" : "1"); }
+  if (PHONE) log("phone tabs:", PHONES, "iPhone UA:", await Object.values(tabs).filter((_, i) => i === Object.keys(tabs).findIndex((k) => k.startsWith("phone")))[0].evaluate(() => navigator.userAgent.includes("iPhone")));
   await tabs.host.click("#create-btn");
   await tabs.host.waitForFunction(() => /[A-Z0-9]{4}/.test(document.getElementById("side-code").textContent), null, { timeout: 30000 });
   const code = (await tabs.host.textContent("#side-code")).trim().match(/[A-Z0-9]{4}/)[0];
   log("room", code);
-  for (const name of Object.keys(tabs).filter((k) => k !== "host")) { await tabs[name].fill("#code-input", code); await tabs[name].click("#join-btn"); }
+  for (const name of Object.keys(tabs).filter((k) => k !== "host")) { await tabs[name].fill("#code-input", code); await tabs[name].click("#join-btn"); await tabs[name].waitForTimeout(150); }
   const N = Object.keys(tabs).length;
-  for (const p of Object.values(tabs)) await p.waitForFunction((n) => document.querySelectorAll(".peer-card").length >= n, N, { timeout: 60000 });
+  for (const p of Object.values(tabs)) await p.waitForFunction((n) => document.querySelectorAll(".peer-card").length >= n, N, { timeout: 60000 + 2000 * N });
   log(N, "devices in room");
   await tabs.host.waitForTimeout(3000);   // stripe connections
   await tabs.host.selectOption("#ai-model", MODEL);
   await tabs.host.click("#ai-start");
   log("model start pressed");
-  const poll = setInterval(async () => { try { for (const [n, p] of Object.entries(tabs)) log(n + ":", (await status(p)).slice(0, 120)); } catch {} }, 15000);
-  for (const [name, p] of Object.entries(tabs)) await p.waitForFunction(() => document.getElementById("ai-panel").classList.contains("online"), null, { timeout: name === "host" ? 900000 : 120000 });
+  const poll = setInterval(async () => { try { for (const [n, p] of Object.entries(tabs).slice(0, 4)) log(n + ":", (await status(p)).slice(0, 120)); } catch {} }, 15000);
+  // fail fast: a tab that reports a load failure means the room can never come online
+  const failed = setInterval(async () => { try { for (const [n, p] of Object.entries(tabs)) { const st = await p.evaluate(() => document.getElementById("ai-status").textContent); if (/^failed:/.test(st)) { clearInterval(failed); throw new Error(`${n} ${st}`); } } } catch (e) { if (String(e).includes("failed:")) { console.error("FAILED:", String(e).slice(0, 300)); process.exit(2); } } }, 5000);
+  for (const [name, p] of Object.entries(tabs)) await p.waitForFunction(() => document.getElementById("ai-panel").classList.contains("online"), null, { timeout: name === "host" ? 900000 : 300000 });
+  clearInterval(failed);
   clearInterval(poll);
   log("online:", await tabs.host.textContent("#ai-status"));
   const split = await tabs.host.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => /layer split/.test(t)).slice(-1)[0] || "");
@@ -111,15 +134,18 @@ try {
   for (let r = 0; r < ROUNDS; r++) {
     await tabs.host.fill("#ai-prompt", PROMPT); await tabs.host.click("#ai-send");
     await tabs.host.waitForFunction(() => /^ready — prefill|^generation failed/.test(document.getElementById("ai-status").textContent), null, { timeout: 300000 });
-    const st = await tabs.host.textContent("#ai-status"); log("round", r, st); results.push(st);
+    const st = await tabs.host.textContent("#ai-status"); log("round", r, st);
+    const reply = await tabs.host.evaluate(() => { const b = document.querySelectorAll("#chat-log .bubble"); return (b[b.length - 1]?.textContent || "").slice(0, 240); });
+    results.push({ status: st, reply });
     await tabs.host.waitForTimeout(1000);
   }
   const wire = {}; for (const [n, p] of Object.entries(tabs)) wire[n] = await p.evaluate(() => window.swarmDebug?.());
   // the room's own log carries GPU validation errors that never reach the console
   const roomErrs = {}; for (const [n, p] of Object.entries(tabs)) roomErrs[n] = await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => t.includes("\u26a0")).map((t) => t.slice(0, 160)));
   const nRoomErrs = Object.values(roomErrs).reduce((a, e) => a + e.length, 0);
-  const ok = results.every((s) => s.startsWith("ready")) && Object.values(errs).every((e) => e.length === 0) && nRoomErrs === 0;
-  console.log(JSON.stringify({ ok, wire: WIRE, model: MODEL, phone: PHONE, code, split, results, links: wire, errors: errs, roomErrors: { count: nRoomErrs, first: Object.fromEntries(Object.entries(roomErrs).map(([k, v]) => [k, v.slice(0, 2)])) } }, null, 1));
+  const ok = results.every((s) => s.status.startsWith("ready")) && Object.values(errs).every((e) => e.length === 0) && nRoomErrs === 0;
+  const linkSummary = Object.fromEntries(Object.entries(wire).map(([n, l]) => [n, (l || []).map((x) => `${x.name}:${x.chans}ch ${x.sent}/${x.recv}`).join(", ")]));
+  console.log(JSON.stringify({ ok, wire: WIRE, model: MODEL, devices: DEVICES, phones: PHONES, code, split, results, links: DEVICES > 6 ? Object.fromEntries(Object.entries(linkSummary).slice(0, 4)) : linkSummary, errors: Object.fromEntries(Object.entries(errs).filter(([, v]) => v.length)), roomErrors: { count: nRoomErrs, first: Object.fromEntries(Object.entries(roomErrs).filter(([, v]) => v.length).map(([k, v]) => [k, v.slice(0, 2)]).slice(0, 3)) } }, null, 1));
   process.exitCode = ok ? 0 : 1;
 } catch (e) {
   console.error("FAILED:", String(e).slice(0, 400));
@@ -127,5 +153,5 @@ try {
   console.error("errors:", JSON.stringify(errs));
   process.exitCode = 2;
 } finally {
-  await browser.close(); srv.close(); wsrv.close(); fs.rmSync(tlsDir, { recursive: true, force: true });
+  await browser.close(); srv.close(); wsrv.close(); fs.rmSync(tlsDir, { recursive: true, force: true }); if (peerServer) peerServer.kill();
 }

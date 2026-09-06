@@ -16,6 +16,17 @@ import { makeLink, attachWire, wireReady, sendFrame } from "./room/transport.js"
 // ?wire=slice uses one sliced channel; ?wire=stripeN spreads slices over N peer connections.
 const WIRE = (new URLSearchParams(location.search).get("wire") || "stripe4").toLowerCase();
 const WIRE_STRIPES = WIRE === "off" ? 0 : WIRE.startsWith("stripe") ? Math.max(1, Math.min(8, parseInt(WIRE.slice(6), 10) || 1)) : 1;
+// Signaling: ?signal=host:port points PeerJS at our own PeerServer (the emulator and big
+// rooms use one); default is the public PeerJS cloud.
+const SIGNAL = new URLSearchParams(location.search).get("signal");
+const SIGNAL_OPTS = SIGNAL ? (() => { const [host, port] = SIGNAL.split(":"); return { host, port: +port || 443, path: "/", secure: location.protocol === "https:" }; })() : {};
+
+// Topology: every device keeps ONE link to the host (control, roster, tokens). Data links
+// between chain neighbours open when the layers are dealt (ensureLink), so a room of N
+// devices has N-1 host links plus N-1 chain links, not N*(N-1)/2. Workers learn about the
+// other devices from the host's roster message and draw cards from it.
+const members = new Map();   // id -> { name, meta } for everyone in the room except me
+const cards = new Map();     // id -> card element
 
 const $ = (id) => document.getElementById(id);
 function toast(text) {
@@ -152,7 +163,7 @@ function updateNeed(pledged) {
 }
 $("ai-model").addEventListener("change", () => updateCluster());
 function updateCluster() {
-  const all = [myMeta, ...[...conns.values()].map(c => c.meta)];
+  const all = [myMeta, ...[...members.values()].map(m => m.meta)];
   const gpus = all.filter(m => m && m.webgpu).length;
   const pledged = all.reduce((s, m) => s + (m?.contribGB || 0), 0);
   updateNeed(pledged);
@@ -206,26 +217,44 @@ function wire(conn, name, meta, initiator = false) {
   conn.on("data", (d) => onData(conn.peer, d));
   conn.on("close", () => {
     const e = conns.get(conn.peer);
-    if (e?.card) e.card.remove();
     conns.delete(conn.peer);
-    roster.delete(conn.peer);
-    if (isHost) broadcastRoster();
+    if (isHost) {   // on the host a closed link means the device left; workers wait for the roster
+      dropCard(conn.peer); members.delete(conn.peer); roster.delete(conn.peer); broadcastRoster();
+      log("swarm", `${e?.name || conn.peer} left`);
+    } else if (conn.peer === ai.hostId || entry.name === "host") log("swarm", "lost the link to the host");
     updateCluster();
-    log("swarm", `${e?.name || conn.peer} left`);
   });
   conn.on("error", () => {});
   return entry;
 }
 
-function ensureCard(id) {
-  const e = conns.get(id);
-  if (e && !e.card) {
-    e.card = peerCard(id, e.name, e.meta, false);
+function ensureCard(id, name, meta) {
+  let card = cards.get(id);
+  if (!card) {
+    card = peerCard(id, name || id, meta || {}, false);
+    cards.set(id, card);
     updateCluster();
-    log("swarm", `${e.name} connected`);
-    mascot(`${e.name} joined! ${conns.size + 1} devices in the room.`);
+    log("swarm", `${name || id} joined`);
+    mascot(`${name || id} joined! ${members.size + 1} devices in the room.`);
   }
+  const e = conns.get(id);
+  if (e) e.card = card;
+  return card;
 }
+function dropCard(id) { const c = cards.get(id); if (c) { c.remove(); cards.delete(id); } }
+// open a data link to a chain neighbour if we do not have one yet; resolves when it is up
+function ensureLink(id, timeoutMs = 60000) {
+  if (!id || id === "host" || conns.has(id)) return Promise.resolve(true);
+  if (!ensureLink.pending.has(id)) { ensureLink.pending.add(id); meshConnect(id); }
+  return new Promise((res) => {
+    const t0 = performance.now();
+    const t = setInterval(() => {
+      if (conns.has(id)) { clearInterval(t); ensureLink.pending.delete(id); res(true); }
+      else if (performance.now() - t0 > timeoutMs) { clearInterval(t); ensureLink.pending.delete(id); res(false); }
+    }, 100);
+  });
+}
+ensureLink.pending = new Set();
 
 function sendTo(id, obj) { conns.get(id)?.conn.send(obj); }
 // debug: per-peer wire state (channels open, frames sent/received) — `swarmDebug()` in the console
@@ -253,13 +282,14 @@ function onData(from, d) {
   switch (d.t) {
     case "hello":
       e.name = d.name; e.meta = d.meta;
-      ensureCard(from);
+      members.set(from, { name: d.name, meta: d.meta });
+      ensureCard(from, d.name, d.meta);
       if (isHost) {
         roster.set(from, { name: d.name, meta: d.meta }); broadcastRoster();
         aiRejoin(from, d.name);
       }
       break;
-    case "ai-next": ai.next = d.next; break;
+    case "ai-next": ai.next = d.next; ensureLink(d.next); break;
     case "ai-reset": try { ai.engine?.reset?.(); } catch {} break;
     case "ai-layers": ai.layersByName = d.by; loadCardRender(); break;
     case "ai-start-req":
@@ -269,13 +299,21 @@ function onData(from, d) {
       if (d.boss === peer.id) { toast(`${d.by} started ${MODELS[d.model]?.label.split("\u00b7")[0].trim()}`); aiStart(d.model); }
       else aiStatus(`${d.by} started the model\u2026`);
       break;
-    case "roster":
-      // connect to any member I don't know yet (mesh completion)
-      // exactly one side initiates (larger id), so no duplicate connections
+    case "roster": {
+      // the host's view of the room: draw a card per device, no mesh connections
+      const seen = new Set();
       for (const m of d.members) {
-        if (m.id !== peer.id && !conns.has(m.id) && peer.id > m.id) meshConnect(m.id);
+        if (m.id === peer.id) continue;
+        seen.add(m.id);
+        members.set(m.id, { name: m.name, meta: m.meta });
+        const c = ensureCard(m.id, m.name, m.meta);
+        if (m.meta?.contribGB) c.querySelector(".buf").textContent = "gives " + m.meta.contribGB + " GB";
+        const ce = conns.get(m.id); if (ce) ce.meta = m.meta;
       }
+      for (const id of [...members.keys()]) if (!seen.has(id)) { members.delete(id); dropCard(id); }
+      updateCluster();
       break;
+    }
     case "ping": sendTo(from, { t: "pong", ts: d.ts }); break;
     case "pong": {
       e.rtt = Math.round(performance.now() - d.ts);
@@ -283,7 +321,10 @@ function onData(from, d) {
       break;
     }
     case "pledge":
-      if (e) { e.meta = { ...e.meta, contribGB: d.gb }; if (e.card) e.card.querySelector(".buf").textContent = "gives " + d.gb + " GB"; updateCluster(); }
+      if (e) { e.meta = { ...e.meta, contribGB: d.gb }; if (e.card) e.card.querySelector(".buf").textContent = "gives " + d.gb + " GB"; }
+      if (members.has(from)) members.get(from).meta = { ...members.get(from).meta, contribGB: d.gb };
+      if (isHost && roster.has(from)) { roster.get(from).meta = { ...roster.get(from).meta, contribGB: d.gb }; broadcastRoster(); }
+      updateCluster();
       break;
     case "bw-start": bwRecv.set(from, { bytes: 0, t0: performance.now() }); break;
     case "bw-end": {
@@ -362,7 +403,7 @@ async function start(create) {
     ],
   };
   // host claims the well-known id for the code; joiners get random ids
-  peer = new Peer(create ? PREFIX + code : undefined, { debug: 1, config: ICE });
+  peer = new Peer(create ? PREFIX + code : undefined, { debug: 1, config: ICE, ...SIGNAL_OPTS });
 
   peer.on("open", () => {
     isHost = create;
@@ -1101,8 +1142,10 @@ async function aiOnData(from, d) {
       ai.role = "worker";
       ai.next = d.next;
       ai.hostId = d.host;
+      ensureLink(d.next);   // open the link to my chain neighbour while the weights download
       try {
         await aiLoadShard(d.model || "smollm-135m", d.range, false, false);
+        if (!(await ensureLink(d.next))) throw new Error("could not connect to the next device in the chain");
         aiStatus(`layers ${d.range[0]}\u2013${d.range[1] - 1} ready \u00b7 syncing with the room\u2026`);
         aiLoading(true, `layers ${d.range[0]}\u2013${d.range[1] - 1} ready`);
         $("ldg-sub").textContent = "syncing with the rest of the room";
