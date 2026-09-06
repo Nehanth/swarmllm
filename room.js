@@ -10,6 +10,23 @@ import { WIRE_F16, badF32, f32ToB64, packF16, unpackF16, asU16, packWire, unpack
 import { esc, md } from "./room/markdown.js";
 import { aiSample } from "./room/sampling.js";
 import { MODELS, NEED_GB, MAX_SEQ, MAX_NEW, MIN_ROOM } from "./room/models.js";
+import { makeLink, attachWire, wireReady, sendFrame } from "./room/transport.js";
+
+// Hidden-state transport (room/transport.js). ?wire=off falls back to PeerJS messages;
+// ?wire=slice uses one sliced channel; ?wire=stripeN spreads slices over N peer connections.
+const WIRE = (new URLSearchParams(location.search).get("wire") || "stripe4").toLowerCase();
+const WIRE_STRIPES = WIRE === "off" ? 0 : WIRE.startsWith("stripe") ? Math.max(1, Math.min(8, parseInt(WIRE.slice(6), 10) || 1)) : 1;
+// Signaling: ?signal=host:port points PeerJS at our own PeerServer (the emulator and big
+// rooms use one); default is the public PeerJS cloud.
+const SIGNAL = new URLSearchParams(location.search).get("signal");
+const SIGNAL_OPTS = SIGNAL ? (() => { const [host, port] = SIGNAL.split(":"); return { host, port: +port || 443, path: "/", secure: location.protocol === "https:" }; })() : {};
+
+// Topology: every device keeps ONE link to the host (control, roster, tokens). Data links
+// between chain neighbours open when the layers are dealt (ensureLink), so a room of N
+// devices has N-1 host links plus N-1 chain links, not N*(N-1)/2. Workers learn about the
+// other devices from the host's roster message and draw cards from it.
+const members = new Map();   // id -> { name, meta } for everyone in the room except me
+const cards = new Map();     // id -> card element
 
 const $ = (id) => document.getElementById(id);
 function toast(text) {
@@ -146,7 +163,7 @@ function updateNeed(pledged) {
 }
 $("ai-model").addEventListener("change", () => updateCluster());
 function updateCluster() {
-  const all = [myMeta, ...[...conns.values()].map(c => c.meta)];
+  const all = [myMeta, ...[...members.values()].map(m => m.meta)];
   const gpus = all.filter(m => m && m.webgpu).length;
   const pledged = all.reduce((s, m) => s + (m?.contribGB || 0), 0);
   updateNeed(pledged);
@@ -182,35 +199,72 @@ function enterRoom() {
 }
 
 // --- connection wiring ---
-function wire(conn, name, meta) {
-  const entry = { conn, name: name || conn.peer, meta: meta || {}, rtt: null, card: null };
+function wire(conn, name, meta, initiator = false) {
+  const entry = { conn, name: name || conn.peer, meta: meta || {}, rtt: null, card: null, link: makeLink(), stripes: [] };
   conns.set(conn.peer, entry);
+  if (WIRE_STRIPES > 0) {
+    attachWire(entry.link, conn, (m) => onData(conn.peer, m));
+    // extra associations for striping: the side that dialed opens them, the other side accepts
+    // them in peer.on("connection") by label and attaches its end of the wire channel
+    if (initiator) for (let i = 1; i < WIRE_STRIPES; i++) {
+      const sc = peer.connect(conn.peer, { reliable: true, label: "stripe" });
+      sc.on("open", () => { attachWire(entry.link, sc, (m) => onData(conn.peer, m)); });
+      sc.on("error", () => {});
+      entry.stripes.push(sc);
+    }
+  }
 
   conn.on("data", (d) => onData(conn.peer, d));
   conn.on("close", () => {
     const e = conns.get(conn.peer);
-    if (e?.card) e.card.remove();
     conns.delete(conn.peer);
-    roster.delete(conn.peer);
-    if (isHost) broadcastRoster();
+    if (isHost) {   // on the host a closed link means the device left; workers wait for the roster
+      dropCard(conn.peer); members.delete(conn.peer); roster.delete(conn.peer); broadcastRoster();
+      log("swarm", `${e?.name || conn.peer} left`);
+    } else if (conn.peer === ai.hostId || entry.name === "host") log("swarm", "lost the link to the host");
     updateCluster();
-    log("swarm", `${e?.name || conn.peer} left`);
   });
   conn.on("error", () => {});
   return entry;
 }
 
-function ensureCard(id) {
-  const e = conns.get(id);
-  if (e && !e.card) {
-    e.card = peerCard(id, e.name, e.meta, false);
+function ensureCard(id, name, meta) {
+  let card = cards.get(id);
+  if (!card) {
+    card = peerCard(id, name || id, meta || {}, false);
+    cards.set(id, card);
     updateCluster();
-    log("swarm", `${e.name} connected`);
-    mascot(`${e.name} joined! ${conns.size + 1} devices in the room.`);
+    log("swarm", `${name || id} joined`);
+    mascot(`${name || id} joined! ${members.size + 1} devices in the room.`);
   }
+  const e = conns.get(id);
+  if (e) e.card = card;
+  return card;
 }
+function dropCard(id) { const c = cards.get(id); if (c) { c.remove(); cards.delete(id); } }
+// open a data link to a chain neighbour if we do not have one yet; resolves when it is up
+function ensureLink(id, timeoutMs = 60000) {
+  if (!id || id === "host" || conns.has(id)) return Promise.resolve(true);
+  if (!ensureLink.pending.has(id)) { ensureLink.pending.add(id); meshConnect(id); }
+  return new Promise((res) => {
+    const t0 = performance.now();
+    const t = setInterval(() => {
+      if (conns.has(id)) { clearInterval(t); ensureLink.pending.delete(id); res(true); }
+      else if (performance.now() - t0 > timeoutMs) { clearInterval(t); ensureLink.pending.delete(id); res(false); }
+    }, 100);
+  });
+}
+ensureLink.pending = new Set();
 
 function sendTo(id, obj) { conns.get(id)?.conn.send(obj); }
+// debug: per-peer wire state (channels open, frames sent/received) — `swarmDebug()` in the console
+window.swarmDebug = () => [...conns].map(([id, e]) => ({ id, name: e.name, chans: e.link?.chans.filter((c) => c.readyState === "open").length ?? 0, sent: e.link?.sent ?? 0, recv: e.link?.recv ?? 0 }));
+// activations go over the sliced wire channel when it is up, else as a normal message
+function sendHidden(id, msg) {
+  const e = conns.get(id);
+  if (e?.link && wireReady(e.link) && sendFrame(e.link, msg)) return;
+  sendTo(id, msg);
+}
 function broadcastAll(obj) { for (const [id] of conns) sendTo(id, obj); }
 
 // bandwidth test state
@@ -228,13 +282,14 @@ function onData(from, d) {
   switch (d.t) {
     case "hello":
       e.name = d.name; e.meta = d.meta;
-      ensureCard(from);
+      members.set(from, { name: d.name, meta: d.meta });
+      ensureCard(from, d.name, d.meta);
       if (isHost) {
         roster.set(from, { name: d.name, meta: d.meta }); broadcastRoster();
         aiRejoin(from, d.name);
       }
       break;
-    case "ai-next": ai.next = d.next; break;
+    case "ai-next": ai.next = d.next; ensureLink(d.next); break;
     case "ai-reset": try { ai.engine?.reset?.(); } catch {} break;
     case "ai-layers": ai.layersByName = d.by; loadCardRender(); break;
     case "ai-start-req":
@@ -244,13 +299,21 @@ function onData(from, d) {
       if (d.boss === peer.id) { toast(`${d.by} started ${MODELS[d.model]?.label.split("\u00b7")[0].trim()}`); aiStart(d.model); }
       else aiStatus(`${d.by} started the model\u2026`);
       break;
-    case "roster":
-      // connect to any member I don't know yet (mesh completion)
-      // exactly one side initiates (larger id), so no duplicate connections
+    case "roster": {
+      // the host's view of the room: draw a card per device, no mesh connections
+      const seen = new Set();
       for (const m of d.members) {
-        if (m.id !== peer.id && !conns.has(m.id) && peer.id > m.id) meshConnect(m.id);
+        if (m.id === peer.id) continue;
+        seen.add(m.id);
+        members.set(m.id, { name: m.name, meta: m.meta });
+        const c = ensureCard(m.id, m.name, m.meta);
+        if (m.meta?.contribGB) c.querySelector(".buf").textContent = "gives " + m.meta.contribGB + " GB";
+        const ce = conns.get(m.id); if (ce) ce.meta = m.meta;
       }
+      for (const id of [...members.keys()]) if (!seen.has(id)) { members.delete(id); dropCard(id); }
+      updateCluster();
       break;
+    }
     case "ping": sendTo(from, { t: "pong", ts: d.ts }); break;
     case "pong": {
       e.rtt = Math.round(performance.now() - d.ts);
@@ -258,7 +321,10 @@ function onData(from, d) {
       break;
     }
     case "pledge":
-      if (e) { e.meta = { ...e.meta, contribGB: d.gb }; if (e.card) e.card.querySelector(".buf").textContent = "gives " + d.gb + " GB"; updateCluster(); }
+      if (e) { e.meta = { ...e.meta, contribGB: d.gb }; if (e.card) e.card.querySelector(".buf").textContent = "gives " + d.gb + " GB"; }
+      if (members.has(from)) members.get(from).meta = { ...members.get(from).meta, contribGB: d.gb };
+      if (isHost && roster.has(from)) { roster.get(from).meta = { ...roster.get(from).meta, contribGB: d.gb }; broadcastRoster(); }
+      updateCluster();
       break;
     case "bw-start": bwRecv.set(from, { bytes: 0, t0: performance.now() }); break;
     case "bw-end": {
@@ -287,7 +353,7 @@ function broadcastRoster() {
 function meshConnect(targetId) {
   const conn = peer.connect(targetId, { reliable: true });
   conn.on("open", () => {
-    wire(conn);
+    wire(conn, undefined, undefined, true);
     conn.send({ t: "hello", name: myName, meta: myMeta });
   });
 }
@@ -337,7 +403,7 @@ async function start(create) {
     ],
   };
   // host claims the well-known id for the code; joiners get random ids
-  peer = new Peer(create ? PREFIX + code : undefined, { debug: 1, config: ICE });
+  peer = new Peer(create ? PREFIX + code : undefined, { debug: 1, config: ICE, ...SIGNAL_OPTS });
 
   peer.on("open", () => {
     isHost = create;
@@ -356,7 +422,7 @@ async function start(create) {
     }, 15000);
     conn.on("open", () => {
       clearTimeout(timeout);
-      wire(conn, "host");
+      wire(conn, "host", undefined, true);
       let died = null;
       try { const c = JSON.parse(localStorage.getItem("swarm-crumb") || "null"); if (c && Date.now() - c.t < 10 * 60 * 1000) died = { during: c.s, ago: Math.round((Date.now() - c.t) / 1000) }; } catch {}
       conn.send({ t: "hello", name: myName, meta: myMeta, died });
@@ -366,6 +432,11 @@ async function start(create) {
 
   peer.on("connection", (conn) => {
     conn.on("open", () => {
+      if (conn.label === "stripe") {   // extra association for the hidden-state wire, not a new peer
+        const e = conns.get(conn.peer);
+        if (e) { attachWire(e.link, conn, (m) => onData(conn.peer, m)); e.stripes.push(conn); }
+        return;
+      }
       wire(conn);
       conn.send({ t: "hello", name: myName, meta: myMeta });
     });
@@ -866,7 +937,7 @@ async function aiPipeToken(id, needLogits = true) {
       ai.waiters.set(pos, res);
       setTimeout(() => { ai.waiters.delete(pos); rej(new Error("pipeline timeout (peer gone?)")); }, 30000);
     });
-    sendTo(ai.chain[0], { t: "ai-hidden", pos, ...packWire(h) });
+    sendHidden(ai.chain[0], { t: "ai-hidden", pos, ...packWire(h) });
     h = await returned;
     if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos}) — check peer status lines`);
     ai.lastHidden = h;
@@ -940,7 +1011,7 @@ async function aiGenerate(textArg, who) {
             ai.waiters.set("b" + basePos, res);
             setTimeout(() => { ai.waiters.delete("b" + basePos); rej(new Error("pipeline timeout (batch prefill)")); }, 90000);
           });
-          sendTo(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * NCW, ...packWire(hb) });
+          sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * NCW, ...packWire(hb) });
           await returned;
         }
         ai.pos = basePos + nChunks * NCW;
@@ -978,7 +1049,7 @@ async function aiGenerate(textArg, who) {
             ai.waiters.set("b" + pos, res);
             setTimeout(() => { ai.waiters.delete("b" + pos); rej(new Error("pipeline timeout (verify)")); }, 90000);
           });
-          sendTo(ai.chain[0], { t: "ai-hidden-b", basePos: pos, n: tokens.length, spec: 1, ...packWire(hb) });
+          sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos: pos, n: tokens.length, spec: 1, ...packWire(hb) });
           const h = await returned;
           if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos})`);
           const dt = performance.now() - tLap;
@@ -1071,8 +1142,10 @@ async function aiOnData(from, d) {
       ai.role = "worker";
       ai.next = d.next;
       ai.hostId = d.host;
+      ensureLink(d.next);   // open the link to my chain neighbour while the weights download
       try {
         await aiLoadShard(d.model || "smollm-135m", d.range, false, false);
+        if (!(await ensureLink(d.next))) throw new Error("could not connect to the next device in the chain");
         aiStatus(`layers ${d.range[0]}\u2013${d.range[1] - 1} ready \u00b7 syncing with the room\u2026`);
         aiLoading(true, `layers ${d.range[0]}\u2013${d.range[1] - 1} ready`);
         $("ldg-sub").textContent = "syncing with the rest of the room";
@@ -1120,8 +1193,8 @@ async function aiOnData(from, d) {
       }
       if (badF32(hb)) { aiStatus(`\u26a0 NaN in batched prefill on this device`); sendTo(ai.hostId, { t: "ai-error", message: "NaN in batched prefill" }); }
       const bmsg = { basePos: d.basePos, n: nTok, ...packWire(hb) };
-      if (ai.next === "host") sendTo(ai.hostId, { t: "ai-hiddenret-b", ...bmsg });
-      else sendTo(ai.next, { t: "ai-hidden-b", ...bmsg });
+      if (ai.next === "host") sendHidden(ai.hostId, { t: "ai-hiddenret-b", ...bmsg });
+      else sendHidden(ai.next, { t: "ai-hidden-b", ...bmsg });
       break;
     }
     case "ai-rollback": {
@@ -1142,8 +1215,8 @@ async function aiOnData(from, d) {
       const h = await ai.engine.runHidden(hin, d.pos);
       if (badF32(h)) { aiStatus(`\u26a0 NaN PRODUCED by this device (pos ${d.pos}, layers ${ai.range[0]}\u2013${ai.range[1] - 1}) — GPU kernel issue here`); sendTo(ai.hostId, { t: "ai-error", message: `NaN produced on worker layers ${ai.range[0]}\u2013${ai.range[1] - 1}` }); }
       const msg = { pos: d.pos, ...packWire(h) };
-      if (ai.next === "host") sendTo(ai.hostId, { t: "ai-hiddenret", ...msg });
-      else sendTo(ai.next, { t: "ai-hidden", ...msg });
+      if (ai.next === "host") sendHidden(ai.hostId, { t: "ai-hiddenret", ...msg });
+      else sendHidden(ai.next, { t: "ai-hidden", ...msg });
       if (d.pos % 8 === 0) aiStatus(`serving layers ${ai.range[0]}–${ai.range[1] - 1} — pos ${d.pos}`);
       break;
     }
