@@ -28,7 +28,10 @@ Model files are not in the repository. Put GGUFs under `models/` (see [docs/mode
 npm run test:gpu          # golden tests on the small model
 npm run test:q38          # 27B tests (needs ~16 GB of GPU memory)
 npm run bench             # decode/prefill tok/s
+npm run e2e -- --phone    # room emulator: host, worker and a phone-shaped tab in headless Chromium on this machine
 ```
+
+The emulator (`tests/e2e/room.mjs`) forms a real room through PeerJS signaling and WebRTC, splits the small model across the tabs, runs prompts, and reports stats, wire channel counters and console errors. `--wire off|slice|stripeN` picks the hidden-state transport, `--phone` adds a tab with a mobile user agent and a 4x CPU throttle so the phone code paths run. It needs `npm install` and a Chromium with WebGPU on the machine; it is never run automatically.
 
 To run the site locally, serve the repository root with any static server (`npx serve .`) and open `/room`.
 

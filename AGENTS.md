@@ -16,6 +16,7 @@ npm test                              # unit tests, no GPU (CI runs these)
 cd tests && deno run --unstable-webgpu --allow-read --allow-env test_qwen.js   # one GPU test
 tests/run.sh quick | q38 | all        # suites; GPU tests read models from ../models/
 cd benchmarks && MODEL=q38 deno run --unstable-webgpu --allow-read --allow-env bench.js
+npm run e2e -- --phone                # room emulator: host + worker + phone-shaped tab, real WebRTC + GPU (manual only)
 ```
 Model files live in `models/` (git-ignored). The 27B loads in ~2 minutes; plan runs accordingly.
 

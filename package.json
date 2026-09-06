@@ -3,7 +3,10 @@
   "version": "0.2.0",
   "description": "Peer-to-peer LLM inference across browser tabs: a from-scratch WebGPU engine and a WebRTC runtime that split one model over the devices in a room.",
   "homepage": "https://swarmllm.ai",
-  "repository": { "type": "git", "url": "https://github.com/Nehanth/swarmllm.git" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Nehanth/swarmllm.git"
+  },
   "license": "MIT",
   "author": "Nehanth Narendrula",
   "type": "module",
@@ -18,7 +21,13 @@
     "bench:q38": "MODEL=q38 deno run --unstable-webgpu --allow-read --allow-env benchmarks/bench.js",
     "bench:breakdown": "deno run --unstable-webgpu --allow-read --allow-env benchmarks/bench_breakdown.js",
     "serve": "npx -y serve -l 8080 .",
-    "deploy:staging": "scripts/deploy-staging.sh"
+    "deploy:staging": "scripts/deploy-staging.sh",
+    "e2e": "node tests/e2e/room.mjs"
   },
-  "engines": { "deno": ">=2.0" }
+  "engines": {
+    "deno": ">=2.0"
+  },
+  "devDependencies": {
+    "playwright": "1.49.1"
+  }
 }
