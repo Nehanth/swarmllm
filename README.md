@@ -59,6 +59,22 @@ host      final norm → LM head → sample → next token (and the draft head g
 
 Generating a token is memory-bound: every token reads all of the weights once. So the engine's job is reading fewer bytes (4-bit blocks with f16 scales) and reading them well (64 threads sweep each row together, dequantize in registers, reduce in shared memory), with one command submit per token. The runtime's job is making network laps carry more: batched prefill, and multi-token-prediction speculation verified in a single batched pass with exact rollback of the recurrent state. Details: [docs/architecture.md](docs/architecture.md), [docs/kernels.md](docs/kernels.md), [docs/protocol.md](docs/protocol.md).
 
+## How it compares
+
+Other projects split or share models across machines. The differences are what has to be installed and where the model runs.
+
+| | Model per device | Devices | Install | Network |
+|---|---|---|---|---|
+| **SwarmLLM** | a slice of layers | laptops and phones, any OS with a WebGPU browser | none, open a URL | same Wi‑Fi or across the internet (WebRTC) |
+| exo | a slice of layers | machines that run Python and MLX or tinygrad | Python package per node | one network |
+| llama.cpp `rpc-server` | a slice of layers | machines that run the binary | binary and an open port per node; the docs say not for untrusted networks | LAN in practice |
+| Petals | a slice of layers | server GPUs in a public swarm | Python client and server | internet, public swarm |
+| distributed-llama | a slice of layers | Linux boxes and Raspberry Pis | binary per node | LAN |
+| WebLLM / MLC, transformers.js | the whole model | one browser tab | none | none needed |
+| Ollama, llmman | the whole model | one machine per request | native app | routing between machines, no splitting |
+
+The engine underneath is our own WGSL, not WebLLM, MLC or llama.cpp; the model weights and tokenizer come from Qwen, hosting from Hugging Face, and signaling only from PeerJS.
+
 ## Supported models
 
 | Model | Format | Notes |
@@ -67,19 +83,20 @@ Generating a token is memory-bound: every token reads all of the weights once. S
 | Qwen3 0.6B / 1.7B / 4B | GGUF Q8_0 / Q4_0 | dense; used for golden tests |
 | SmolLM2 135M | safetensors f32 | smallest demo |
 
-Browsers: Chrome/Edge 113+, Safari 26+. Headless: Deno 2 (wgpu). See [docs/models.md](docs/models.md).
+Browsers: Chrome on macOS is the tested host. Safari on an iPhone joins a room and holds a small slice; Safari on a Mac reloads the tab under memory pressure when it holds the 27B's large slice, so do not host from it. Firefox and Linux Chromium need WebGPU enabled and are untested by us. Headless: Deno 2 (wgpu). See [docs/models.md](docs/models.md).
 
 ## Performance
 
 Qwen 3.8 27B Q4_0, greedy, bit-identical output at every row. Full history with commits in [docs/bench-log.md](docs/bench-log.md).
 
-| Device | Decode plain | Decode speculative | Native llama.cpp (same GGUF) |
-|---|---|---|---|
-| NVIDIA GB10 (Deno / Vulkan) | 9.0 tok/s | 16.1 tok/s | 8.0 tok/s |
-| MacBook Pro (Chrome / Metal) | 6.7 tok/s | 10.8 tok/s | — |
-| Cross-internet room (host + peer) | — | 3.5–6 tok/s | — |
+| Device | Decode plain | Decode speculative | Prefill | Native llama.cpp, same GGUF, same machine |
+|---|---|---|---|---|
+| NVIDIA GB10 (Deno / Vulkan, headless) | 9.0 tok/s | 16.1 tok/s | 44 tok/s | 8.0 decode (tg32), 377 prefill (pp86), CUDA build 749f688 |
+| MacBook Pro (Chrome / Metal), solo | 6.7 tok/s | 10.8 tok/s | ~20 tok/s | — |
+| MacBook Pro + iPhone, same Wi‑Fi, 62 + 2 layers | — | 7.7 tok/s | 8.5 s for a 169-token prompt | — |
+| Cross-internet room (host + peer) | — | 3.5–6 tok/s | — | — |
 
-Prefill is the known gap (27 tok/s vs 377 native on the GB10); a tiled GEMM for prefill is in progress ([benchmarks/bench_gemm.js](benchmarks/bench_gemm.js)).
+Decode on the GB10 runs at the memory bandwidth a WebGPU buffer read can reach on that machine (183 of 184 GB/s measured), which is why it is ahead of the native build there. Prefill is the known gap: the DeltaNet recurrence is serial and the prefill GEMM is young. One token's hidden state on the wire is 10 KB (5,120 × f16).
 
 ## Repository layout
 
@@ -94,7 +111,7 @@ room.js + room/    the room: signaling, mesh, weight streaming, generation loop;
 index.html         landing page          p2p.html   the room's markup (served at /room)
 tests/             GPU golden tests · unit/ (no GPU) · golden/ · reference/ · run.sh
 benchmarks/        tok/s harnesses, kernel-family profiler, GEMM prototype
-docs/              architecture · tech-stack · kernels (every trick, measured) · protocol · models · bench log · research
+docs/              architecture · tech-stack · kernels (every trick, measured) · protocol · models · bench log · research · agents (rules for automated contributors)
 roadmap/           one file per planned item with status, design and done-criteria
 ```
 

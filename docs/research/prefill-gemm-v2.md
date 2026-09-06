@@ -274,7 +274,7 @@ _dop(pass, op, nCols = 0) {
 }
 ```
 
-`this.gemm = false` is the kill switch required by AGENTS.md ("approximations need a default-off switch") and the A/B lever for the bench-log row.
+`this.gemm = false` is the kill switch required by docs/agents.md ("approximations need a default-off switch") and the A/B lever for the bench-log row.
 
 **(e) `_encodeLayerBatch` (line 641):** four `gemm_xpose` dispatches per layer, emitted only in GEMM mode, each immediately after its producer and inside the same compute pass (WebGPU's implicit intra-pass ordering covers the dependency).
 
