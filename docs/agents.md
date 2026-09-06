@@ -1,6 +1,6 @@
 # Working on SwarmLLM with an AI agent
 
-Instructions for coding agents (Claude Code, Codex, Cursor, …). Humans: see [CONTRIBUTING.md](CONTRIBUTING.md).
+Instructions for coding agents (Claude Code, Codex, Cursor, …). Humans: see [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## What this is
 A from-scratch WebGPU inference engine (`engine/`) and a browser room runtime (`p2p.html` + `room/`) that split one LLM's layers across devices over WebRTC. No build step, no framework, ES modules only. Read [docs/architecture.md](docs/architecture.md) first, then [docs/kernels.md](docs/kernels.md).
