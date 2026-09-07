@@ -1,7 +1,3 @@
-
-
-https://github.com/user-attachments/assets/4f349e4b-c699-45da-abe8-e9162689293e
-
 <p align="center">
   <a href="https://swarmllm.ai"><img src="favicon.svg" width="72" alt="SwarmLLM"></a>
 </p>
@@ -21,12 +17,9 @@ https://github.com/user-attachments/assets/4f349e4b-c699-45da-abe8-e9162689293e
   <img alt="runtime" src="https://img.shields.io/badge/runs%20on-WebGPU%20%2B%20WebRTC-16171c">
 </p>
 
-<p align="center">
-  <a href="https://github.com/Nehanth/swarmllm/releases/download/v0.2.0/swarmllm-demo-2026-09-07.mp4"><img src="docs/media/demo-2026-09-07.png" width="820" alt="Demo, recorded September 7, 2026: Qwen 3.8 27B across a MacBook and an iPhone in browser tabs, 400 tokens at 10.7 tok/s"></a><br>
-  <sub><a href="https://github.com/Nehanth/swarmllm/releases/download/v0.2.0/swarmllm-demo-2026-09-07.mp4">Demo video</a>, recorded September 7, 2026: Qwen 3.8 27B across a MacBook and an iPhone, same Wi‑Fi, 400 tokens at 10.7 tok/s.<
+https://github.com/user-attachments/assets/4f349e4b-c699-45da-abe8-e9162689293e
 
-
-</p>
+<p align="center"><sub>Demo, recorded September 7, 2026: Qwen 3.8 27B across a MacBook and an iPhone in browser tabs, same Wi‑Fi, 400 tokens at 10.7 tok/s. <a href="https://github.com/Nehanth/swarmllm/releases/download/v0.2.0/swarmllm-demo-2026-09-07.mp4">Download</a>.</sub></p>
 
 SwarmLLM runs large language models across the devices in a room, in their browser tabs. Each device holds a slice of the model; a 10 KB activation vector passes between them over direct WebRTC connections. Nothing to install, no accounts, no server does any thinking.
 
