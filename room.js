@@ -1077,7 +1077,11 @@ async function aiGenerate(textArg, who) {
         if (kc.step % 16 === 0) { const alt = kc.cand.filter((k) => k !== best); return alt[(kc.step / 16) % alt.length | 0]; }
         return best;
       };
+      // the first answer token is sampled here; specStep treats it as already chosen for this
+      // position and returns only the tokens after it, so it has to be emitted (or end the
+      // answer) before the loop, or the reply starts one word late
       let next = aiSample(logits), done = false;
+      if (next === imEnd || next === eot) done = true; else emit(next);
       while (!done && count < maxNew) {
         // a speculative step touches positions pos .. pos+K (K drafts verified in one pass) and
         // drafts one more; shrink K near the end of the context and stop before it overflows
