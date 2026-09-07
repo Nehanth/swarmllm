@@ -135,7 +135,7 @@ try {
     await tabs.host.fill("#ai-prompt", PROMPT); await tabs.host.click("#ai-send");
     await tabs.host.waitForFunction(() => /^ready — prefill|^generation failed/.test(document.getElementById("ai-status").textContent), null, { timeout: 300000 });
     const st = await tabs.host.textContent("#ai-status"); log("round", r, st);
-    const reply = await tabs.host.evaluate(() => { const b = document.querySelectorAll("#chat-log .bubble"); return (b[b.length - 1]?.textContent || "").slice(0, 240); });
+    const reply = await tabs.host.evaluate(() => { const b = document.querySelectorAll(".m.bot .bubble"); return (b[b.length - 1]?.textContent || "").slice(0, 240); });
     results.push({ status: st, reply });
     await tabs.host.waitForTimeout(1000);
   }
