@@ -13,10 +13,13 @@ Two ways a room dies on Monday, both permanent. A friend closes their tab mid-an
 - **Read `died`.** The joiner already sends `hello.died` from the localStorage crumb (361–362) and the `hello` handler ignores it; surface it as "phone came back; its tab was killed 40 s ago while streaming blk.30" so people learn that backgrounding Safari kills the peer.
 - `ai-stop` is a new message and "degraded" is a new room state, so this file is the GOVERNANCE design note; `docs/protocol.md` gets a row for each. Roadmap 03 then adds spares and automatic replay on top of the same degraded → re-deal state and should be reworded to say so.
 
+- **Join mid-generation.** A device that joins while an answer is streaming does nothing today until the next model start (layers are dealt once in `aiStart`). Two cases: joining while idle should let the host re-run `planSplit()` with a "re-deal to include X" prompt, cached ranges reloading in seconds; joining during an answer must never change that answer, so the newcomer preloads a *backup* copy of an existing slice instead (roadmap 03's spare copies). Re-deal covers departures, spares cover arrivals; both reuse the `ensureLink` neighbour connects from the linear topology.
+
 ## Done when
 - In a three-device room, closing one tab mid-answer surfaces the failure within 2 s, offers "Re-deal", and the next question is answered without anyone reloading.
 - Pressing Stop on any screen ends generation within one lap and every Send box unlocks.
 - A guest whose host left sees "this room is over" rather than "cluster online".
+- A device joining a three-device room mid-answer holds a slice by the next question without any reload, and joining during an answer never changes that answer's output.
 - `docs/protocol.md` documents `ai-stop` and the degraded state. Fail-fast, the guest message and the start-button fix are ordinary bug-fix PRs and land first.
 ```
 
