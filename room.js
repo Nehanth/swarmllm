@@ -293,6 +293,7 @@ function onData(from, d) {
     return;
   }
   const e = conns.get(from);
+  if (e) e.pongAt = Date.now();   // any message is proof of life for the watchdogs
   if (d.t && d.t.startsWith("ai-")) { aiOnData(from, d); return; }
   switch (d.t) {
     case "hello":
@@ -329,7 +330,8 @@ function onData(from, d) {
     case "ping": sendTo(from, { t: "pong", ts: d.ts }); break;
     case "pong": {
       e.rtt = Math.round(performance.now() - d.ts);
-      e.pongAt = Date.now();
+      // a pong from a peer the watchdog gave up on: it was a stall, not a leave
+      if (isHost && gone.has(from)) { gone.delete(from); if (ai.role === "host" && ai.state !== "idle") schedulePlan(`${e.name} is back`); }
       if (e.card) e.card.querySelector(".rtt").textContent = e.rtt + " ms";
       break;
     }
@@ -394,6 +396,18 @@ setInterval(() => {
   const now = Date.now();
   for (const id of ai.chain) { const e = conns.get(id); if (e && now - (e.pongAt || now) > 7500) peerGone(id, e.name); }
 }, 2500);
+// while an answer is in flight the host pings the chain it is served by every 500 ms and gives
+// up on a member 2 s after its last message (any message counts: pongs, hidden states); a tab
+// that closed without a clean PeerJS close then stops the answer in ~2 s instead of 7.5 s
+setInterval(() => {
+  if (ai.role !== "host" || !ai.gen) return;
+  const now = Date.now();
+  for (const id of ai.gen.chain) {
+    const e = conns.get(id); if (!e) continue;
+    sendTo(id, { t: "ping", ts: performance.now() });
+    if (now - (e.pongAt || now) > 2000) peerGone(id, e.name);
+  }
+}, 500);
 
 const stepGB = (d) => { const i = $("join-gb"); const lo = parseFloat(i.min) || 1; const st = parseFloat(i.step) || 1; i.value = Math.min(64, Math.max(lo, (parseFloat(i.value) || lo) + d * st)); };
 $("gb-minus").addEventListener("click", () => stepGB(-1));
@@ -1069,6 +1083,7 @@ async function aiGenerate(textArg, who) {
   // the chain serving this answer is frozen: a plan arriving now waits for ai-gendone
   ai.gen = { v: ai.planV, chain: ai.chain.slice() };
   const chain = ai.gen.chain;
+  for (const id of chain) { const e = conns.get(id); if (e) e.pongAt = Date.now(); }   // fresh 2 s liveness budget
   ai.stopReason = null;
   setState("generating", "");
   $("ai-prompt").value = "";
