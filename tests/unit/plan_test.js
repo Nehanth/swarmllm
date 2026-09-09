@@ -199,6 +199,27 @@ Deno.test("plan: worked 27B example (docs/protocol.md)", () => {
   eq(q1.L, 64);
 });
 
+Deno.test("plan: waiting -> join keeps the served plan as prev (host range and order survive)", () => {
+  // 14.5 GiB host: the desktop leaves and the room cannot hold the model (waiting); room.js keeps
+  // the last served plan as prev, so a 2 GiB joiner leaves the host's 58 layers where they are
+  const w = (hostGiB, workers) => ({ ...DIMS.q27, host: { id: "h", name: "host", pledgeBytes: hostGiB * GiB }, workers });
+  const desk = { id: "w", name: "worker-e2e", pledgeBytes: 1 * GiB, webgpu: true };
+  const phone = { id: "p", name: "phone-e2e", pledgeBytes: 0.5 * GiB, webgpu: true };
+  const late = { id: "x", name: "late-e2e", pledgeBytes: 2 * GiB, webgpu: true };
+  const q0 = planSplit(w(14.5, [phone, desk]));
+  eq(q0.ranges, { h: [0, 58], p: [58, 60], w: [60, 64] }, "served plan");
+  const q1 = planSplit({ ...w(14.5, [phone]), prev: q0 });
+  eq(q1.fits, false); eq(q1.held, 62);
+  const q2 = planSplit({ ...w(14.5, [phone, late]), prev: q0 });
+  eq(q2.hostRange, q0.hostRange, "host keeps its range after waiting");
+  eq(q2.pinned, true);
+  eq(q2.chain.map((c) => c.id), ["p", "x"], "survivor first, newcomer appended");
+  eq(q2.ranges, { h: [0, 58], p: [58, 59], x: [59, 64] });
+  // without the remembered plan the host would reload 5 layers for nothing
+  const q3 = planSplit({ ...w(14.5, [phone, late]), prev: null });
+  eq(q3.hostRange, [0, 53]);
+});
+
 Deno.test("plan: more workers than layers -> idle, host may hold 0", () => {
   const input = { L: 3, layerBytes: GiB, embedBytes: 0, host: { id: "h", pledgeBytes: 8 * GiB },
     workers: ["a", "b", "c", "d", "e"].map((id) => ({ id, name: id, pledgeBytes: 4 * GiB, webgpu: true })) };

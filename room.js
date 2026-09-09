@@ -633,6 +633,7 @@ let ai = {
   state: "idle",         // idle | loading | online | generating | redealing | waiting
   planV: 0,              // plan version, monotonic per room; workers: the version they hold
   plan: null,            // host: current planSplit result (+ v)
+  lastPlan: null,        // host: the plan served before the room went to "waiting" (keeps order + host pin across it)
   gen: null,             // host: {v, chain} frozen for the answer in flight
   planWanted: null,      // host: reason for a pending re-plan
   planTimer: null,
@@ -931,7 +932,7 @@ async function aiStart(modelArg) {
     }
     ai.dims = { L, layerBytes, embedBytes };
     ai.modelKey = modelKey;
-    ai.plan = null; ai.exclude = new Set(); ai.speed = new Map();
+    ai.plan = null; ai.lastPlan = null; ai.exclude = new Set(); ai.speed = new Map();
     // the first plan goes through the same queue as every later one, so a device leaving
     // during the download re-plans right after the host's own load
     const p = ai.loadQ.then(() => applyPlan("start"));
@@ -941,7 +942,7 @@ async function aiStart(modelArg) {
     clearInterval(ai.progTimer);
     aiLoading(false);
     ai.engine = null;
-    ai.plan = null; ai.chain = [];
+    ai.plan = null; ai.lastPlan = null; ai.chain = [];
     $("ai-panel").classList.remove("online");
     aiStatus("failed: " + err.message);
     ai.busy = false;
@@ -956,13 +957,15 @@ async function aiStart(modelArg) {
 async function applyPlan(reason) {
   if (ai.gen) { ai.planWanted = ai.planWanted || reason; return; }   // the chain is frozen for the answer: queue instead
   const v = ++ai.planV;
-  const prev = ai.plan;
+  // the plan served last, even across "waiting": survivors keep their order and the host its
+  // range when they still fit, so a join after a waiting spell reloads only the delta
+  const prev = ai.plan || ai.lastPlan || null;
   const M = MODELS[ai.modelKey];
   const first = !ai.engine;
   const nameOf = (id) => id === peer.id ? "you" : (conns.get(id)?.name || id);
   const plan = planSplit({ ...ai.dims, ...aiMembersForPlan(), prev, exclude: ai.exclude });
   if (!plan.fits) {
-    ai.plan = null; ai.chain = []; ai.busy = "wait"; ai.layersByName = {};
+    ai.lastPlan = prev; ai.plan = null; ai.chain = []; ai.busy = "wait"; ai.layersByName = {};
     log("swarm", `${M.label} \u2014 the room holds ${plan.held} of ${plan.L} layers${reason ? ` (${reason})` : ""} \u2014 waiting for a device`);
     setState("waiting", `waiting for a device \u2014 room holds ${plan.held} of ${plan.L} layers`);
     $("ai-empty").textContent = "waiting for a device \u2014 share the room code";
@@ -983,7 +986,8 @@ async function applyPlan(reason) {
   log("swarm", describeSplit(plan, nameOf, M.label) + (!first && reason ? ` (${reason})` : ""));
   if (prev) log("swarm", note || "layer split unchanged");
   setState(first ? "loading" : "redealing", first ? "" : (note || "re-dealing layers"));
-  const hostSame = ai.engine && ai.model === ai.modelKey && prev && prev.hostRange[0] === plan.hostRange[0] && prev.hostRange[1] === plan.hostRange[1];
+  // the engine's own range decides whether the host reloads (not prev: after "waiting" prev is the remembered plan)
+  const hostSame = ai.engine && ai.model === ai.modelKey && ai.range && ai.range[0] === plan.hostRange[0] && ai.range[1] === plan.hostRange[1];
   try {
     if (!hostSame) await aiLoadShard(ai.modelKey, plan.hostRange, true, true, { quiet: !first });
     if (v !== ai.planV) return;   // superseded while loading
