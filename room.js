@@ -289,16 +289,6 @@ function onData(from, d) {
         aiRejoin(from, d.name);
       }
       break;
-    case "ai-next": ai.next = d.next; ensureLink(d.next); break;
-    case "ai-reset": try { ai.engine?.reset?.(); } catch {} break;
-    case "ai-layers": ai.layersByName = d.by; loadCardRender(); break;
-    case "ai-start-req":
-      if (MODELS[d.model]) $("ai-model").value = d.model;   // every screen shows the model that was actually started
-      $("ai-start").disabled = true; $("ai-model").disabled = true;
-      if (d.boss !== peer.id) { aiLoading(true, `starting ${MODELS[d.model]?.label.split("\u00b7")[0].trim()}`); $("ldg-sub").textContent = `${d.by} pressed start`; $("ldg-fill").style.width = "0%"; }
-      if (d.boss === peer.id) { toast(`${d.by} started ${MODELS[d.model]?.label.split("\u00b7")[0].trim()}`); aiStart(d.model); }
-      else aiStatus(`${d.by} started the model\u2026`);
-      break;
     case "roster": {
       // the host's view of the room: draw a card per device, no mesh connections
       const seen = new Set();
@@ -568,8 +558,9 @@ let ai = {
   next: null,            // worker: peer id to forward hidden to, or "host"
   readyPeers: new Set(),
   pos: 0,
-  waiters: new Map(),    // pos -> resolve(hiddenF32) for host awaiting return
+  waiters: new Map(),    // pos | "b"+pos -> {res, rej, timer}: host laps awaiting their return (waitLap)
   busy: false,
+  stopReason: null,      // host: set when a chain member left mid-answer; waitLap rejects with it
 };
 
 function aiStatus(s) { $("ai-status").textContent = s; crumb(s); }
@@ -919,6 +910,21 @@ function aiMaybeReady() {
   mascot("Cluster online! Ask anything. Everyone in the room can.");
 }
 
+// one outstanding lap: resolved by ai-hiddenret(-b), rejected by the timer or by rejectLaps
+// (a chain member left). Resolving or rejecting clears the timer and the map entry.
+function waitLap(key, ms) {
+  if (ai.stopReason) return Promise.reject(new Error(ai.stopReason));
+  return new Promise((resolve, reject) => {
+    const w = { res: null, rej: null, timer: null };
+    const done = () => { clearTimeout(w.timer); ai.waiters.delete(key); };
+    w.res = (h) => { done(); resolve(h); };
+    w.rej = (err) => { done(); reject(err); };
+    w.timer = setTimeout(() => w.rej(new Error("pipeline timeout (peer gone?)")), ms);
+    ai.waiters.set(key, w);
+  });
+}
+function rejectLaps(err) { for (const w of [...ai.waiters.values()]) w.rej(err); }
+
 // run one token through the whole pipeline, returns logits
 async function aiPipeToken(id, needLogits = true) {
   const pos = ai.pos;
@@ -933,10 +939,7 @@ async function aiPipeToken(id, needLogits = true) {
   let h = await ai.engine.embedRun(id, pos);
   if (badF32(h)) throw new Error(`NaN after HOST layers (pos ${pos}) — host GPU kernel issue`);
   if (ai.chain.length) {
-    const returned = new Promise((res, rej) => {
-      ai.waiters.set(pos, res);
-      setTimeout(() => { ai.waiters.delete(pos); rej(new Error("pipeline timeout (peer gone?)")); }, 30000);
-    });
+    const returned = waitLap(pos, 30000);
     sendHidden(ai.chain[0], { t: "ai-hidden", pos, ...packWire(h) });
     h = await returned;
     if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos}) — check peer status lines`);
@@ -1007,10 +1010,7 @@ async function aiGenerate(textArg, who) {
           hb.set(await ai.engine.embedRunBatch(ids.slice(i + c * NCW, i + (c + 1) * NCW), basePos + c * NCW), c * NCW * hdim);
         if (badF32(hb)) throw new Error(`NaN in batched prefill (pos ${basePos})`);
         if (ai.chain.length) {
-          const returned = new Promise((res, rej) => {
-            ai.waiters.set("b" + basePos, res);
-            setTimeout(() => { ai.waiters.delete("b" + basePos); rej(new Error("pipeline timeout (batch prefill)")); }, 90000);
-          });
+          const returned = waitLap("b" + basePos, 90000);
           sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * NCW, ...packWire(hb) });
           await returned;
         }
@@ -1045,10 +1045,7 @@ async function aiGenerate(textArg, who) {
             hb.set(await ai.engine.embedRunBatch(tokens.slice(c, c + m), pos + c, { base: c, total: n }), c * hdim);
           }
           if (badF32(hb)) throw new Error(`NaN after HOST layers (pos ${pos})`);
-          const returned = new Promise((res, rej) => {
-            ai.waiters.set("b" + pos, res);
-            setTimeout(() => { ai.waiters.delete("b" + pos); rej(new Error("pipeline timeout (verify)")); }, 90000);
-          });
+          const returned = waitLap("b" + pos, 90000);
           sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos: pos, n: tokens.length, spec: 1, ...packWire(hb) });
           const h = await returned;
           if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos})`);
@@ -1175,6 +1172,15 @@ async function aiOnData(from, d) {
       ai.prog = ai.prog || {}; ai.progAt = ai.progAt || {};
       ai.prog[e?.name || from] = d.pct; ai.progAt[e?.name || from] = Date.now(); loadCardRender();
       break;
+    case "ai-reset": try { ai.engine?.reset?.(); } catch {} break;
+    case "ai-layers": ai.layersByName = d.by; loadCardRender(); break;
+    case "ai-start-req":
+      if (MODELS[d.model]) $("ai-model").value = d.model;   // every screen shows the model that was actually started
+      $("ai-start").disabled = true; $("ai-model").disabled = true;
+      if (d.boss !== peer.id) { aiLoading(true, `starting ${MODELS[d.model]?.label.split("\u00b7")[0].trim()}`); $("ldg-sub").textContent = `${d.by} pressed start`; $("ldg-fill").style.width = "0%"; }
+      if (d.boss === peer.id) { toast(`${d.by} started ${MODELS[d.model]?.label.split("\u00b7")[0].trim()}`); aiStart(d.model); }
+      else aiStatus(`${d.by} started the model\u2026`);
+      break;
     case "ai-ready":
       ai.readyPeers.add(from);
       if (e?.card) e.card.querySelector(".bw").textContent = "ready";
@@ -1208,7 +1214,7 @@ async function aiOnData(from, d) {
     }
     case "ai-hiddenret-b": {
       const w = ai.waiters.get("b" + d.basePos);
-      if (w) { ai.waiters.delete("b" + d.basePos); w(unpackWire(d)); }
+      if (w) w.res(unpackWire(d));
       break;
     }
     case "ai-hidden": {
@@ -1227,7 +1233,7 @@ async function aiOnData(from, d) {
     case "ai-hiddenret": {
       // host: pipeline round-trip complete
       const w = ai.waiters.get(d.pos);
-      if (w) { ai.waiters.delete(d.pos); w(unpackWire(d)); }
+      if (w) w.res(unpackWire(d));
       break;
     }
     case "ai-genstart":
