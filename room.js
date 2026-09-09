@@ -928,6 +928,7 @@ async function aiStart(modelArg) {
 // deal (or re-deal) the layers over the devices in the room and get every device loading its
 // range; called only from schedulePlan (queued) or aiStart, never while an answer is in flight
 async function applyPlan(reason) {
+  if (ai.gen) { ai.planWanted = ai.planWanted || reason; return; }   // the chain is frozen for the answer: queue instead
   const v = ++ai.planV;
   const prev = ai.plan;
   const M = MODELS[ai.modelKey];
@@ -975,9 +976,10 @@ async function applyPlan(reason) {
 // finally picks planWanted up), then runs on the load queue behind any load still going
 function schedulePlan(reason) {
   ai.planWanted = reason;
-  if (ai.busy === "gen") return;
+  if (ai.busy === "gen" || ai.gen) return;
   clearTimeout(ai.planTimer);
   ai.planTimer = setTimeout(() => {
+    if (ai.busy === "gen" || ai.gen) return;   // a question started inside the 300 ms: planWanted stays, aiGenerate's tail re-schedules
     const r = ai.planWanted; ai.planWanted = null;
     if (r === null) return;
     ai.loadQ = ai.loadQ.then(() => applyPlan(r)).catch((e) => log("swarm", "plan failed: " + e.message));
@@ -1012,7 +1014,7 @@ function hostGone() {
 
 // host: the current plan is served once every chain member reported ready for it
 function aiMaybeReady() {
-  if (ai.role !== "host" || !ai.engine || !ai.plan) return;
+  if (ai.role !== "host" || !ai.engine || !ai.plan || ai.busy === "gen" || ai.gen) return;   // a stray ready must not unlock a running answer
   if (!ai.chain.every((id) => ai.readyPeers.has(id))) return;
   ai.busy = false;
   clearInterval(ai.progTimer);
@@ -1080,7 +1082,9 @@ async function aiGenerate(textArg, who) {
   ai.pos = 0;
   broadcastAll({ t: "ai-reset" });
   ai.busy = "gen";
-  // the chain serving this answer is frozen: a plan arriving now waits for ai-gendone
+  // the chain serving this answer is frozen: a plan arriving now waits for ai-gendone, and a
+  // plan already ticking down its 300 ms is held back too (planWanted keeps the reason)
+  clearTimeout(ai.planTimer);
   ai.gen = { v: ai.planV, chain: ai.chain.slice() };
   const chain = ai.gen.chain;
   for (const id of chain) { const e = conns.get(id); if (e) e.pongAt = Date.now(); }   // fresh 2 s liveness budget
