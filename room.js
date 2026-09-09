@@ -9,6 +9,7 @@ import { Qwen35Engine } from "./engine/qwen35.js";
 import { WIRE_F16, badF32, f32ToB64, packF16, unpackF16, asU16, packWire, unpackWire, asF32, b64ToF32 } from "./room/wire.js";
 import { esc, md } from "./room/markdown.js";
 import { aiSample } from "./room/sampling.js";
+import { chatRecipients } from "./room/visibility.js";
 import { MODELS, NEED_GB, MAX_SEQ, MAX_NEW, MIN_ROOM } from "./room/models.js";
 import { makeLink, attachWire, wireReady, sendFrame } from "./room/transport.js";
 
@@ -126,83 +127,25 @@ function log(from, text) {
   $("chat-log").scrollTop = $("chat-log").scrollHeight;
 }
 
-function renderTagsHtml(tags) {
-  if (!tags) return "";
-  const tagArr = Array.isArray(tags) ? tags : String(tags).split(",").map(s => s.trim()).filter(Boolean);
-  if (!tagArr.length) return "";
-  return `<div class="peer-tags">${tagArr.map(t => `<span class="tag-chip">${esc(t)}</span>`).join("")}</div>`;
-}
-
 function peerCard(id, name, meta, self) {
   const card = document.createElement("div");
   card.className = "peer-card" + (self ? " self" : "");
-  const budget = meta.budgetGB || meta.maxBufGB;
-  const tagsHtml = renderTagsHtml(meta.tags);
   card.innerHTML = `
     <div class="peer-name"><span class="dot ${self ? "ok" : "warn"}"></span><span class="pname"></span></div>
-    <div class="tags-container">${tagsHtml}</div>
     <div class="peer-gpu"></div>
     <div class="peer-stats">
       <span>rtt <b class="rtt">—</b></span>
       <span>bw <b class="bw">—</b></span>
       <span>buf <b class="buf">—</b></span>
-      <span>max <b class="max-mem">${budget ? budget + " GB" : "—"}</b></span>
     </div>
-    <div class="node-edit-box" style="display:none;">
-      <div class="node-edit-row">
-        <input class="edit-name" placeholder="Name" value="${esc(name)}">
-        <input class="edit-tags" placeholder="Tags (comma-separated)" value="${esc(Array.isArray(meta.tags) ? meta.tags.join(", ") : meta.tags || "")}">
-        <button class="save-node-btn primary">Save</button>
-      </div>
-    </div>
-    <div class="card-btn-row" style="display:flex; gap:6px; margin-top:8px;">
-      <button class="edit-node-btn">${self ? "edit node" : (isHost ? "edit peer" : "details")}</button>
-      ${self ? "" : '<button class="bw-btn">test bandwidth</button>'}
-    </div>`;
+    ${self ? "" : '<button class="bw-btn">test bandwidth</button>'}`;
   card.querySelector(".pname").textContent = name + (self ? " (you)" : "");
   card.querySelector(".peer-gpu").textContent = meta.webgpu
     ? `${meta.ua} · ${meta.gpu}` : `${meta.ua} · ⚠ no WebGPU`;
+  const budget = meta.budgetGB || meta.maxBufGB;
   card.querySelector(".buf").textContent = meta.contribGB ? "gives " + meta.contribGB + " GB" : (budget ? budget + " GB" : "—");
   $("peers").appendChild(card);
-
   if (!self) card.querySelector(".bw-btn").addEventListener("click", () => bwTest(id));
-
-  const editBtn = card.querySelector(".edit-node-btn");
-  if (editBtn) {
-    const editBox = card.querySelector(".node-edit-box");
-    editBtn.addEventListener("click", () => {
-      editBox.style.display = editBox.style.display === "none" ? "block" : "none";
-    });
-    card.querySelector(".save-node-btn").addEventListener("click", () => {
-      const newName = card.querySelector(".edit-name").value.trim() || name;
-      const tagsStr = card.querySelector(".edit-tags").value.trim();
-      const tagsArr = tagsStr.split(",").map(s => s.trim()).filter(Boolean);
-      editBox.style.display = "none";
-      if (self) {
-        myName = newName;
-        myMeta.tags = tagsArr;
-        card.querySelector(".pname").textContent = myName + " (you)";
-        card.querySelector(".tags-container").innerHTML = renderTagsHtml(myMeta.tags);
-        broadcastAll({ t: "node-update", name: myName, meta: myMeta });
-        if (isHost) {
-          roster.set(peer.id, { name: myName, meta: myMeta });
-          broadcastRoster();
-        }
-      } else if (isHost && conns.has(id)) {
-        const e = conns.get(id);
-        if (e) {
-          e.name = newName;
-          e.meta.tags = tagsArr;
-          members.set(id, { name: newName, meta: e.meta });
-          roster.set(id, { name: newName, meta: e.meta });
-          card.querySelector(".pname").textContent = newName;
-          card.querySelector(".tags-container").innerHTML = renderTagsHtml(tagsArr);
-          broadcastRoster();
-        }
-      }
-      updateCluster();
-    });
-  }
   return card;
 }
 
@@ -225,20 +168,9 @@ function updateCluster() {
   const gpus = all.filter(m => m && m.webgpu).length;
   const pledged = all.reduce((s, m) => s + (m?.contribGB || 0), 0);
   updateNeed(pledged);
-  const totalMaxMem = all.reduce((s, m) => s + (m?.budgetGB || m?.maxBufGB || 0), 0);
+  const mem = all.reduce((s, m) => s + (m?.budgetGB || m?.maxBufGB || 0), 0);
   $("cluster-summary").textContent =
-    `${all.length} device${all.length > 1 ? "s" : ""} \u00b7 ${gpus} WebGPU \u00b7 ${pledged.toFixed(1)} GB pledged (${totalMaxMem.toFixed(1)} GB max)`;
-
-  if (isHost) {
-    const hostCtrl = $("host-controls");
-    if (hostCtrl) {
-      hostCtrl.style.display = "block";
-      const storageSummary = $("host-storage-summary");
-      if (storageSummary) {
-        storageSummary.textContent = `Host Storage Inspector: Room Max Storage: ${totalMaxMem.toFixed(1)} GB | Pledged Allocation for Slicing: ${pledged.toFixed(1)} GB`;
-      }
-    }
-  }
+    `${all.length} device${all.length > 1 ? "s" : ""} \u00b7 ${gpus} WebGPU \u00b7 ${pledged.toFixed(1)} GB pledged`;
 }
 
 function enterRoom() {
@@ -248,6 +180,7 @@ function enterRoom() {
   $("room-badge").textContent = roomCode;
   $("side-code").textContent = roomCode;
   $("side-code").addEventListener("click", copyRoomLink);
+  if (isHost) $("host-controls").hidden = false;
   peerCard("self", myName, myMeta, true);
   updateCluster();
   log("swarm", `room ${roomCode} — share this code with your other devices`);
@@ -356,6 +289,7 @@ function onData(from, d) {
       if (isHost) {
         roster.set(from, { name: d.name, meta: d.meta }); broadcastRoster();
         aiRejoin(from, d.name);
+        if (ai.visibility !== "all") sendTo(from, { t: "ai-visibility", mode: ai.visibility });
       }
       break;
     case "ai-next": ai.next = d.next; ensureLink(d.next); break;
@@ -389,20 +323,6 @@ function onData(from, d) {
       if (e.card) e.card.querySelector(".rtt").textContent = e.rtt + " ms";
       break;
     }
-    case "node-update":
-      if (e) {
-        e.name = d.name; e.meta = d.meta;
-        if (e.card) {
-          e.card.querySelector(".pname").textContent = d.name;
-          const tagsCont = e.card.querySelector(".tags-container");
-          if (tagsCont) tagsCont.innerHTML = renderTagsHtml(d.meta?.tags);
-          if (d.meta?.contribGB) e.card.querySelector(".buf").textContent = "gives " + d.meta.contribGB + " GB";
-        }
-      }
-      if (members.has(from)) members.set(from, { name: d.name, meta: d.meta });
-      if (isHost && roster.has(from)) { roster.set(from, { name: d.name, meta: d.meta }); broadcastRoster(); }
-      updateCluster();
-      break;
     case "pledge":
       if (e) { e.meta = { ...e.meta, contribGB: d.gb }; if (e.card) e.card.querySelector(".buf").textContent = "gives " + d.gb + " GB"; }
       if (members.has(from)) members.get(from).meta = { ...members.get(from).meta, contribGB: d.gb };
@@ -471,10 +391,6 @@ async function start(create) {
   $("create-btn").disabled = $("join-btn").disabled = true;
   $("join-status").textContent = "connecting to signaling…";
   myMeta = await metaPromise;
-  const rawTags = $("tags-input")?.value.trim() || "";
-  if (rawTags) {
-    myMeta.tags = rawTags.split(",").map(s => s.trim()).filter(Boolean);
-  }
   const gbIn = parseFloat($("join-gb").value);
   myMeta.contribGB = Math.max(myMeta.phone ? 0.5 : 1, gbIn > 0 ? gbIn : (myMeta.contribGB || 1));
 
@@ -570,18 +486,17 @@ $("create-btn").addEventListener("click", () => { keepAwake(); start(true); });
 // (auto-rejoin removed: the user prefers to see what happened)
 $("join-btn").addEventListener("click", () => { keepAwake(); start(false); });
 $("code-input").addEventListener("keydown", (e) => { if (e.key === "Enter") start(false); });
-const initialCode = (new URLSearchParams(location.search).get("code") || new URLSearchParams(location.search).get("room") || "").trim().toUpperCase();
-if (initialCode && $("code-input")) $("code-input").value = initialCode;
-
+// the room code badge copies a join link; a page opened with ?code=ABCD has the code filled in
 function copyRoomLink() {
-  const roomUrl = `${location.origin}${location.pathname}?code=${roomCode}`;
-  if (navigator.clipboard) {
-    navigator.clipboard.writeText(roomUrl).then(() => { toast("room join link copied"); log("swarm", "room link copied: " + roomUrl); })
-      .catch(() => { navigator.clipboard.writeText(roomCode); toast("room code copied"); });
-  } else { toast("room code: " + roomCode); }
+  const url = `${location.origin}${location.pathname}?code=${roomCode}`;
+  if (!navigator.clipboard) { toast("room code: " + roomCode); return; }
+  navigator.clipboard.writeText(url).then(() => toast("join link copied")).catch(() => { navigator.clipboard.writeText(roomCode); toast("room code copied"); });
 }
-
 $("room-badge").addEventListener("click", copyRoomLink);
+{
+  const code = (new URLSearchParams(location.search).get("code") || "").trim().toUpperCase();
+  if (code) $("code-input").value = code;
+}
 
 // ================= distributed inference =================
 
@@ -657,6 +572,7 @@ const rangeBytesOf = (url) => async (info) => {
 };
 
 let ai = {
+  visibility: "all",   // who sees the chat: all | host | asker (room/visibility.js)
   engine: null, tok: null, cfg: null, device: null,
   role: null,            // "host" | "worker"
   chain: [],             // host: worker peer ids in pipeline order
@@ -1045,21 +961,15 @@ async function aiPipeToken(id, needLogits = true) {
 }
 
 
-function broadcastOutput(msg, askerName) {
-  const mode = ai.outputVisibility || "all";
-  if (mode === "host-only") return;
-  if (mode === "asker-only") {
-    if (askerName && askerName !== myName) {
-      for (const [id, e] of conns) {
-        if (e.name === askerName) sendTo(id, msg);
-      }
-    }
-    return;
-  }
-  broadcastAll(msg);
+// who sees the chat: the host's dropdown. The full message goes to the screens allowed to see
+// the text, the hidden stand-in (same type, `hidden: true`) to the others, so every screen still
+// locks and unlocks its Send box with the answer.
+function sendChat(msg, askerId) {
+  const { full, hidden } = chatRecipients(ai.visibility || "all", askerId, [...conns.keys()]);
+  for (const id of full) sendTo(id, msg);
+  if (msg.t !== "ai-token") for (const id of hidden) sendTo(id, { t: msg.t, name: msg.name, stats: msg.stats, hidden: true });
 }
-
-async function aiGenerate(textArg, who) {
+async function aiGenerate(textArg, who, askerId = peer.id) {
   const text = (textArg ?? $("ai-prompt").value).trim();
   const asker = who || myName;
   if (!text || ai.busy === "gen" || !ai.engine) return;
@@ -1081,15 +991,7 @@ async function aiGenerate(textArg, who) {
 
   chatUser(asker, text);
   chatBotStart();
-  const visMode = ai.outputVisibility || "all";
-  if (visMode === "host-only" || (visMode === "asker-only" && asker !== myName)) {
-    for (const [id, e] of conns) {
-      if (visMode === "asker-only" && e.name === asker) sendTo(id, { t: "ai-genstart", name: asker, text });
-      else sendTo(id, { t: "ai-genstart-hidden", name: asker });
-    }
-  } else {
-    broadcastAll({ t: "ai-genstart", name: asker, text });
-  }
+  sendChat({ t: "ai-genstart", name: asker, text }, askerId);
   mascot("Thinking… every word is taking a lap through the room.");
   aiStatus(`prefill: ${ids.length} tokens…`);
 
@@ -1146,7 +1048,7 @@ async function aiGenerate(textArg, who) {
       reply += piece;
       count++;
       chatBotUpdate(reply);
-      broadcastOutput({ t: "ai-token", text: piece }, asker);
+      sendChat({ t: "ai-token", text: piece }, askerId);
       aiStatus(`generating… ${count} tok · ${(count / ((performance.now() - t0) / 1000)).toFixed(1)} tok/s`);
     };
     if (ai.engine.mtp && ai.engine.specStep) {
@@ -1235,27 +1137,13 @@ async function aiGenerate(textArg, who) {
     const secs = (performance.now() - t0) / 1000;
     const stats = `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices${capped ? ` · stopped: context full (${MAX_SEQ} tokens)` : ""}`;
     chatBotEnd(reply, stats);
-    if (visMode === "host-only" || (visMode === "asker-only" && asker !== myName)) {
-      for (const [id, e] of conns) {
-        if (visMode === "asker-only" && e.name === asker) sendTo(id, { t: "ai-gendone", stats });
-        else sendTo(id, { t: "ai-gendone-hidden", stats });
-      }
-    } else {
-      broadcastAll({ t: "ai-gendone", stats });
-    }
+    sendChat({ t: "ai-gendone", stats }, askerId);
     mascot("Done. Anyone in the room can ask the next one.");
     aiStatus(`ready — prefill ${((t0 - tPre) / 1000).toFixed(1)}s, ${stats}`);
   } catch (err) {
     aiStatus("generation failed: " + err.message);
     chatBotEnd("\u26a0 " + err.message, "");
-    if (visMode === "host-only" || (visMode === "asker-only" && asker !== myName)) {
-      for (const [id, e] of conns) {
-        if (visMode === "asker-only" && e.name === asker) sendTo(id, { t: "ai-gendone", stats: "failed: " + err.message });
-        else sendTo(id, { t: "ai-gendone-hidden", stats: "failed: " + err.message });
-      }
-    } else {
-      broadcastAll({ t: "ai-gendone", stats: "failed: " + err.message });
-    }
+    sendChat({ t: "ai-gendone", stats: "failed: " + err.message }, askerId);   // unlock everyone's send box
   }
   ai.busy = false;
   $("ai-send").disabled = false;
@@ -1361,32 +1249,19 @@ async function aiOnData(from, d) {
       if (w) { ai.waiters.delete(d.pos); w(unpackWire(d)); }
       break;
     }
-    case "ai-visibility-change":
-      ai.outputVisibility = d.mode;
-      if (d.mode !== "all") toast(`Host set output visibility to: ${d.mode}`);
-      break;
-    case "ai-genstart-hidden":
-      ai.remoteReply = "";
-      chatUser(d.name, "[Prompt submitted - output restricted by host]");
-      chatBotStart();
-      chatBotUpdate("*(Compute worker active - output text is restricted to authorized devices)*");
-      $("ai-send").disabled = true;
-      mascot(`${d.name} asked something. Computing…`);
-      break;
-    case "ai-gendone-hidden":
-      chatBotEnd("*(Generation finished - computed by swarm)*", d.stats || "");
-      $("ai-send").disabled = false;
-      mascot("Your turn. Ask anything.");
+    case "ai-visibility":
+      ai.visibility = d.mode;
+      toast(d.mode === "all" ? "the host shows the chat to everyone" : d.mode === "host" ? "the host keeps the chat private" : "the host shows each answer to whoever asked");
       break;
     case "ai-genstart":
       ai.remoteReply = "";
-      chatUser(d.name, d.text);
+      chatUser(d.name, d.hidden ? "asked something (the host keeps the chat private)" : d.text);
       chatBotStart();
       $("ai-send").disabled = true;
       mascot(`${d.name} asked something. Thinking…`);
       break;
     case "ai-token": ai.remoteReply = (ai.remoteReply || "") + d.text; chatBotUpdate(ai.remoteReply); break;
-    case "ai-gendone": chatBotEnd(ai.remoteReply || "", d.stats); $("ai-send").disabled = false; mascot("Your turn. Ask anything."); break;
+    case "ai-gendone": chatBotEnd(d.hidden ? "answer hidden by the host" : (ai.remoteReply || ""), d.stats); $("ai-send").disabled = false; mascot("Your turn. Ask anything."); break;
     case "ai-ready-all":
       aiLoading(false);
       $("ai-panel").classList.add("online");
@@ -1399,18 +1274,18 @@ async function aiOnData(from, d) {
     case "ai-ask":
       if (ai.role !== "host") break;
       if (ai.busy === "gen") { sendTo(from, { t: "ai-busy" }); break; }
-      aiGenerate(d.text, d.name);
+      aiGenerate(d.text, d.name, from);
       break;
     case "ai-busy": toast("the swarm is still answering, try again in a moment"); break;
   }
 }
 
-$("ai-visibility")?.addEventListener("change", (e) => {
-  ai.outputVisibility = e.target.value;
-  broadcastAll({ t: "ai-visibility-change", mode: ai.outputVisibility });
-  toast(`output visibility set to ${e.target.value}`);
-});
 $("ai-start").addEventListener("click", aiStartAnywhere);
+$("ai-visibility").addEventListener("change", (e) => {
+  ai.visibility = e.target.value;
+  broadcastAll({ t: "ai-visibility", mode: ai.visibility });
+  toast(ai.visibility === "all" ? "everyone sees the chat" : ai.visibility === "host" ? "only you see the chat" : "each answer goes to whoever asked");
+});
 $("cache-clear").addEventListener("click", async (ev) => {
   ev.preventDefault();
   try { await caches.delete("swarmllm-weights-v1"); weightCache = null; toast("cached weights cleared"); } catch { toast("could not clear the cache"); }
