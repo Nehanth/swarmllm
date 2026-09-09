@@ -46,3 +46,14 @@ Deno.test("transport refuses when no channel is open", () => {
   const link = makeLink(); link.chans.push({ readyState: "connecting", send() {} });
   if (sendFrame(link, { t: "ai-hidden", pos: 0, data: new Uint16Array(8) })) throw new Error("should refuse");
 });
+Deno.test("transport carries the plan version (0 when absent)", () => {
+  const data = new Uint16Array(64); for (let i = 0; i < data.length; i++) data[i] = i * 3;
+  for (const [v, want] of [[7, 7], [undefined, 0]]) {
+    const link = makeLink(), out = []; fakeChannels(link, 1, out);
+    if (!sendFrame(link, { t: "ai-hidden", pos: 3, v, data })) throw new Error("send refused");
+    let got = null; const deliver = receiver((m) => { got = m; });
+    for (const { buf } of out) deliver(buf);
+    if (!got || got.v !== want) throw new Error(`v: expected ${want}, got ${got?.v}`);
+    if (got.pos !== 3 || got.data.length !== data.length) throw new Error("frame changed");
+  }
+});

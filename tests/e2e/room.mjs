@@ -9,6 +9,24 @@
 //   npm run e2e -- --devices 16 --phones 8 --model qwen3.8-27b   16 tabs, half phone-shaped, 1 GB / 0.5 GB pledges
 //   Signaling runs on a local PeerServer (node_modules/.bin/peerjs) unless --signal cloud.
 //
+// Re-deal scenarios (roadmap 12): the room comes online, then one event, then the remaining rounds
+// must still be answered by a fresh plan with 0 room errors (report: plans before/after, split lines).
+//   npm run e2e -- --phone --leave worker --leave-at 1.5    close the worker tab 1.5 s into round 0
+//   npm run e2e -- --phone --leave phone --leave-at 1.5     same for the phone-shaped tab
+//   npm run e2e -- --phone --join-after 2                   a desktop tab ('late-e2e', 1 GB) joins 2 s after online
+//   npm run e2e -- --phone --host-gb 0.5 --join-after 2     the worker (1 GB) is the boss, the creator only a worker: a boss that joined dials the room itself
+//   npm run e2e -- --phone --host-gb 0.5 --leave phone       same room, the phone leaves mid-answer (the joined boss re-plans from the roster)
+//   npm run e2e -- --phone --redeal                         press the host's re-deal button
+//   npm run e2e -- --model qwen3.8-27b --leave phone --leave-at 5      the 27B (spec decode) survives a leave (~7 min)
+//   npm run e2e -- --model qwen3.8-27b --host-gb 14 --leave worker --expect-waiting   room too small after the leave
+//   npm run e2e -- --phone --leave host --leave-at 1.5 --expect-over   the host tab dies mid-answer: every other
+//                                                            tab must reach body[data-state]="over" with Send enabled
+//   npm run e2e -- --phone --redeal --verbose     also print every tab's room log
+// --leave takes a tab key (worker, worker2, phone, …; host only with --expect-over, the room is over then).
+// With --leave the host pledge grows by the departed pledge so the survivors still hold the model.
+// Desktop tabs share one browser context and therefore one Cache API, so a late desktop joiner is
+// artificially warm.
+//
 // The phone tab gets a mobile user agent (the room then treats it as a phone: 0.5 GB pledge,
 // 256 MB buffer cap, no weight cache) and a 4x CPU throttle. Needs `npm install` (playwright)
 // and a Chromium that exposes WebGPU on this machine; on Linux/NVIDIA the flags below do.
@@ -32,7 +50,13 @@ const CLOUD = arg("signal", "local") === "cloud";
 // pledges in GB: host,worker,phone. The 27B needs 16.5 GB in the room.
 // host pledge: whatever the joiners (1 GB desktop, 0.5 GB phone) leave of the model's need, at least 2 GB
 const NEED = { "qwen3.8-27b": 16.5, "qwen3-4b": 4.6, "qwen3-1.7b": 2.0, "qwen3-0.6b": 0.8 }[MODEL] || 2;
-const HOST_GB = arg("host-gb", String(Math.max(2, Math.ceil(NEED + 0.5 - (DEVICES - 1 - PHONES) * 1 - PHONES * 0.5))));
+// re-deal scenarios: --leave <tab> --leave-at <s> (close that tab s seconds into round 0),
+// --join-after <s> (one more desktop tab joins s seconds after online), --redeal (host button),
+// --expect-waiting (the run passes when the room ends up waiting for a device)
+const LEAVE = arg("leave"), LEAVE_AT = +arg("leave-at", 1.5), JOIN_AFTER = arg("join-after"), REDEAL = flag("redeal"), EXPECT_WAITING = flag("expect-waiting"), EXPECT_OVER = flag("expect-over");
+if (LEAVE === "host" && !EXPECT_OVER) { console.error("--leave host: when the host leaves the room is over; pass --expect-over to test that, or pick a worker or phone tab"); process.exit(2); }
+const LEAVE_GB = LEAVE ? (LEAVE === "host" ? 0 : LEAVE.startsWith("phone") ? 0.5 : 1) : 0;
+const HOST_GB = arg("host-gb", String(Math.max(2, Math.ceil(NEED + 0.5 - (DEVICES - 1 - PHONES) * 1 - PHONES * 0.5 + LEAVE_GB))));
 // GGUF files already on this machine stand in for Hugging Face (Range requests served from disk)
 const LOCAL = { "Qwen3.8-27B-Q4_0.gguf": "models/q38/model.gguf", "Qwen3-0.6B-Q8_0.gguf": "models/qwen/model.gguf", "Qwen3-1.7B-Q8_0.gguf": "models/qwen17/model.gguf" };
 const ROOT = path.resolve(new URL(".", import.meta.url).pathname, "../..");
@@ -84,10 +108,12 @@ async function localWeights(context) {
 const ctx = await browser.newContext({ userAgent: UA_DESKTOP, ignoreHTTPSErrors: true });
 if (!flag("no-local-weights")) await localWeights(ctx);
 const tabs = { host: await ctx.newPage() };
+let boss = null; const B = () => boss || tabs.host;
 const nDesk = DEVICES - 1 - PHONES;
 for (let i = 0; i < nDesk; i++) tabs[nDesk === 1 ? "worker" : "worker" + (i + 1)] = await ctx.newPage();
+let pctx = null;
 if (PHONE) {
-  const pctx = await browser.newContext({ userAgent: UA_PHONE, viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, ignoreHTTPSErrors: true });
+  pctx = await browser.newContext({ userAgent: UA_PHONE, viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, ignoreHTTPSErrors: true });
   if (!flag("no-local-weights")) await localWeights(pctx);
   for (let i = 0; i < PHONES; i++) {
     const pg = await pctx.newPage(); tabs[PHONES === 1 ? "phone" : "phone" + (i + 1)] = pg;
@@ -95,16 +121,41 @@ if (PHONE) {
     await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
   }
 }
-const errs = Object.fromEntries(Object.keys(tabs).map((k) => [k, []]));
-for (const [name, p] of Object.entries(tabs)) {
+const errs = {};
+// console errors and page errors per tab; a closed tab keeps its list (it counts too)
+function attach(name, p) {
+  errs[name] = errs[name] || [];
   p.on("console", (m) => { if (m.type() === "error") errs[name].push(m.text().slice(0, 200)); });
   p.on("pageerror", (e) => errs[name].push("pageerror: " + String(e).slice(0, 200)));
+}
+for (const [name, p] of Object.entries(tabs)) attach(name, p);
+// open one more desktop tab and join the room (the late joiner of --join-after)
+async function joinTab(name, gb, code) {
+  const pg = await ctx.newPage(); attach(name, pg);
+  await pg.goto(BASE);
+  await pg.waitForFunction(() => document.getElementById("join-gb").value !== "", null, { timeout: 60000 });
+  await pg.fill("#name-input", name + "-e2e"); await pg.fill("#join-gb", gb); await pg.fill("#code-input", code);
+  await pg.click("#join-btn");
+  return pg;
 }
 const t0 = Date.now(); const T = () => ((Date.now() - t0) / 1000).toFixed(1) + "s";
 const log = (...a) => console.error(T(), ...a);
 const status = (p) => p.evaluate(() => [document.getElementById("ai-status").textContent, document.getElementById("ldg-sub").textContent, document.getElementById("ldg-fill").style.width].join(" | "));
+const lastLog = (p, re) => p.evaluate((src) => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => new RegExp(src).test(t)).slice(-1)[0] || "", re.source);
+// a round ends with "ready — prefill …" (answered), "stopped: X left …" (a device left mid-answer) or "generation failed: …"
+const ROUND_RE = /^ready — prefill|^generation failed|^stopped:/;
+// a "stopped:" status is overwritten by the re-deal line ~300 ms later, so the page records it
+const hookStatus = () => B().evaluate(() => { const el = document.getElementById("ai-status"); new MutationObserver(() => { if (/^stopped:/.test(el.textContent)) window.__stop = el.textContent; }).observe(el, { childList: true, characterData: true, subtree: true }); });
+const ask = async () => { await B().evaluate(() => { window.__stop = null; }); await B().fill("#ai-prompt", PROMPT); await B().click("#ai-send"); };
+const waitRound = () => B().waitForFunction((src) => window.__stop || new RegExp(src).test(document.getElementById("ai-status").textContent), ROUND_RE.source, { timeout: 300000 });
+const roundResult = async (phase) => {
+  const st = await B().evaluate(() => window.__stop || document.getElementById("ai-status").textContent);
+  const reply = await B().evaluate(() => { const b = document.querySelectorAll(".m.bot .bubble"); return (b[b.length - 1]?.textContent || "").slice(0, 240); });
+  return { phase, status: st, reply };
+};
 
-try {
+try { main: {
+  if (LEAVE && !tabs[LEAVE]) throw new Error(`--leave ${LEAVE}: no such tab (have ${Object.keys(tabs).join(", ")})`);
   for (const p of Object.values(tabs)) await p.goto(BASE);
   for (const p of Object.values(tabs)) await p.waitForFunction(() => document.getElementById("join-gb").value !== "", null, { timeout: 60000 });
   for (const [name, p] of Object.entries(tabs)) { await p.fill("#name-input", name + "-e2e"); await p.fill("#join-gb", name === "host" ? HOST_GB : name.startsWith("phone") ? "0.5" : "1"); }
@@ -127,27 +178,148 @@ try {
   for (const [name, p] of Object.entries(tabs)) await p.waitForFunction(() => document.getElementById("ai-panel").classList.contains("online"), null, { timeout: name === "host" ? 900000 : 300000 });
   clearInterval(failed);
   clearInterval(poll);
-  log("online:", await tabs.host.textContent("#ai-status"));
-  const split = await tabs.host.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => /layer split/.test(t)).slice(-1)[0] || "");
-  log(split);
+  // the boss (the tab that plans, asks and reads answers) is the biggest pledge, not necessarily the creator: --host-gb 0.5 makes the worker the boss
+  for (const [n, p] of Object.entries(tabs)) if (await p.evaluate(() => window.swarmPlan?.().role === "host")) { boss = p; log("boss:", n + "-e2e"); }
+  log("online:", await B().textContent("#ai-status"));
+  await hookStatus();
+  const splitBefore = await lastLog(B(), /layer split/);
+  const planBefore = await B().evaluate(() => +document.body.dataset.plan);
+  log(splitBefore, "(plan", planBefore + ")");
+
   const results = [];
-  for (let r = 0; r < ROUNDS; r++) {
-    await tabs.host.fill("#ai-prompt", PROMPT); await tabs.host.click("#ai-send");
-    await tabs.host.waitForFunction(() => /^ready — prefill|^generation failed/.test(document.getElementById("ai-status").textContent), null, { timeout: 300000 });
-    const st = await tabs.host.textContent("#ai-status"); log("round", r, st);
-    const reply = await tabs.host.evaluate(() => { const b = document.querySelectorAll(".m.bot .bubble"); return (b[b.length - 1]?.textContent || "").slice(0, 240); });
-    results.push({ status: st, reply });
-    await tabs.host.waitForTimeout(1000);
+  let event = null, tEvent = 0, r = 0, splitAfter = "", note = "", planAfter = planBefore, unlocked = null, lateOnline = null, waiting = false;
+  if (LEAVE === "host") {
+    // the host tab dies mid-answer: every other tab must notice on its own (ICE failed or 7.5 s
+    // of host silence; PeerJS' own close comes 15-30 s later), end the answer, unlock Send and
+    // show "this room is over" (body[data-state]="over")
+    await ask();
+    await tabs.host.waitForTimeout(LEAVE_AT * 1000);
+    const st0 = await tabs.host.textContent("#ai-status");
+    const inFlight = /^prefill|^generating/.test(st0);
+    const tLeave = Date.now();
+    await tabs.host.close(); delete tabs.host;
+    log("closed host", inFlight ? "mid-answer" : `between answers (${st0.slice(0, 60)})`);
+    const over = {};
+    for (const [n, p] of Object.entries(tabs)) {
+      try { await p.waitForFunction(() => document.body.dataset.state === "over", null, { timeout: 30000 }); } catch {}
+      over[n] = await p.evaluate(() => ({ state: document.body.dataset.state, sendEnabled: !document.getElementById("ai-send").disabled, status: document.getElementById("ai-status").textContent.slice(0, 120), bubble: (([...document.querySelectorAll(".m.bot .stats")].pop() || {}).textContent || "").slice(0, 80) }));
+      over[n].afterMs = Date.now() - tLeave;
+      log(n + ":", JSON.stringify(over[n]));
+    }
+    if (flag("verbose")) for (const [n, p] of Object.entries(tabs)) console.error(n + " log:\n  " + (await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent.slice(0, 200)))).join("\n  "));
+    const roomErrs = {}; for (const [n, p] of Object.entries(tabs)) roomErrs[n] = await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => t.includes("\u26a0")).map((t) => t.slice(0, 160)));
+    const nRoomErrs = Object.values(roomErrs).reduce((a, e) => a + e.length, 0);
+    const ok = Object.values(over).every((o) => o.state === "over" && o.sendEnabled) && Object.values(errs).every((e) => e.length === 0) && nRoomErrs === 0;
+    console.log(JSON.stringify({ ok, wire: WIRE, model: MODEL, devices: DEVICES, phones: PHONES, code, event: { kind: "leave", tab: "host", at: LEAVE_AT, inFlight }, over, errors: Object.fromEntries(Object.entries(errs).filter(([, v]) => v.length)), roomErrors: { count: nRoomErrs, first: roomErrs } }, null, 1));
+    process.exitCode = ok ? 0 : 1;
+    break main;
+  }
+  if (LEAVE) {
+    // round 0 starts, then the tab closes LEAVE_AT seconds later (mid-answer, unless the
+    // answer was already over); the host must report "stopped: X left" within ~2 s
+    await ask();
+    await B().waitForTimeout(LEAVE_AT * 1000);
+    const st0 = await B().textContent("#ai-status");
+    const inFlight = /^prefill|^generating/.test(st0);
+    const tLeave = Date.now();
+    await tabs[LEAVE].close(); delete tabs[LEAVE];
+    log("closed", LEAVE, inFlight ? "mid-answer" : `between answers (${st0.slice(0, 60)})`);
+    await waitRound();
+    const res = await roundResult(inFlight ? "interrupted" : "before");
+    log("round 0", res.status);
+    results.push(res); r = 1;
+    event = { kind: "leave", tab: LEAVE, at: LEAVE_AT, inFlight, stopAfterMs: inFlight ? Date.now() - tLeave : null };
+    tEvent = tLeave;
+  }
+  if (JOIN_AFTER !== undefined) {
+    await tabs.host.waitForTimeout(+JOIN_AFTER * 1000);
+    tEvent = Date.now();
+    // timeline of room state and the Send box on the boss from the join on: the newcomer must
+    // download in the background (state stays online, Send open) and only the switch may block
+    await B().evaluate(() => { window.__tl = []; const push = () => window.__tl.push({ t: Math.round(performance.now()), state: document.body.dataset.state, plan: document.body.dataset.plan, send: !document.getElementById("ai-send").disabled }); push(); new MutationObserver(push).observe(document.body, { attributes: true, attributeFilter: ["data-state", "data-plan"] }); new MutationObserver(push).observe(document.getElementById("ai-send"), { attributes: true, attributeFilter: ["disabled"] }); });
+    tabs.late = await joinTab("late", "1", code);
+    await tabs.host.waitForFunction(() => [...document.querySelectorAll("#chat-log div")].some((d) => /late-e2e joined/.test(d.textContent)), null, { timeout: 60000 });
+    log("late-e2e joined");
+    event = { kind: "join", tab: "late", at: +JOIN_AFTER };
+
+  }
+  if (REDEAL) {
+    tEvent = Date.now();
+    await B().click("#ai-redeal");
+    log("re-deal pressed");
+    event = { kind: "redeal", tab: "host", at: 0 };
+  }
+  if (event) {
+    // the host bumps body[data-plan] when a new plan is dealt and body[data-state] goes back to
+    // "online" once every device reported ready for it ("waiting" = the room can no longer hold the model)
+    const h = await B().waitForFunction((p) => { const s = document.body.dataset.state; return +document.body.dataset.plan > p && (s === "online" || s === "waiting") ? s : false; }, planBefore, { timeout: 600000 });
+    const state = await h.jsonValue();
+    event.redealMs = Date.now() - tEvent;
+    planAfter = await B().evaluate(() => +document.body.dataset.plan);
+    splitAfter = await lastLog(B(), /layer split/);
+    note = await lastLog(B(), /re-dealing:/);
+    log("plan", planBefore, "->", planAfter, state, `(${event.redealMs} ms)`);
+    if (event.kind === "join") {
+      const tl = await B().evaluate(() => window.__tl);
+      const i = tl.findIndex((x) => x.state === "redealing");
+      const before = i < 0 ? tl : tl.slice(0, i);
+      event.sendOpenWhileLoading = before.length > 0 && before.every((x) => x.send && x.state === "online");
+      event.switchMs = i < 0 ? 0 : (tl.slice(i).find((x) => x.state === "online")?.t ?? tl[tl.length - 1].t) - tl[i].t;
+      log("send open while late-e2e loads:", event.sendOpenWhileLoading, "· switch took", event.switchMs, "ms");
+      // survivors should have narrowed (no reload) rather than reloaded their range
+      event.narrowed = []; event.reloaded = [];
+      for (const [n, p] of Object.entries(tabs)) if (p !== tabs.late) {
+        const lines = await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent));
+        const i = lines.findIndex((l) => /late-e2e joined/.test(l));
+        const after = lines.slice(i + 1);
+        if (after.some((l) => /no reload needed/.test(l))) event.narrowed.push(n); else if (after.some((l) => /downloading layers|loading weights/.test(l))) event.reloaded.push(n);
+      }
+      log("narrowed:", event.narrowed.join(",") || "-", "· reloaded:", event.reloaded.join(",") || "-");
+    }
+    log(splitAfter); if (note) log(note);
+    if (state === "waiting") {
+      waiting = true;
+      const st = await B().textContent("#ai-status");
+      if (!EXPECT_WAITING) throw new Error(`the room went to "waiting for a device" after the ${event.kind} (${st}); pass --expect-waiting if that is the point of this run`);
+      log("room is waiting for a device, as expected:", st);
+    }
+    if (JOIN_AFTER !== undefined && !waiting) {
+      await tabs.late.waitForFunction(() => document.getElementById("ai-panel").classList.contains("online"), null, { timeout: 300000 });
+      const st = await tabs.late.textContent("#ai-status");
+      lateOnline = /serving layers \d+–\d+/.test(st);
+      log("late:", st);
+    }
+    unlocked = {}; for (const [n, p] of Object.entries(tabs)) unlocked[n] = await p.evaluate(() => !document.getElementById("ai-send").disabled);
+  }
+  if (!waiting) for (; r < ROUNDS; r++) {
+    await ask();
+    await waitRound();
+    const res = await roundResult(event ? "after" : "plain");
+    log("round", r, res.status);
+    results.push(res);
+    await B().waitForTimeout(1000);
   }
   const wire = {}; for (const [n, p] of Object.entries(tabs)) wire[n] = await p.evaluate(() => window.swarmDebug?.());
+  // every tab's final status line (workers: "serving layers a–b"), and with --verbose its room log
+  const serving = {}; for (const [n, p] of Object.entries(tabs)) serving[n] = await p.evaluate(() => { const s = window.swarmPlan?.() || {}; return { status: document.getElementById("ai-status").textContent.slice(0, 120), v: s.v, range: s.range, engineLayers: s.engineLayers, next: s.next }; });
+  if (flag("verbose")) for (const [n, p] of Object.entries(tabs)) console.error(n + " log:\n  " + (await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent.slice(0, 200)))).join("\n  "));
   // the room's own log carries GPU validation errors that never reach the console
-  const roomErrs = {}; for (const [n, p] of Object.entries(tabs)) roomErrs[n] = await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => t.includes("\u26a0")).map((t) => t.slice(0, 160)));
+  const roomErrs = {}; for (const [n, p] of Object.entries(tabs)) roomErrs[n] = await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => t.includes("⚠")).map((t) => t.slice(0, 160)));
   const nRoomErrs = Object.values(roomErrs).reduce((a, e) => a + e.length, 0);
-  const ok = results.every((s) => s.status.startsWith("ready")) && Object.values(errs).every((e) => e.length === 0) && nRoomErrs === 0;
+  // a reply that is mostly symbols means a device served the wrong weights or a frame was garbled:
+  // the round "completed" but the pipeline is broken (seen once after a re-deal: "﹤﹤﹤`;`;`;")
+  const garbled = (t) => { const w = (t.match(/[A-Za-z]{3,}/g) || []).length; return t.length > 20 && w < t.length / 40; };
+  for (const s of results) if (s.phase !== "interrupted" && garbled(s.reply)) s.garbled = true;
+  const ok = results.every((s) => s.phase === "interrupted" ? s.status.startsWith("stopped:") : s.status.startsWith("ready") && !s.garbled)
+    && Object.values(errs).every((e) => e.length === 0) && nRoomErrs === 0
+    && (JOIN_AFTER === undefined || waiting || (lateOnline === true && event.sendOpenWhileLoading === true))
+    && (!EXPECT_WAITING || waiting)
+    && (!unlocked || Object.values(unlocked).every(Boolean))
+    && (!event || planAfter > planBefore);
   const linkSummary = Object.fromEntries(Object.entries(wire).map(([n, l]) => [n, (l || []).map((x) => `${x.name}:${x.chans}ch ${x.sent}/${x.recv}`).join(", ")]));
-  console.log(JSON.stringify({ ok, wire: WIRE, model: MODEL, devices: DEVICES, phones: PHONES, code, split, results, links: DEVICES > 6 ? Object.fromEntries(Object.entries(linkSummary).slice(0, 4)) : linkSummary, errors: Object.fromEntries(Object.entries(errs).filter(([, v]) => v.length)), roomErrors: { count: nRoomErrs, first: Object.fromEntries(Object.entries(roomErrs).filter(([, v]) => v.length).map(([k, v]) => [k, v.slice(0, 2)]).slice(0, 3)) } }, null, 1));
+  console.log(JSON.stringify({ ok, wire: WIRE, model: MODEL, devices: DEVICES, phones: PHONES, code, event, plans: { before: planBefore, after: planAfter }, splitBefore, splitAfter, note, unlocked, waiting, serving, results, links: DEVICES > 6 ? Object.fromEntries(Object.entries(linkSummary).slice(0, 4)) : linkSummary, errors: Object.fromEntries(Object.entries(errs).filter(([, v]) => v.length)), roomErrors: { count: nRoomErrs, first: Object.fromEntries(Object.entries(roomErrs).filter(([, v]) => v.length).map(([k, v]) => [k, v.slice(0, 2)]).slice(0, 3)) } }, null, 1));
   process.exitCode = ok ? 0 : 1;
-} catch (e) {
+} } catch (e) {
   console.error("FAILED:", String(e).slice(0, 400));
   for (const [n, p] of Object.entries(tabs)) { try { console.error(n + ":", await status(p)); } catch {} }
   console.error("errors:", JSON.stringify(errs));
