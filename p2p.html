@@ -139,6 +139,10 @@
   .peer-load .fill { height: 100%; width: 0; background: var(--accent); border-radius: 4px; transition: width .6s ease; }
   .peer-card.loading { border-color: var(--accent); animation: peer-pulse 1.4s ease-in-out infinite; }
   @keyframes peer-pulse { 50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 22%, transparent); } }
+  .host-section { border-top: 1px dashed var(--border); padding-top: 10px; margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+  .host-section[hidden] { display: none; }
+  .host-section label { font-family: var(--mono); font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; }
+  .host-select { font-family: var(--mono); font-size: 11.5px; padding: 6px 10px; border-radius: 8px; width: 100%; }
 
   /* ---- ai panel ---- */
   #ai-panel {
@@ -371,6 +375,15 @@
       <span id="ai-status">split across every device in the room</span>
       <button id="ai-start" class="primary">start</button>
       <button id="ai-redeal" hidden>re-deal layers</button>
+    </div>
+    <div id="host-controls" class="host-section" hidden>
+      <label for="ai-visibility">who sees the chat</label>
+      <select id="ai-visibility" class="host-select">
+        <option value="all">everyone in the room</option>
+        <option value="host">only me</option>
+        <option value="asker">only whoever asked</option>
+      </select>
+      <div class="side-hint">every device still computes the answer; this only decides who sees the text</div>
     </div>
       <div id="ai-loading" style="display:none">
         <div id="ldg-title"></div>
