@@ -19,6 +19,17 @@ export class Qwen35Engine {
     return e;
   }
 
+  // serve a sub-range of the loaded layers without a reload: the layer objects (weights, caches)
+  // are the same, so the output is that of a fresh load of [lo, hi). Dropped layers keep their
+  // GPU memory until the next full load.
+  narrow(lo, hi) {
+    if (lo < this.lo || hi > this.hi || lo >= hi) throw new Error(`narrow ${lo}-${hi} outside ${this.lo}-${this.hi}`);
+    const a = lo - this.lo, b = hi - this.lo;
+    this.layers = this.layers.slice(a, b);
+    if (this.layerBGs) this.layerBGs = this.layerBGs.slice(a, b);
+    if (this.layerB) this.layerB = this.layerB.slice(a, b);
+    this.lo = lo; this.hi = hi;
+  }
   // Fresh context: forget the conversation so far. Recurrent (DeltaNet) states and
   // conv windows are zeroed; the KV caches are simply overwritten from position 0.
   reset() {

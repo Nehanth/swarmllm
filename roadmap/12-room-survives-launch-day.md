@@ -21,6 +21,7 @@ Two ways a room dies on Monday, both permanent. A friend closes their tab mid-an
 - [x] In a three-device room, closing one tab mid-answer surfaces the failure within 2 s (emulator: `stopAfterMs` ≈ 2.1–2.2 s), the room re-deals on its own (the button is there for "find the best split now"), and the next question is answered without anyone reloading.
 - [ ] Pressing Stop on any screen ends generation within one lap and every Send box unlocks.
 - [x] A guest whose host left sees "this room is over" rather than "cluster online" (emulator: `--leave host --expect-over`).
+- [x] A join never blocks the room: the newcomer downloads in the background while the old split keeps answering (emulator: `sendOpenWhileLoading`), survivors only narrow (no reload, `narrowed:` in the report) and the switch takes well under a second on the 0.6B. Every screen shows the download on the joining peer's card.
 - [x] A device joining a three-device room is serving a slice by the next question (emulator: `--join-after`); a join during an answer never changes that answer's output (the chain is frozen; the plan is applied after `ai-gendone`).
 - [x] A device leaving mid-answer stops that answer within 2 s; the next question is answered by the remaining devices, with the departed range reloaded from cache where any device still has it (survivors keep their order, so only the delta loads).
 - [x] `docs/protocol.md` documents the room states (`redealing`, `waiting`, `over`) and the versioned plan messages. `ai-stop` is documented with the Stop-button follow-up.

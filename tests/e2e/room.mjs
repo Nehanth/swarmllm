@@ -234,10 +234,14 @@ try { main: {
   if (JOIN_AFTER !== undefined) {
     await tabs.host.waitForTimeout(+JOIN_AFTER * 1000);
     tEvent = Date.now();
+    // timeline of room state and the Send box on the boss from the join on: the newcomer must
+    // download in the background (state stays online, Send open) and only the switch may block
+    await B().evaluate(() => { window.__tl = []; const push = () => window.__tl.push({ t: Math.round(performance.now()), state: document.body.dataset.state, plan: document.body.dataset.plan, send: !document.getElementById("ai-send").disabled }); push(); new MutationObserver(push).observe(document.body, { attributes: true, attributeFilter: ["data-state", "data-plan"] }); new MutationObserver(push).observe(document.getElementById("ai-send"), { attributes: true, attributeFilter: ["disabled"] }); });
     tabs.late = await joinTab("late", "1", code);
     await tabs.host.waitForFunction(() => [...document.querySelectorAll("#chat-log div")].some((d) => /late-e2e joined/.test(d.textContent)), null, { timeout: 60000 });
     log("late-e2e joined");
     event = { kind: "join", tab: "late", at: +JOIN_AFTER };
+
   }
   if (REDEAL) {
     tEvent = Date.now();
@@ -255,6 +259,23 @@ try { main: {
     splitAfter = await lastLog(B(), /layer split/);
     note = await lastLog(B(), /re-dealing:/);
     log("plan", planBefore, "->", planAfter, state, `(${event.redealMs} ms)`);
+    if (event.kind === "join") {
+      const tl = await B().evaluate(() => window.__tl);
+      const i = tl.findIndex((x) => x.state === "redealing");
+      const before = i < 0 ? tl : tl.slice(0, i);
+      event.sendOpenWhileLoading = before.length > 0 && before.every((x) => x.send && x.state === "online");
+      event.switchMs = i < 0 ? 0 : (tl.slice(i).find((x) => x.state === "online")?.t ?? tl[tl.length - 1].t) - tl[i].t;
+      log("send open while late-e2e loads:", event.sendOpenWhileLoading, "· switch took", event.switchMs, "ms");
+      // survivors should have narrowed (no reload) rather than reloaded their range
+      event.narrowed = []; event.reloaded = [];
+      for (const [n, p] of Object.entries(tabs)) if (p !== tabs.late) {
+        const lines = await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent));
+        const i = lines.findIndex((l) => /late-e2e joined/.test(l));
+        const after = lines.slice(i + 1);
+        if (after.some((l) => /no reload needed/.test(l))) event.narrowed.push(n); else if (after.some((l) => /downloading layers|loading weights/.test(l))) event.reloaded.push(n);
+      }
+      log("narrowed:", event.narrowed.join(",") || "-", "· reloaded:", event.reloaded.join(",") || "-");
+    }
     log(splitAfter); if (note) log(note);
     if (state === "waiting") {
       waiting = true;
@@ -291,7 +312,7 @@ try { main: {
   for (const s of results) if (s.phase !== "interrupted" && garbled(s.reply)) s.garbled = true;
   const ok = results.every((s) => s.phase === "interrupted" ? s.status.startsWith("stopped:") : s.status.startsWith("ready") && !s.garbled)
     && Object.values(errs).every((e) => e.length === 0) && nRoomErrs === 0
-    && (JOIN_AFTER === undefined || waiting || lateOnline === true)
+    && (JOIN_AFTER === undefined || waiting || (lateOnline === true && event.sendOpenWhileLoading === true))
     && (!EXPECT_WAITING || waiting)
     && (!unlocked || Object.values(unlocked).every(Boolean))
     && (!event || planAfter > planBefore);

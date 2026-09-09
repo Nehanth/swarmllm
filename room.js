@@ -142,6 +142,7 @@ function peerCard(id, name, meta, self) {
       <span>bw <b class="bw">—</b></span>
       <span>buf <b class="buf">—</b></span>
     </div>
+    <div class="peer-load"><span class="pl-text"></span><div class="bar"><div class="fill"></div></div></div>
     ${self ? "" : '<button class="bw-btn">test bandwidth</button>'}`;
   card.querySelector(".pname").textContent = name + (self ? " (you)" : "");
   card.querySelector(".peer-gpu").textContent = meta.webgpu
@@ -263,6 +264,16 @@ function ensureCard(id, name, meta) {
   return card;
 }
 function dropCard(id) { const c = cards.get(id); if (c) { c.remove(); cards.delete(id); } }
+// download progress on a peer's card (every screen): pct < 100 shows the bar, 100 clears it
+function cardLoad(name, pct, layers) {
+  if (!name) return;
+  let card = null;
+  for (const [id, m] of members) if (m.name === name) { card = cards.get(id); break; }
+  const el = card?.querySelector(".peer-load"); if (!el) return;
+  const on = pct != null && pct < 100;
+  el.classList.toggle("on", on); card.classList.toggle("loading", on);
+  if (on) { el.querySelector(".pl-text").textContent = `loading layers ${layers || "\u2026"} \u00b7 ${Math.round(pct)}%`; el.querySelector(".fill").style.width = pct + "%"; }
+}
 // open a data link to a chain neighbour if we do not have one yet; resolves true when it is up,
 // false on timeout or as soon as cancelled() says the caller no longer needs it (a superseded
 // plan whose neighbour has left must not hold the load queue for the full minute)
@@ -279,6 +290,19 @@ function ensureLink(id, timeoutMs = 60000, cancelled = () => false) {
 }
 ensureLink.pending = new Set();
 
+// resolves once the hidden-state wire to `id` is open, so a fresh chain link never starts on
+// plain messages and switches to the wire mid-answer (frames must keep one order). If it does
+// not open within `ms` the link stays on plain messages for good.
+async function wireUp(id, ms = 4000) {
+  const e = conns.get(id);
+  if (!e?.link || WIRE_STRIPES === 0 || e.link.noWire) return true;
+  const t0 = performance.now();
+  while (!wireReady(e.link)) {
+    if (performance.now() - t0 > ms) { e.link.noWire = true; log("swarm", `wire to ${e.name} did not open, using plain messages`); return false; }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return true;
+}
 function sendTo(id, obj) { const e = conns.get(id); if (e?.conn?.open) e.conn.send(obj); }   // a closing connection is skipped, not thrown at
 // debug: per-peer wire state (channels open, frames sent/received) — `swarmDebug()` in the console
 window.swarmDebug = () => [...conns].map(([id, e]) => ({ id, name: e.name, chans: e.link?.chans.filter((c) => c.readyState === "open").length ?? 0, sent: e.link?.sent ?? 0, recv: e.link?.recv ?? 0 }));
@@ -287,7 +311,7 @@ window.swarmPlan = () => ({ v: ai.planV, state: ai.state, chain: ai.plan?.chain,
 // activations go over the sliced wire channel when it is up, else as a normal message
 function sendHidden(id, msg) {
   const e = conns.get(id);
-  if (e?.link && wireReady(e.link) && sendFrame(e.link, msg)) return;
+  if (e?.link && !e.link.noWire && wireReady(e.link) && sendFrame(e.link, msg)) return;
   sendTo(id, msg);
 }
 function broadcastAll(obj) { for (const [id] of conns) sendTo(id, obj); }
@@ -670,14 +694,14 @@ function aiStatus(s) { $("ai-status").textContent = s; crumb(s); }
 // emulator reads those); the host mirrors it to every screen with ai-layers
 function setState(state, note) {
   ai.state = state;
-  document.body.dataset.state = state; document.body.dataset.plan = String(ai.planV);
+  document.body.dataset.state = state; document.body.dataset.plan = String(ai.plan?.v ?? ai.planV);   // the served plan
   if (note) aiStatus(note);
   if (ai.role !== "host") return;
   if (state === "online") $("ai-send").disabled = false; else if (state !== "generating") $("ai-send").disabled = true;
   const rd = $("ai-redeal");
   rd.hidden = !/^(online|waiting|redealing|generating)$/.test(state);   // during generating a click queues the plan
   if (state === "online") rd.textContent = "re-deal layers";
-  broadcastAll({ t: "ai-layers", v: ai.planV, model: ai.modelKey, by: ai.layersByName || {}, state, note: note || "" });
+  broadcastAll({ t: "ai-layers", v: ai.plan?.v ?? ai.planV, model: ai.modelKey, by: ai.layersByName || {}, state, note: note || "" });
 }
 // breadcrumb: if iOS kills the tab, the reloaded page can say where it died
 function crumb(s) { try { localStorage.setItem("swarm-crumb", JSON.stringify({ s, t: Date.now(), mem: performance.memory?.usedJSHeapSize })); } catch {} }
@@ -739,6 +763,16 @@ function chatBotEnd(raw, stats) {
 // download, when the whole room downloads together); progress goes to the status line only
 async function aiLoadShard(modelKey, range, hasEmbed, hasHead, { quiet = false } = {}) {
   const M = MODELS[modelKey];
+  // a sub-range of what this device already serves: narrow the engine, no reload (the output is
+  // that of a fresh load; the dropped layers' GPU memory is kept until the next full load)
+  if (ai.engine?.narrow && ai.model === modelKey && ai.range && range[0] >= ai.range[0] && range[1] <= ai.range[1]
+      && ai.engine.hasEmbed === hasEmbed && ai.engine.hasHead === hasHead) {
+    await aiQuiesce();
+    ai.engine.narrow(range[0], range[1]);
+    ai.range = range;
+    log("swarm", `now serving layers ${range[0]}\u2013${range[1] - 1} (no reload needed)`);
+    return;
+  }
   if (!quiet) aiLoading(true, `downloading layers ${range[0]}\u2013${range[1] - 1} of ${M.label.split("\u00b7")[0].trim()}`);
   aiStatus("requesting GPU\u2026");
   if (!quiet) mascot("Grabbing my slice of the model… hang tight.");
@@ -775,7 +809,7 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead, { quiet = false }
   try { tdev.destroy(); } catch {}
   ai.device.lost.then((l) => crumb("GPU device lost: " + l.reason + " " + l.message));
   aiStatus("tuning kernels for this GPU\u2026");
-  ai.tune = await autotuneCoop(ai.device).catch(() => ({ wg: 256, rows: 4 }));
+  ai.tune = await autotuneCoop(ai.device, { rows8: M.kind === "qwen35" }).catch(() => ({ wg: 256, rows: 4 }));
   crumb(`autotune: WG=${ai.tune.wg} ROWS=${ai.tune.rows}`);
   if (ai.role === "host" && ai.tune?.results?.[0]?.ms) ai.speed.set(peer.id, ai.tune.results[0].ms);
   const isPhone = myMeta?.phone;
@@ -999,19 +1033,40 @@ async function applyPlan(reason) {
   const needGB = plan.needBytes / 2 ** 30, haveGB = plan.haveBytes / 2 ** 30;
   if (first && needGB > haveGB * 1.15)
     log("swarm", `\u26a0 this model needs ~${needGB.toFixed(1)} GB but the room pledged ~${haveGB.toFixed(1)} GB \u2014 it may not fit`);
+  const label = (r) => `${r[0]}\u2013${r[1] - 1}`;
+  const byName = Object.fromEntries([[myName, label(plan.hostRange)], ...plan.chain.map((c) => [conns.get(c.id)?.name || c.id, label(c.range)])]);
+  const loadMsg = (i) => ({ t: "ai-load", v, model: ai.modelKey, range: plan.chain[i].range, next: i + 1 < plan.chain.length ? plan.chain[i + 1].id : "host", host: peer.id });
+  ai.pending = null;
+  log("swarm", describeSplit(plan, nameOf, M.label) + (!first && reason ? ` (${reason})` : ""));
+  // the chain serving today is intact (a join, or the re-deal button): the newcomers download in
+  // the background while the room keeps answering on the old split; the switch happens between
+  // answers once they are ready (flipPlan). A leave breaks the chain: reload now, below.
+  const live = !first && ai.engine && ai.state === "online" && ai.chain.every((id) => conns.get(id)?.conn?.open && !gone.has(id));
+  if (live) {
+    const newcomers = new Set(plan.chain.map((c) => c.id).filter((id) => !ai.chain.includes(id)));
+    ai.pending = { v, plan, prev, newcomers, ready: new Set(), note: "" };
+    plan.chain.forEach((c, i) => { if (newcomers.has(c.id)) sendTo(c.id, loadMsg(i)); });
+    ai.loadByName = Object.fromEntries([...newcomers].map((id) => [conns.get(id)?.name || id, byName[conns.get(id)?.name || id]]));
+    const who = [...newcomers].map((id) => `${noteName(id)} loading layers ${byName[noteName(id)]}`).join(" \u00b7 ");
+    ai.pending.note = who ? `${who} \u00b7 the room keeps answering, the new split takes over at the next question` : "";
+    ai.note = ai.pending.note; ai.reProg = {};
+    if (who) { log("swarm", ai.pending.note); startProgRelay(); setState("online", ai.pending.note); }
+    maybeFlip();   // nothing to download: switch now
+    return;
+  }
   ai.plan = { ...plan, v };
   ai.chain = plan.chain.map((c) => c.id);
   ai.readyPeers = new Set();
-  const label = (r) => `${r[0]}\u2013${r[1] - 1}`;
-  ai.layersByName = Object.fromEntries([[myName, label(plan.hostRange)], ...plan.chain.map((c) => [conns.get(c.id)?.name || c.id, label(c.range)])]);
+  ai.layersByName = byName;
+  ai.loadByName = Object.fromEntries(plan.chain.filter((c) => !prev || String(prev.ranges?.[c.id]) !== String(c.range)).map((c) => [conns.get(c.id)?.name || c.id, byName[conns.get(c.id)?.name || c.id]]));
   ai.busy = ai.busy === true ? true : "plan";
-  plan.chain.forEach((c, i) => sendTo(c.id, { t: "ai-load", v, model: ai.modelKey, range: c.range, next: i + 1 < plan.chain.length ? plan.chain[i + 1].id : "host", host: peer.id }));
+  plan.chain.forEach((c, i) => sendTo(c.id, loadMsg(i)));
   for (const id of plan.idle) sendTo(id, { t: "ai-wait", v });
   const note = prev ? planNote(prev, plan, noteName) : "";
-  ai.note = note || "re-dealing layers"; ai.reProg = {};
-  log("swarm", describeSplit(plan, nameOf, M.label) + (!first && reason ? ` (${reason})` : ""));
+  ai.note = (prev && /left$/.test(reason || "") ? `${reason} \u2014 ` : "") + (note || "re-dealing layers") + (first ? "" : " \u00b7 questions resume when the layers are loaded"); ai.reProg = {};
   if (prev) log("swarm", note || "layer split unchanged");
-  setState(first ? "loading" : "redealing", first ? "" : (note || "re-dealing layers"));
+  if (!first) startProgRelay();
+  setState(first ? "loading" : "redealing", first ? "" : ai.note);
   // the engine's own range decides whether the host reloads (not prev: after "waiting" prev is the remembered plan)
   const hostSame = ai.engine && ai.model === ai.modelKey && ai.range && ai.range[0] === plan.hostRange[0] && ai.range[1] === plan.hostRange[1];
   try {
@@ -1027,6 +1082,49 @@ async function applyPlan(reason) {
     log("swarm", "host reload failed: " + err.message);
     setState("waiting", "host reload failed: " + err.message);
   }
+}
+// the pending plan's newcomers are loaded: switch the room to it between answers. Survivors
+// narrow or rewire (no download), the host narrows or reloads its own range from cache.
+function maybeFlip() {
+  const P = ai.pending;
+  if (!P || ai.gen || ai.busy === "gen") return;
+  if (![...P.newcomers].every((id) => P.ready.has(id))) return;
+  ai.pending = null;
+  ai.loadQ = ai.loadQ.then(() => flipPlan(P)).catch((e) => log("swarm", "re-deal failed: " + e.message));
+}
+async function flipPlan(P) {
+  if (P.v !== ai.planV) return;                       // superseded by a newer plan
+  if (ai.gen) { ai.pending = P; return; }             // a question started meanwhile: aiGenerate's tail retries
+  const { v, plan, prev } = P;
+  const label = (r) => `${r[0]}\u2013${r[1] - 1}`;
+  const noteName = (id) => id === peer.id ? myName : (conns.get(id)?.name || id);
+  ai.plan = { ...plan, v };
+  ai.chain = plan.chain.map((c) => c.id);
+  ai.readyPeers = new Set(P.ready);
+  ai.layersByName = Object.fromEntries([[myName, label(plan.hostRange)], ...plan.chain.map((c) => [noteName(c.id), label(c.range)])]);
+  ai.loadByName = {};
+  ai.busy = ai.busy === true ? true : "plan";
+  plan.chain.forEach((c, i) => { if (!P.newcomers.has(c.id)) sendTo(c.id, { t: "ai-load", v, model: ai.modelKey, range: c.range, next: i + 1 < plan.chain.length ? plan.chain[i + 1].id : "host", host: peer.id }); });
+  for (const id of plan.idle) sendTo(id, { t: "ai-wait", v });
+  const note = prev ? planNote(prev, plan, noteName) : "";
+  ai.note = note || "re-dealing layers"; ai.reProg = {};
+  if (prev) log("swarm", note || "layer split unchanged");
+  setState("redealing", "switching to the new layer split\u2026");
+  const hostSame = ai.engine && ai.model === ai.modelKey && ai.range && ai.range[0] === plan.hostRange[0] && ai.range[1] === plan.hostRange[1];
+  try {
+    if (!hostSame) await aiLoadShard(ai.modelKey, plan.hostRange, true, true, { quiet: true });
+    if (v !== ai.planV) return;
+    aiMaybeReady();
+  } catch (err) {
+    log("swarm", "host reload failed: " + err.message);
+    setState("waiting", "host reload failed: " + err.message);
+  }
+}
+// while any device loads for a plan, every screen gets the per-device progress (drawn on the
+// peer cards); stops with a final 100 % frame when the plan is served
+function startProgRelay() {
+  clearInterval(ai.progTimer);
+  ai.progTimer = setInterval(() => { if (ai.role === "host") broadcastAll({ t: "ai-hostprog", all: ai.prog || {}, layers: ai.loadByName || {}, at: Date.now() }); }, 600);
 }
 // ask for a re-plan; coalesces bursts (300 ms) and waits for the answer in flight (aiGenerate's
 // finally picks planWanted up), then runs on the load queue behind any load still going
@@ -1054,7 +1152,7 @@ function peerGone(id, name) {
   }
   ai.speed.delete(id);
   ai.readyPeers.delete(id);
-  if (ai.chain.includes(id) || ai.busy === "wait") schedulePlan(`${name} left`);
+  if (ai.chain.includes(id) || ai.pending?.newcomers.has(id) || ai.busy === "wait") schedulePlan(`${name} left`);
 }
 // non-host: the host is gone, so is the room
 function hostGone() {
@@ -1073,8 +1171,22 @@ function hostGone() {
 function aiMaybeReady() {
   if (ai.role !== "host" || !ai.engine || !ai.plan || ai.busy === "gen" || ai.gen) return;   // a stray ready must not unlock a running answer
   if (!ai.chain.every((id) => ai.readyPeers.has(id))) return;
+  // the first hop's wire must be open too (a fresh link after a re-deal), else frames would
+  // start on plain messages and move to the wire mid-answer
+  if (ai.chain.length) {
+    const e = conns.get(ai.chain[0]);
+    if (e?.link && WIRE_STRIPES > 0 && !e.link.noWire && !wireReady(e.link)) {
+      ai.wireWait = ai.wireWait || performance.now();
+      if (performance.now() - ai.wireWait < 4000) { setTimeout(aiMaybeReady, 100); return; }
+      e.link.noWire = true; log("swarm", `wire to ${e.name} did not open, using plain messages`);
+    }
+    ai.wireWait = 0;
+  }
   ai.busy = false;
   clearInterval(ai.progTimer);
+  const done = Object.fromEntries(Object.keys(ai.prog || {}).map((nm) => [nm, 100]));
+  broadcastAll({ t: "ai-hostprog", all: done, layers: {}, at: Date.now() });
+  for (const nm of Object.keys(done)) cardLoad(nm, 100);
   const n = ai.chain.length + 1;
   aiStatus(`cluster online — ${n} device${n > 1 ? "s" : ""}, ${ai.cfg.num_hidden_layers} layers split ${n} ways`);
   $("ai-panel").classList.add("online");
@@ -1142,7 +1254,7 @@ async function aiGenerate(textArg, who) {
   // the chain serving this answer is frozen: a plan arriving now waits for ai-gendone, and a
   // plan already ticking down its 300 ms is held back too (planWanted keeps the reason)
   clearTimeout(ai.planTimer);
-  ai.gen = { v: ai.planV, chain: ai.chain.slice() };
+  ai.gen = { v: ai.plan?.v ?? ai.planV, chain: ai.chain.slice() };   // the served plan (a pending one may carry a newer v)
   const chain = ai.gen.chain;
   for (const id of chain) { const e = conns.get(id); if (e) e.pongAt = Date.now(); }   // fresh 2 s liveness budget
   ai.stopReason = null;
@@ -1318,7 +1430,7 @@ async function aiGenerate(textArg, who) {
   ai.gen = null;
   ai.busy = false;
   $("ai-send").disabled = false;
-  if (ai.planWanted) schedulePlan(ai.planWanted); else setState("online", "");
+  if (ai.planWanted) schedulePlan(ai.planWanted); else { setState("online", ai.pending?.note || ""); maybeFlip(); }
 }
 
 // ---- worker + shared message handling ----
@@ -1351,6 +1463,8 @@ async function aiOnData(from, d) {
           if (superseded()) return;
           if (!(await ensureLink(d.next, 60000, superseded))) { if (superseded()) return; throw new Error("could not connect to the next device in the chain"); }
           if (superseded()) return;
+          await wireUp(d.next === "host" ? ai.hostId : d.next);
+          if (superseded()) return;
           aiStatus(`layers ${d.range[0]}\u2013${d.range[1] - 1} ready \u00b7 syncing with the room\u2026`);
           if ($("ai-loading").style.display !== "none") {
             aiLoading(true, `layers ${d.range[0]}\u2013${d.range[1] - 1} ready`);
@@ -1370,15 +1484,16 @@ async function aiOnData(from, d) {
       const now = Date.now();
       ai.prog = { ...(d.all || {}), [myName]: Math.round(ai.myPct || 0) };
       ai.progAt = ai.progAt || {};
-      for (const nm of Object.keys(d.all || {})) if (nm !== myName) ai.progAt[nm] = now;
+      for (const nm of Object.keys(d.all || {})) if (nm !== myName) { ai.progAt[nm] = now; cardLoad(nm, d.all[nm], d.layers?.[nm]); }
       loadCardRender();
       break;
     }
     case "ai-progress":
       if (e?.card) e.card.querySelector(".bw").textContent = "dl " + d.pct + "%";
+      cardLoad(e?.name, d.pct, ai.loadByName?.[e?.name]);
       ai.prog = ai.prog || {}; ai.progAt = ai.progAt || {};
       ai.prog[e?.name || from] = d.pct; ai.progAt[e?.name || from] = Date.now(); loadCardRender();
-      if (ai.state === "redealing" && /^re-dealing/.test($("ai-status").textContent)) {   // keep "who takes what", append who is still loading
+      if ((ai.state === "redealing" || ai.pending) && ai.note) {   // keep "who takes what", append who is still loading
         ai.reProg = ai.reProg || {}; ai.reProg[e?.name || from] = d.pct;
         const loading = Object.entries(ai.reProg).filter(([, p]) => p < 100).map(([n, p]) => `${n} ${p}%`);
         aiStatus(ai.note + (loading.length ? " \u00b7 " + loading.join(" \u00b7 ") : ""));
@@ -1392,6 +1507,7 @@ async function aiOnData(from, d) {
       ai.layersByName = d.by; loadCardRender();
       ai.state = d.state; document.body.dataset.state = d.state; document.body.dataset.plan = String(d.v);
       if (d.note) aiStatus(d.note);
+      if (d.state === "redealing" && d.note) mascot(d.note);
       if (d.state === "idle") {   // the host's start failed: the room is back to the start button
         aiLoading(false); $("ai-start").disabled = false; $("ai-model").disabled = false; ai.hostId = null; ai.role = null;
         $("ai-send").disabled = true;
@@ -1412,13 +1528,15 @@ async function aiOnData(from, d) {
     case "ai-ready":
       if (ai.role !== "host" || d.v !== ai.planV) break;   // a ready for an older plan
       if (d.ms > 0) ai.speed.set(from, d.ms);
-      ai.readyPeers.add(from);
       if (e?.card) e.card.querySelector(".bw").textContent = "ready";
+      cardLoad(e?.name, 100);
+      if (ai.pending?.newcomers.has(from)) { ai.pending.ready.add(from); maybeFlip(); break; }   // background load done
+      ai.readyPeers.add(from);
       aiMaybeReady();
       break;
     case "ai-error":
       aiStatus(`peer ${e?.name || from} failed: ${d.message}`);
-      if (ai.role === "host" && d.v === ai.planV && ai.chain.includes(from)) { ai.exclude.set(from, d.v); schedulePlan(`${e?.name || from} failed to load`); }
+      if (ai.role === "host" && d.v === ai.planV && (ai.chain.includes(from) || ai.pending?.newcomers.has(from))) { ai.exclude.set(from, d.v); schedulePlan(`${e?.name || from} failed to load`); }
       break;
     case "ai-hidden-b": {
       // worker: n hiddens in (multiple of 4), my layers (batched), n hiddens on

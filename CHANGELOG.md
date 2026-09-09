@@ -5,6 +5,7 @@ All notable changes to SwarmLLM. Format follows [Keep a Changelog](https://keepa
 ## [Unreleased]
 
 ### Added
+- Automatic re-deal (roadmap 12): a device joining a running room gets a share of the layers, prepared in the background while the old split keeps answering and switched in between answers without any reload (survivors narrow to a sub-range of the layers they hold; `engine.narrow`). A device leaving mid-answer stops that answer within 2 s, every Send box unlocks, the room re-deals from the Cache API and tells every screen. A manual "re-deal layers" button. The layer planner is `room/plan.js` (pledge × speed, narrow-only joins), unit tested. Every screen shows a joining peer's download on its card. Emulator scenarios: `--join-after`, `--leave`, `--redeal`, `--host-gb 0.5` (a boss that joined the room).
 - Room topology is linear, not a mesh: every device keeps one link to the host; chain neighbours connect only when the layers are dealt (`ensureLink`). A 64-device room opens 126 links instead of 2,016. Workers draw the device list from the host's roster. `?signal=host:port` points the room at a self-hosted PeerServer.
 - Room emulator (`npm run e2e`): `--devices N --phones K`, local PeerServer, 27B from local disk, room-log error capture, fail-fast on load errors. 16 devices on the 27B verified on GB10.
 - Hidden-state wire (`room/transport.js`): activations travel on a dedicated data channel as ≤4.6 KB slices, striped over several peer connections (`?wire=stripeN`, default 4; `?wire=off` to disable). On a 100 ms link a token's hidden state now crosses a hop in 51 ms instead of 152, and a depth-5 verify block in 52 ms instead of 355 (docs/bench-log.md, transport section). Bytes only, output unchanged.
@@ -16,6 +17,9 @@ All notable changes to SwarmLLM. Format follows [Keep a Changelog](https://keepa
 - Fused gate/up GEMV with in-kernel SiLU; fused DeltaNet gate + L2-norm pre-pass; accumulate-into-residual matvec variants.
 - Bench log, kernel-family profiler, GEMM prefill prototype, research plans and four implementation designs under `docs/` and `docs/research/`.
 - A roadmap (`roadmap/`) of 27 items, each mirrored by a tracking issue.
+
+### Fixed
+- The cooperative GEMV kernel's 8-rows-per-workgroup shape returns wrong values in the dense engine (the 0.6B/4B path); the autotuner offered it by timing, so about one load in seven produced garbage answers. Dense engines now tune over 4-row shapes only; the Qwen 3.8 kernels pass with every shape (`tests/test_tune_shapes.js`).
 
 ### Changed
 - Repository restructured for open source: `engine/` split into focused modules behind a compatible `engine.js` barrel (dense, qwen35, wgsl/*, gguf, tokenizer, sampling, quant, autotune, selftest, safetensors); the room page split into `p2p.html` (markup) + `room.js` + `room/*` helpers; tests, benchmarks, goldens and references moved under `tests/` and `benchmarks/`; `BelloEngine` renamed `DenseEngine`.

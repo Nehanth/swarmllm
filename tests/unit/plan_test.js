@@ -159,19 +159,20 @@ Deno.test("plan: leave keeps survivor order, host pin keeps host range", () => {
   eq(planNote(p, p, (id) => id), "", "unchanged plan -> empty note");
 });
 
-Deno.test("plan: join appends the newcomer last with at least one layer", () => {
+Deno.test("plan: join keeps the survivors' order and gives the newcomer at least one layer", () => {
   const input = three();
   const first = planSplit(input);
   const joined = { ...input, prev: first, workers: [...input.workers, { id: "d", name: "D", pledgeBytes: 2 * GiB, webgpu: true }] };
   const p = planSplit(joined);
   checkInvariants(p, joined);
-  eq(p.chain.map((c) => c.id), ["a", "b", "c", "d"], "survivors first, newcomer last");
+  eq(p.chain.map((c) => c.id).filter((id) => id !== "d"), ["a", "b", "c"], "survivors keep their order (the newcomer sits at a seam)");
   assert(count(p, "d") >= 1, "newcomer has layers");
   assert(/D takes layers/.test(planNote(first, p, (id) => id.toUpperCase())), "note names the newcomer");
   // the previous plan is passed as planSplit returned it (chain entries are objects): the
   // survivors' order must come from it, not from the id sort (a re-deal in the room shuffled the
   // chain and reloaded every survivor before this was checked)
-  const shuffled = { ...first, chain: [first.chain[2], first.chain[0], first.chain[1]] };
+  // (no ranges: the narrow-only join needs the served tiles, so this exercises the plain re-deal)
+  const shuffled = { ...first, chain: [first.chain[2], first.chain[0], first.chain[1]], ranges: undefined };
   const q = planSplit({ ...joined, prev: shuffled });
   eq(q.chain.map((c) => c.id), ["c", "a", "b", "d"], "previous chain order kept, newcomer last");
 });
@@ -229,4 +230,47 @@ Deno.test("plan: more workers than layers -> idle, host may hold 0", () => {
   eq(p.chain.length, 3);
   const s = describeSplit(p, (id) => id, "x");
   assert(/layer split/.test(s) && /standing by/.test(s), s);
+});
+
+// --- narrow-only joins: survivors shrink to a sub-range of what they hold, newcomers take the seam ---
+const sub = (a, b) => a[0] >= b[0] && a[1] <= b[1];
+const covered = (plan, L) => { const rs = Object.values(plan.ranges).sort((a, b) => a[0] - b[0]); let acc = 0; for (const r of rs) { if (r[0] !== acc) return false; acc = r[1]; } return acc === L; };
+const mk = (id, gb, extra = {}) => ({ id, name: id, pledgeBytes: gb * GiB, webgpu: true, ...extra });
+
+Deno.test("join: every survivor narrows, the newcomer takes one contiguous block", () => {
+  const D = DIMS.q06, host = { id: "h", name: "h", pledgeBytes: 2 * GiB };
+  const p1 = planSplit({ ...D, host, workers: [mk("phone", 0.5), mk("worker", 1)] });
+  const p2 = planSplit({ ...D, host, workers: [mk("phone", 0.5), mk("worker", 1), mk("late", 1)], prev: p1 });
+  assert(p2.fits && p2.narrow, "narrow join");
+  assert(covered(p2, D.L), "covers all layers");
+  assert(sub(p2.hostRange, p1.hostRange), "host shrank or stayed");
+  for (const id of ["phone", "worker"]) assert(sub(p2.ranges[id], p1.ranges[id]), id + " narrowed: " + p2.ranges[id] + " within " + p1.ranges[id]);
+  assert(p2.ranges.late[1] - p2.ranges.late[0] >= 1, "newcomer has layers");
+});
+
+Deno.test("join into a solo host: the host narrows from the top, the newcomer takes the rest", () => {
+  const D = DIMS.q06, host = { id: "h", name: "h", pledgeBytes: 4 * GiB };
+  const p1 = planSplit({ ...D, host, workers: [] });
+  eq(p1.hostRange, [0, D.L]);
+  const p2 = planSplit({ ...D, host, workers: [mk("w", 1)], prev: p1 });
+  assert(p2.narrow, "narrow");
+  eq(p2.hostRange[0], 0); assert(p2.hostRange[1] < D.L, "host gave up layers");
+  eq(p2.ranges.w, [p2.hostRange[1], D.L]);
+});
+
+Deno.test("join after a leave is a normal (reloading) deal: the old tiles no longer cover the model", () => {
+  const D = DIMS.q06, host = { id: "h", name: "h", pledgeBytes: 2 * GiB };
+  const p1 = planSplit({ ...D, host, workers: [mk("a", 1), mk("b", 1)] });
+  const p2 = planSplit({ ...D, host, workers: [mk("a", 1), mk("c", 1)], prev: p1 });
+  assert(p2.fits && !p2.narrow, "not narrow");
+  assert(covered(p2, D.L));
+});
+
+Deno.test("join whose share no seam can free falls back to the proportional deal", () => {
+  const D = DIMS.q06, host = { id: "h", name: "h", pledgeBytes: 1 * GiB };
+  const p1 = planSplit({ ...D, host, workers: [mk("a", 0.5), mk("b", 0.5)] });
+  const p2 = planSplit({ ...D, host, workers: [mk("a", 0.5), mk("b", 0.5), mk("big", 16)], prev: p1 });
+  assert(p2.fits, "fits");
+  assert(covered(p2, D.L));
+  assert(p2.ranges.big[1] - p2.ranges.big[0] >= 10, "the big device got a big share: " + p2.ranges.big);
 });

@@ -2,8 +2,12 @@
 import { WGSL } from "./wgsl/base.js";
 import { probeUnpack, coopWGSL } from "./wgsl/coop.js";
 
-export async function autotuneCoop(device, { dIn = 5120, dOut = 17408, kind = "q4" } = {}) {
-  const candidates = [[256, 4], [128, 4], [256, 8], [128, 8], [64, 4]];
+// 8 rows per workgroup is only offered where it is known good: the Qwen 3.8 (q4, Qwen35Engine)
+// kernels pass tests/test_tune_shapes.js with it, the dense-engine variant returns wrong values.
+// Since the tuner picks by timing, a bad shape surfaces as a rare, run-dependent garbage answer.
+export const candidatesFor = (rows8) => rows8 ? [[256, 4], [128, 4], [256, 8], [128, 8], [64, 4]] : [[256, 4], [128, 4], [64, 4]];
+export async function autotuneCoop(device, { dIn = 5120, dOut = 17408, kind = "q4", rows8 = false } = {}) {
+  const candidates = candidatesFor(rows8);
   const nb = dIn / 32;
   const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
   const qs = device.createBuffer({ size: dOut * (kind === "q4" ? dIn / 2 : dIn), usage: S });

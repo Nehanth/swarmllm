@@ -97,6 +97,51 @@ export function planSplit({ L, layerBytes, embedBytes, host, workers, prev = nul
   for (let i = 1; i < assigned.length; i++)
     if (assigned[i] === 0) { const j = assigned.indexOf(Math.max(...assigned)); assigned[j]--; assigned[i]++; }
 
+  // i. a join while the previous plan is served (its tiles still cover [0, L)): survivors only
+  //    shrink to a sub-range of what they hold, so the switch needs no reload. Each newcomer
+  //    takes a block freed at the top of one neighbour and the bottom of the next, at the seam
+  //    where the loads land closest to the proportional deal (survivors never grow here).
+  //    Falls back to the proportional deal when no seam can free a newcomer's share.
+  let narrow = false;
+  if (prev?.ranges && prev.hostRange) {
+    const oldOf = (d) => d.host ? prev.hostRange : prev.ranges[d.id];
+    const survivors = devs.filter((d) => oldOf(d) && oldOf(d)[1] > oldOf(d)[0]);
+    const newcomers = devs.filter((d) => !survivors.includes(d));
+    const tiles = survivors.map((d) => ({ d, lo: oldOf(d)[0], hi: oldOf(d)[1] })).sort((x, y) => x.lo - y.lo);
+    const covers = tiles.length > 0 && tiles[0].d.host && tiles[0].lo === 0 && tiles[tiles.length - 1].hi === L
+      && tiles.every((t, i) => i === 0 || t.lo === tiles[i - 1].hi);
+    const target = new Map(devs.map((d, i) => [d.id, assigned[i]]));
+    if (covers && newcomers.length) {
+      let ok = true;
+      for (const n of newcomers) {
+        const k = Math.min(Math.max(1, target.get(n.id)), n.maxLayers);
+        let best = null;
+        for (let s = 1; s <= tiles.length; s++) {
+          const left = tiles[s - 1], right = tiles[s] || null;
+          const ln = left.hi - left.lo, rn = right ? right.hi - right.lo : 0;
+          const lt = target.get(left.d.id), rt = right ? target.get(right.d.id) : 0;
+          const lMax = ln - 1, rMax = right ? rn - 1 : 0;   // everyone keeps at least one layer
+          let t = Math.max(0, Math.min(lMax, ln - lt, k));   // the left's top, down to its target
+          let b = k - t;                                       // the rest from the right's bottom
+          if (b > rMax) { b = rMax; t = k - b; }
+          if (t > lMax || t < 0 || b < 0) continue;
+          const score = Math.abs(ln - t - lt) + (right ? Math.abs(rn - b - rt) : 0);
+          if (!best || score < best.score) best = { s, t, b, score };
+        }
+        if (!best) { ok = false; break; }
+        const left = tiles[best.s - 1], right = tiles[best.s];
+        left.hi -= best.t;
+        if (right) right.lo += best.b;
+        tiles.splice(best.s, 0, { d: n, lo: left.hi, hi: left.hi + k });
+      }
+      if (ok) {
+        narrow = true;
+        devs.length = 0; assigned.length = 0;
+        for (const t of tiles) { devs.push(t.d); assigned.push(t.hi - t.lo); }
+      }
+    }
+  }
+
   // h. contiguous ranges in order, host first
   const ranges = {};
   const chain = [];
@@ -107,7 +152,7 @@ export function planSplit({ L, layerBytes, embedBytes, host, workers, prev = nul
     if (i > 0) chain.push({ id: d.id, name: d.name, range: r });
   });
   const weights = Object.fromEntries(devs.map((d) => [d.id, { cap: d.cap, s: d.s, w: d.w, maxLayers: d.maxLayers }]));
-  return { fits: true, needBytes, haveBytes, hostId: host.id, hostRange: ranges[host.id], chain, idle, ranges, assigned, weights, pinned };
+  return { fits: true, needBytes, haveBytes, hostId: host.id, hostRange: ranges[host.id], chain, idle, ranges, assigned, weights, pinned, narrow };
 }
 
 // "Qwen3 0.6B — layer split by pledge×speed: you 16+embed · worker-e2e 8 · phone-e2e 4"
