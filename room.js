@@ -399,22 +399,27 @@ async function bwTest(id) {
 }
 
 // --- ping loop; on the host also the liveness watchdog for chain members (3 missed pongs) ---
+// Both watchdogs skip a tick that comes late (the host's own main thread stalled: GC, a long
+// GPU submit, a throttled tab): pongs queued during the stall have not been dispatched yet, so
+// silence measured across it says nothing about the peers. The stalled tick refreshes pongAt.
+let idleTick = Date.now();
 setInterval(() => {
   broadcastAll({ t: "ping", ts: performance.now() });
+  const now = Date.now(), stalled = now - idleTick > 5000; idleTick = now;
   if (ai.role !== "host") return;
-  const now = Date.now();
-  for (const id of ai.chain) { const e = conns.get(id); if (e && now - (e.pongAt || now) > 7500) peerGone(id, e.name); }
+  for (const id of ai.chain) { const e = conns.get(id); if (!e) continue; if (stalled) e.pongAt = now; else if (now - (e.pongAt || now) > 7500) peerGone(id, e.name); }
 }, 2500);
 // while an answer is in flight the host pings the chain it is served by every 500 ms and gives
 // up on a member 2 s after its last message (any message counts: pongs, hidden states); a tab
 // that closed without a clean PeerJS close then stops the answer in ~2 s instead of 7.5 s
+let genTick = Date.now();
 setInterval(() => {
+  const now = Date.now(), stalled = now - genTick > 1500; genTick = now;
   if (ai.role !== "host" || !ai.gen) return;
-  const now = Date.now();
   for (const id of ai.gen.chain) {
     const e = conns.get(id); if (!e) continue;
     sendTo(id, { t: "ping", ts: performance.now() });
-    if (now - (e.pongAt || now) > 2000) peerGone(id, e.name);
+    if (stalled) e.pongAt = now; else if (now - (e.pongAt || now) > 2000) peerGone(id, e.name);
   }
 }, 500);
 
