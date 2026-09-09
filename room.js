@@ -325,6 +325,7 @@ function onData(from, d) {
         if (ai.state !== "idle") {
           sendTo(from, { t: "ai-layers", v: ai.planV, model: ai.modelKey, by: ai.layersByName, state: ai.state, note: "" });
           if (d.meta?.webgpu !== false) schedulePlan(`${d.name} joined`);
+          else if (ai.state === "online" || ai.state === "generating") sendTo(from, { t: "ai-ready-all" });   // no plan for it: it can still ask
         }
       }
       break;
@@ -638,7 +639,7 @@ let ai = {
   planWanted: null,      // host: reason for a pending re-plan
   planTimer: null,
   speed: new Map(),      // host: peer id -> autotune ms (feeds the speed weight)
-  exclude: new Set(),    // host: ids that failed to load the current plan
+  exclude: new Map(),    // host: id -> plan version it failed to load; excluded from the plan right after, then tried again
   loadQ: Promise.resolve(),   // every device: shard loads/frees run one after another
   inflight: 0,           // worker: laps being computed; aiQuiesce waits for 0 before a device is destroyed
   quiesce: [],
@@ -932,7 +933,7 @@ async function aiStart(modelArg) {
     }
     ai.dims = { L, layerBytes, embedBytes };
     ai.modelKey = modelKey;
-    ai.plan = null; ai.lastPlan = null; ai.exclude = new Set(); ai.speed = new Map();
+    ai.plan = null; ai.lastPlan = null; ai.exclude = new Map(); ai.speed = new Map();
     // the first plan goes through the same queue as every later one, so a device leaving
     // during the download re-plans right after the host's own load
     const p = ai.loadQ.then(() => applyPlan("start"));
@@ -963,7 +964,10 @@ async function applyPlan(reason) {
   const M = MODELS[ai.modelKey];
   const first = !ai.engine;
   const nameOf = (id) => id === peer.id ? "you" : (conns.get(id)?.name || id);
-  const plan = planSplit({ ...ai.dims, ...aiMembersForPlan(), prev, exclude: ai.exclude });
+  // a device that failed plan v-1 sits this one out; a later plan tries it again (docs: "from the next plan")
+  const exclude = new Set([...ai.exclude].filter(([, fv]) => fv === v - 1).map(([id]) => id));
+  for (const [id, fv] of ai.exclude) if (fv < v - 1) ai.exclude.delete(id);
+  const plan = planSplit({ ...ai.dims, ...aiMembersForPlan(), prev, exclude });
   if (!plan.fits) {
     ai.lastPlan = prev; ai.plan = null; ai.chain = []; ai.busy = "wait"; ai.layersByName = {};
     log("swarm", `${M.label} \u2014 the room holds ${plan.held} of ${plan.L} layers${reason ? ` (${reason})` : ""} \u2014 waiting for a device`);
@@ -1358,12 +1362,17 @@ async function aiOnData(from, d) {
     case "ai-layers":   // room state broadcast from the host
       if (ai.role === "host" || d.v < (ai.layersV || 0)) break;
       ai.layersV = d.v;
-      ai.hostId = ai.hostId || from;
       if (MODELS[d.model]) $("ai-model").value = d.model;
-      $("ai-start").disabled = true; $("ai-model").disabled = true;
       ai.layersByName = d.by; loadCardRender();
-      document.body.dataset.state = d.state; document.body.dataset.plan = String(d.v);
+      ai.state = d.state; document.body.dataset.state = d.state; document.body.dataset.plan = String(d.v);
       if (d.note) aiStatus(d.note);
+      if (d.state === "idle") {   // the host's start failed: the room is back to the start button
+        aiLoading(false); $("ai-start").disabled = false; $("ai-model").disabled = false; ai.hostId = null; ai.role = null;
+        $("ai-send").disabled = true;
+        break;
+      }
+      ai.hostId = ai.hostId || from;
+      $("ai-start").disabled = true; $("ai-model").disabled = true;
       $("ai-send").disabled = !(d.state === "online" || d.state === "generating");
       if (d.state === "waiting") $("ai-empty").textContent = "waiting for a device";
       break;
@@ -1383,7 +1392,7 @@ async function aiOnData(from, d) {
       break;
     case "ai-error":
       aiStatus(`peer ${e?.name || from} failed: ${d.message}`);
-      if (ai.role === "host" && d.v === ai.planV && ai.chain.includes(from)) { ai.exclude.add(from); schedulePlan(`${e?.name || from} failed to load`); }
+      if (ai.role === "host" && d.v === ai.planV && ai.chain.includes(from)) { ai.exclude.set(from, d.v); schedulePlan(`${e?.name || from} failed to load`); }
       break;
     case "ai-hidden-b": {
       // worker: n hiddens in (multiple of 4), my layers (batched), n hiddens on
@@ -1475,6 +1484,7 @@ $("ai-start").addEventListener("click", aiStartAnywhere);
 // manual re-deal: the same planner, now (or right after the answer in flight)
 $("ai-redeal").addEventListener("click", () => {
   if (ai.role !== "host" || ai.state === "idle") return;
+  ai.exclude.clear();   // "find the best split now" includes devices that failed an earlier load
   if (ai.busy === "gen") $("ai-redeal").textContent = "re-deal after this answer";
   schedulePlan("re-deal requested");
 });
