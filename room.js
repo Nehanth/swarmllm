@@ -258,15 +258,17 @@ function ensureCard(id, name, meta) {
   return card;
 }
 function dropCard(id) { const c = cards.get(id); if (c) { c.remove(); cards.delete(id); } }
-// open a data link to a chain neighbour if we do not have one yet; resolves when it is up
-function ensureLink(id, timeoutMs = 60000) {
+// open a data link to a chain neighbour if we do not have one yet; resolves true when it is up,
+// false on timeout or as soon as cancelled() says the caller no longer needs it (a superseded
+// plan whose neighbour has left must not hold the load queue for the full minute)
+function ensureLink(id, timeoutMs = 60000, cancelled = () => false) {
   if (!id || id === "host" || conns.has(id)) return Promise.resolve(true);
   if (!ensureLink.pending.has(id)) { ensureLink.pending.add(id); meshConnect(id); }
   return new Promise((res) => {
     const t0 = performance.now();
     const t = setInterval(() => {
       if (conns.has(id)) { clearInterval(t); ensureLink.pending.delete(id); res(true); }
-      else if (performance.now() - t0 > timeoutMs) { clearInterval(t); ensureLink.pending.delete(id); res(false); }
+      else if (cancelled() || performance.now() - t0 > timeoutMs) { clearInterval(t); ensureLink.pending.delete(id); res(false); }
     }, 100);
   });
 }
@@ -1302,11 +1304,13 @@ async function aiOnData(from, d) {
         ai.next = d.next; ai.hostId = d.host;
         // same model and range as the engine already holds: rewire only, no reload
         const same = ai.engine && ai.model === d.model && ai.range?.[0] === d.range[0] && ai.range?.[1] === d.range[1];
-        ensureLink(d.next);   // open the link to my chain neighbour while the weights download
+        const superseded = () => d.v !== ai.planV;   // a newer ai-load arrived: stop waiting on this plan's neighbour
+        ensureLink(d.next, 60000, superseded);   // open the link to my chain neighbour while the weights download
         try {
           if (!same) await aiLoadShard(d.model || "smollm-135m", d.range, false, false, { quiet: !!ai.engine });
-          if (!(await ensureLink(d.next))) throw new Error("could not connect to the next device in the chain");
-          if (d.v !== ai.planV) return;
+          if (superseded()) return;
+          if (!(await ensureLink(d.next, 60000, superseded))) { if (superseded()) return; throw new Error("could not connect to the next device in the chain"); }
+          if (superseded()) return;
           aiStatus(`layers ${d.range[0]}\u2013${d.range[1] - 1} ready \u00b7 syncing with the room\u2026`);
           if ($("ai-loading").style.display !== "none") {
             aiLoading(true, `layers ${d.range[0]}\u2013${d.range[1] - 1} ready`);
