@@ -222,7 +222,7 @@ function wire(conn, name, meta, initiator = false) {
   conn.on("data", (d) => onData(conn.peer, d));
   conn.on("close", () => {
     const e = conns.get(conn.peer);
-    if (isHost) peerGone(conn.peer, e?.name);   // before the roster goes out: the chain may need re-dealing
+    peerGone(conn.peer, e?.name);   // before the roster goes out: the chain may need re-dealing (no-op unless this tab plans)
     conns.delete(conn.peer);
     gone.delete(conn.peer);
     if (isHost) {   // on the host a closed link means the device left; workers wait for the roster
@@ -237,7 +237,7 @@ function wire(conn, name, meta, initiator = false) {
   // false alarm is undone when the link comes back). A joiner watches its host link for the
   // terminal "failed" only: the room is over, there is nothing to undo.
   const pc = conn.peerConnection;
-  if (pc && isHost) pc.addEventListener("iceconnectionstatechange", () => {
+  if (pc && (isHost || name !== "host")) pc.addEventListener("iceconnectionstatechange", () => {   // chain links, on the creator or a boss that joined
     const st = pc.iceConnectionState;
     if (st === "failed") peerGone(conn.peer, entry.name);
     else if (st === "disconnected") setTimeout(() => { if (conns.get(conn.peer) === entry && !/^(connected|completed)$/.test(pc.iceConnectionState)) peerGone(conn.peer, entry.name); }, 1500);
@@ -331,7 +331,7 @@ function onData(from, d) {
       break;
     case "roster": {
       // the host's view of the room: draw a card per device, no mesh connections
-      const seen = new Set();
+      const seen = new Set(), before = new Set(members.keys());
       for (const m of d.members) {
         if (m.id === peer.id) continue;
         seen.add(m.id);
@@ -340,7 +340,17 @@ function onData(from, d) {
         if (m.meta?.contribGB) c.querySelector(".buf").textContent = "gives " + m.meta.contribGB + " GB";
         const ce = conns.get(m.id); if (ce) ce.meta = m.meta;
       }
-      for (const id of [...members.keys()]) if (!seen.has(id)) { members.delete(id); dropCard(id); }
+      for (const id of [...members.keys()]) if (!seen.has(id)) { const nm = members.get(id)?.name; members.delete(id); dropCard(id); peerGone(id, nm); }
+      // a boss that joined the room learns about joins from the roster, not from hello
+      if (!isHost && ai.role === "host" && ai.state !== "idle") for (const m of d.members) {
+        if (m.id === peer.id || before.has(m.id) || m.meta?.webgpu === false) continue;
+        bossAdopt(m.id, m).then((ok) => {
+          if (!ok || ai.state === "idle") return;
+          ai.exclude.delete(m.id);
+          sendTo(m.id, { t: "ai-layers", v: ai.planV, model: ai.modelKey, by: ai.layersByName, state: ai.state, note: "" });
+          schedulePlan(`${m.name} joined`);
+        });
+      }
       updateCluster();
       break;
     }
@@ -348,7 +358,7 @@ function onData(from, d) {
     case "pong": {
       e.rtt = Math.round(performance.now() - d.ts);
       // a pong from a peer the watchdog gave up on: it was a stall, not a leave
-      if (isHost && gone.has(from)) { gone.delete(from); if (ai.role === "host" && ai.state !== "idle") schedulePlan(`${e.name} is back`); }
+      if (gone.has(from)) { gone.delete(from); if (ai.role === "host" && ai.state !== "idle") schedulePlan(`${e.name} is back`); }
       if (e.card) e.card.querySelector(".rtt").textContent = e.rtt + " ms";
       break;
     }
@@ -382,6 +392,15 @@ function broadcastRoster() {
   broadcastAll({ t: "roster", members });
 }
 
+// a boss that is not the room creator (aiStartAnywhere picks the biggest pledge) starts with a
+// link to the creator only: it dials a roster member itself and copies the roster's name and
+// pledge onto the link, since the hello over that link may still be in flight when it plans
+async function bossAdopt(id, m) {
+  if (!(await ensureLink(id))) return false;
+  const e = conns.get(id); if (!e) return false;
+  e.name = m.name; e.meta = { ...e.meta, ...m.meta };
+  return true;
+}
 function meshConnect(targetId) {
   const conn = peer.connect(targetId, { reliable: true });
   conn.on("open", () => {
@@ -933,6 +952,8 @@ async function aiStart(modelArg) {
     ai.dims = { L, layerBytes, embedBytes };
     ai.modelKey = modelKey;
     ai.plan = null; ai.lastPlan = null; ai.exclude = new Map(); ai.speed = new Map();
+    // a boss that joined the room links to every roster member first, so the first plan sees them
+    if (!isHost) await Promise.all([...members].filter(([id, m]) => id !== peer.id && !conns.has(id) && m.meta?.webgpu !== false).map(([id, m]) => bossAdopt(id, m)));
     // the first plan goes through the same queue as every later one, so a device leaving
     // during the download re-plans right after the host's own load
     const p = ai.loadQ.then(() => applyPlan("start"));
@@ -1010,6 +1031,7 @@ async function applyPlan(reason) {
 // ask for a re-plan; coalesces bursts (300 ms) and waits for the answer in flight (aiGenerate's
 // finally picks planWanted up), then runs on the load queue behind any load still going
 function schedulePlan(reason) {
+  if (ai.role !== "host") return;   // only the boss plans; the creator's join/leave hooks fire here too when the boss is a joiner
   ai.planWanted = reason;
   if (ai.busy === "gen" || ai.gen) return;
   clearTimeout(ai.planTimer);

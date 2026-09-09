@@ -14,6 +14,8 @@
 //   npm run e2e -- --phone --leave worker --leave-at 1.5    close the worker tab 1.5 s into round 0
 //   npm run e2e -- --phone --leave phone --leave-at 1.5     same for the phone-shaped tab
 //   npm run e2e -- --phone --join-after 2                   a desktop tab ('late-e2e', 1 GB) joins 2 s after online
+//   npm run e2e -- --phone --host-gb 0.5 --join-after 2     the worker (1 GB) is the boss, the creator only a worker: a boss that joined dials the room itself
+//   npm run e2e -- --phone --host-gb 0.5 --leave phone       same room, the phone leaves mid-answer (the joined boss re-plans from the roster)
 //   npm run e2e -- --phone --redeal                         press the host's re-deal button
 //   npm run e2e -- --model qwen3.8-27b --leave phone --leave-at 5      the 27B (spec decode) survives a leave (~7 min)
 //   npm run e2e -- --model qwen3.8-27b --host-gb 14 --leave worker --expect-waiting   room too small after the leave
@@ -106,6 +108,7 @@ async function localWeights(context) {
 const ctx = await browser.newContext({ userAgent: UA_DESKTOP, ignoreHTTPSErrors: true });
 if (!flag("no-local-weights")) await localWeights(ctx);
 const tabs = { host: await ctx.newPage() };
+let boss = null; const B = () => boss || tabs.host;
 const nDesk = DEVICES - 1 - PHONES;
 for (let i = 0; i < nDesk; i++) tabs[nDesk === 1 ? "worker" : "worker" + (i + 1)] = await ctx.newPage();
 let pctx = null;
@@ -142,12 +145,12 @@ const lastLog = (p, re) => p.evaluate((src) => [...document.querySelectorAll("#c
 // a round ends with "ready — prefill …" (answered), "stopped: X left …" (a device left mid-answer) or "generation failed: …"
 const ROUND_RE = /^ready — prefill|^generation failed|^stopped:/;
 // a "stopped:" status is overwritten by the re-deal line ~300 ms later, so the page records it
-const hookStatus = () => tabs.host.evaluate(() => { const el = document.getElementById("ai-status"); new MutationObserver(() => { if (/^stopped:/.test(el.textContent)) window.__stop = el.textContent; }).observe(el, { childList: true, characterData: true, subtree: true }); });
-const ask = async () => { await tabs.host.evaluate(() => { window.__stop = null; }); await tabs.host.fill("#ai-prompt", PROMPT); await tabs.host.click("#ai-send"); };
-const waitRound = () => tabs.host.waitForFunction((src) => window.__stop || new RegExp(src).test(document.getElementById("ai-status").textContent), ROUND_RE.source, { timeout: 300000 });
+const hookStatus = () => B().evaluate(() => { const el = document.getElementById("ai-status"); new MutationObserver(() => { if (/^stopped:/.test(el.textContent)) window.__stop = el.textContent; }).observe(el, { childList: true, characterData: true, subtree: true }); });
+const ask = async () => { await B().evaluate(() => { window.__stop = null; }); await B().fill("#ai-prompt", PROMPT); await B().click("#ai-send"); };
+const waitRound = () => B().waitForFunction((src) => window.__stop || new RegExp(src).test(document.getElementById("ai-status").textContent), ROUND_RE.source, { timeout: 300000 });
 const roundResult = async (phase) => {
-  const st = await tabs.host.evaluate(() => window.__stop || document.getElementById("ai-status").textContent);
-  const reply = await tabs.host.evaluate(() => { const b = document.querySelectorAll(".m.bot .bubble"); return (b[b.length - 1]?.textContent || "").slice(0, 240); });
+  const st = await B().evaluate(() => window.__stop || document.getElementById("ai-status").textContent);
+  const reply = await B().evaluate(() => { const b = document.querySelectorAll(".m.bot .bubble"); return (b[b.length - 1]?.textContent || "").slice(0, 240); });
   return { phase, status: st, reply };
 };
 
@@ -175,10 +178,12 @@ try { main: {
   for (const [name, p] of Object.entries(tabs)) await p.waitForFunction(() => document.getElementById("ai-panel").classList.contains("online"), null, { timeout: name === "host" ? 900000 : 300000 });
   clearInterval(failed);
   clearInterval(poll);
-  log("online:", await tabs.host.textContent("#ai-status"));
+  // the boss (the tab that plans, asks and reads answers) is the biggest pledge, not necessarily the creator: --host-gb 0.5 makes the worker the boss
+  for (const [n, p] of Object.entries(tabs)) if (await p.evaluate(() => window.swarmPlan?.().role === "host")) { boss = p; log("boss:", n + "-e2e"); }
+  log("online:", await B().textContent("#ai-status"));
   await hookStatus();
-  const splitBefore = await lastLog(tabs.host, /layer split/);
-  const planBefore = await tabs.host.evaluate(() => +document.body.dataset.plan);
+  const splitBefore = await lastLog(B(), /layer split/);
+  const planBefore = await B().evaluate(() => +document.body.dataset.plan);
   log(splitBefore, "(plan", planBefore + ")");
 
   const results = [];
@@ -213,8 +218,8 @@ try { main: {
     // round 0 starts, then the tab closes LEAVE_AT seconds later (mid-answer, unless the
     // answer was already over); the host must report "stopped: X left" within ~2 s
     await ask();
-    await tabs.host.waitForTimeout(LEAVE_AT * 1000);
-    const st0 = await tabs.host.textContent("#ai-status");
+    await B().waitForTimeout(LEAVE_AT * 1000);
+    const st0 = await B().textContent("#ai-status");
     const inFlight = /^prefill|^generating/.test(st0);
     const tLeave = Date.now();
     await tabs[LEAVE].close(); delete tabs[LEAVE];
@@ -236,24 +241,24 @@ try { main: {
   }
   if (REDEAL) {
     tEvent = Date.now();
-    await tabs.host.click("#ai-redeal");
+    await B().click("#ai-redeal");
     log("re-deal pressed");
     event = { kind: "redeal", tab: "host", at: 0 };
   }
   if (event) {
     // the host bumps body[data-plan] when a new plan is dealt and body[data-state] goes back to
     // "online" once every device reported ready for it ("waiting" = the room can no longer hold the model)
-    const h = await tabs.host.waitForFunction((p) => { const s = document.body.dataset.state; return +document.body.dataset.plan > p && (s === "online" || s === "waiting") ? s : false; }, planBefore, { timeout: 600000 });
+    const h = await B().waitForFunction((p) => { const s = document.body.dataset.state; return +document.body.dataset.plan > p && (s === "online" || s === "waiting") ? s : false; }, planBefore, { timeout: 600000 });
     const state = await h.jsonValue();
     event.redealMs = Date.now() - tEvent;
-    planAfter = await tabs.host.evaluate(() => +document.body.dataset.plan);
-    splitAfter = await lastLog(tabs.host, /layer split/);
-    note = await lastLog(tabs.host, /re-dealing:/);
+    planAfter = await B().evaluate(() => +document.body.dataset.plan);
+    splitAfter = await lastLog(B(), /layer split/);
+    note = await lastLog(B(), /re-dealing:/);
     log("plan", planBefore, "->", planAfter, state, `(${event.redealMs} ms)`);
     log(splitAfter); if (note) log(note);
     if (state === "waiting") {
       waiting = true;
-      const st = await tabs.host.textContent("#ai-status");
+      const st = await B().textContent("#ai-status");
       if (!EXPECT_WAITING) throw new Error(`the room went to "waiting for a device" after the ${event.kind} (${st}); pass --expect-waiting if that is the point of this run`);
       log("room is waiting for a device, as expected:", st);
     }
@@ -271,7 +276,7 @@ try { main: {
     const res = await roundResult(event ? "after" : "plain");
     log("round", r, res.status);
     results.push(res);
-    await tabs.host.waitForTimeout(1000);
+    await B().waitForTimeout(1000);
   }
   const wire = {}; for (const [n, p] of Object.entries(tabs)) wire[n] = await p.evaluate(() => window.swarmDebug?.());
   // every tab's final status line (workers: "serving layers a–b"), and with --verbose its room log
