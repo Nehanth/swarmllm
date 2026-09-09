@@ -132,7 +132,15 @@
   .peer-gpu { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 8px; word-wrap: break-word; }
   .peer-stats { font-family: var(--mono); font-size: 11px; margin-top: 10px; display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); }
   .peer-stats b { color: var(--accent); font-weight: 500; }
-  .peer-card button { margin-top: 12px; font-family: var(--mono); font-size: 11px; padding: 6px 12px; border-radius: 100px; }
+  .peer-card button { margin-top: 8px; font-family: var(--mono); font-size: 11px; padding: 5px 10px; border-radius: 100px; }
+  .peer-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+  .tag-chip { font-family: var(--mono); font-size: 10px; background: var(--panel-2); color: var(--muted); padding: 2px 6px; border-radius: 6px; border: 1px solid var(--border); }
+  .node-edit-row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  .node-edit-row input { font-family: var(--mono); font-size: 11px; padding: 4px 8px; border-radius: 6px; flex: 1; min-width: 80px; }
+  .node-edit-row button { margin-top: 0; padding: 4px 8px; border-radius: 6px; font-size: 11px; }
+  .host-section { border-top: 1px dashed var(--border); padding-top: 10px; margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .host-section label { font-family: var(--mono); font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; }
+  .host-select { font-family: var(--mono); font-size: 11.5px; padding: 6px 10px; border-radius: 8px; width: 100%; }
 
   /* ---- ai panel ---- */
   #ai-panel {
@@ -331,6 +339,7 @@
   <h1>start a <span>swarm</span></h1>
   <p>One room code. Every device that types it becomes part of one machine.</p>
   <input id="name-input" placeholder="device name (e.g. mac, phone)" maxlength="20">
+  <input id="tags-input" placeholder="device tags (e.g. gpu, fast, mobile)" maxlength="40">
   <input id="code-input" placeholder="ROOM CODE" maxlength="6">
   <div class="join-row">
     <button id="create-btn" class="primary">Create room</button>
@@ -363,6 +372,15 @@
       <span id="ai-status">split across every device in the room</span>
       <button id="ai-start" class="primary">start</button>
     </div>
+      <div id="host-controls" class="host-section" style="display:none;">
+        <label>Output Visibility (Host Control)</label>
+        <select id="ai-visibility" class="host-select">
+          <option value="all">All Devices (Public)</option>
+          <option value="host-only">Host Only (Private)</option>
+          <option value="asker-only">Asker Only (Sender + Host)</option>
+        </select>
+        <div id="host-storage-summary" class="side-hint" style="margin-top:4px;"></div>
+      </div>
       <div id="ai-loading" style="display:none">
         <div id="ldg-title"></div>
         <div id="ldg-bar"><div id="ldg-fill"></div></div>

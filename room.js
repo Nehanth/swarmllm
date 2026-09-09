@@ -126,25 +126,83 @@ function log(from, text) {
   $("chat-log").scrollTop = $("chat-log").scrollHeight;
 }
 
+function renderTagsHtml(tags) {
+  if (!tags) return "";
+  const tagArr = Array.isArray(tags) ? tags : String(tags).split(",").map(s => s.trim()).filter(Boolean);
+  if (!tagArr.length) return "";
+  return `<div class="peer-tags">${tagArr.map(t => `<span class="tag-chip">${esc(t)}</span>`).join("")}</div>`;
+}
+
 function peerCard(id, name, meta, self) {
   const card = document.createElement("div");
   card.className = "peer-card" + (self ? " self" : "");
+  const budget = meta.budgetGB || meta.maxBufGB;
+  const tagsHtml = renderTagsHtml(meta.tags);
   card.innerHTML = `
     <div class="peer-name"><span class="dot ${self ? "ok" : "warn"}"></span><span class="pname"></span></div>
+    <div class="tags-container">${tagsHtml}</div>
     <div class="peer-gpu"></div>
     <div class="peer-stats">
       <span>rtt <b class="rtt">—</b></span>
       <span>bw <b class="bw">—</b></span>
       <span>buf <b class="buf">—</b></span>
+      <span>max <b class="max-mem">${budget ? budget + " GB" : "—"}</b></span>
     </div>
-    ${self ? "" : '<button class="bw-btn">test bandwidth</button>'}`;
+    <div class="node-edit-box" style="display:none;">
+      <div class="node-edit-row">
+        <input class="edit-name" placeholder="Name" value="${esc(name)}">
+        <input class="edit-tags" placeholder="Tags (comma-separated)" value="${esc(Array.isArray(meta.tags) ? meta.tags.join(", ") : meta.tags || "")}">
+        <button class="save-node-btn primary">Save</button>
+      </div>
+    </div>
+    <div class="card-btn-row" style="display:flex; gap:6px; margin-top:8px;">
+      <button class="edit-node-btn">${self ? "edit node" : (isHost ? "edit peer" : "details")}</button>
+      ${self ? "" : '<button class="bw-btn">test bandwidth</button>'}
+    </div>`;
   card.querySelector(".pname").textContent = name + (self ? " (you)" : "");
   card.querySelector(".peer-gpu").textContent = meta.webgpu
     ? `${meta.ua} · ${meta.gpu}` : `${meta.ua} · ⚠ no WebGPU`;
-  const budget = meta.budgetGB || meta.maxBufGB;
   card.querySelector(".buf").textContent = meta.contribGB ? "gives " + meta.contribGB + " GB" : (budget ? budget + " GB" : "—");
   $("peers").appendChild(card);
+
   if (!self) card.querySelector(".bw-btn").addEventListener("click", () => bwTest(id));
+
+  const editBtn = card.querySelector(".edit-node-btn");
+  if (editBtn) {
+    const editBox = card.querySelector(".node-edit-box");
+    editBtn.addEventListener("click", () => {
+      editBox.style.display = editBox.style.display === "none" ? "block" : "none";
+    });
+    card.querySelector(".save-node-btn").addEventListener("click", () => {
+      const newName = card.querySelector(".edit-name").value.trim() || name;
+      const tagsStr = card.querySelector(".edit-tags").value.trim();
+      const tagsArr = tagsStr.split(",").map(s => s.trim()).filter(Boolean);
+      editBox.style.display = "none";
+      if (self) {
+        myName = newName;
+        myMeta.tags = tagsArr;
+        card.querySelector(".pname").textContent = myName + " (you)";
+        card.querySelector(".tags-container").innerHTML = renderTagsHtml(myMeta.tags);
+        broadcastAll({ t: "node-update", name: myName, meta: myMeta });
+        if (isHost) {
+          roster.set(peer.id, { name: myName, meta: myMeta });
+          broadcastRoster();
+        }
+      } else if (isHost && conns.has(id)) {
+        const e = conns.get(id);
+        if (e) {
+          e.name = newName;
+          e.meta.tags = tagsArr;
+          members.set(id, { name: newName, meta: e.meta });
+          roster.set(id, { name: newName, meta: e.meta });
+          card.querySelector(".pname").textContent = newName;
+          card.querySelector(".tags-container").innerHTML = renderTagsHtml(tagsArr);
+          broadcastRoster();
+        }
+      }
+      updateCluster();
+    });
+  }
   return card;
 }
 
@@ -167,9 +225,20 @@ function updateCluster() {
   const gpus = all.filter(m => m && m.webgpu).length;
   const pledged = all.reduce((s, m) => s + (m?.contribGB || 0), 0);
   updateNeed(pledged);
-  const mem = all.reduce((s, m) => s + (m?.budgetGB || m?.maxBufGB || 0), 0);
+  const totalMaxMem = all.reduce((s, m) => s + (m?.budgetGB || m?.maxBufGB || 0), 0);
   $("cluster-summary").textContent =
-    `${all.length} device${all.length > 1 ? "s" : ""} \u00b7 ${gpus} WebGPU \u00b7 ${pledged.toFixed(1)} GB pledged`;
+    `${all.length} device${all.length > 1 ? "s" : ""} \u00b7 ${gpus} WebGPU \u00b7 ${pledged.toFixed(1)} GB pledged (${totalMaxMem.toFixed(1)} GB max)`;
+
+  if (isHost) {
+    const hostCtrl = $("host-controls");
+    if (hostCtrl) {
+      hostCtrl.style.display = "block";
+      const storageSummary = $("host-storage-summary");
+      if (storageSummary) {
+        storageSummary.textContent = `Host Storage Inspector: Room Max Storage: ${totalMaxMem.toFixed(1)} GB | Pledged Allocation for Slicing: ${pledged.toFixed(1)} GB`;
+      }
+    }
+  }
 }
 
 function enterRoom() {
@@ -178,7 +247,7 @@ function enterRoom() {
   $("room-badge").style.display = "block";
   $("room-badge").textContent = roomCode;
   $("side-code").textContent = roomCode;
-  $("side-code").addEventListener("click", () => { navigator.clipboard?.writeText(roomCode); toast("room code copied"); });
+  $("side-code").addEventListener("click", copyRoomLink);
   peerCard("self", myName, myMeta, true);
   updateCluster();
   log("swarm", `room ${roomCode} — share this code with your other devices`);
@@ -320,6 +389,20 @@ function onData(from, d) {
       if (e.card) e.card.querySelector(".rtt").textContent = e.rtt + " ms";
       break;
     }
+    case "node-update":
+      if (e) {
+        e.name = d.name; e.meta = d.meta;
+        if (e.card) {
+          e.card.querySelector(".pname").textContent = d.name;
+          const tagsCont = e.card.querySelector(".tags-container");
+          if (tagsCont) tagsCont.innerHTML = renderTagsHtml(d.meta?.tags);
+          if (d.meta?.contribGB) e.card.querySelector(".buf").textContent = "gives " + d.meta.contribGB + " GB";
+        }
+      }
+      if (members.has(from)) members.set(from, { name: d.name, meta: d.meta });
+      if (isHost && roster.has(from)) { roster.set(from, { name: d.name, meta: d.meta }); broadcastRoster(); }
+      updateCluster();
+      break;
     case "pledge":
       if (e) { e.meta = { ...e.meta, contribGB: d.gb }; if (e.card) e.card.querySelector(".buf").textContent = "gives " + d.gb + " GB"; }
       if (members.has(from)) members.get(from).meta = { ...members.get(from).meta, contribGB: d.gb };
@@ -388,6 +471,10 @@ async function start(create) {
   $("create-btn").disabled = $("join-btn").disabled = true;
   $("join-status").textContent = "connecting to signaling…";
   myMeta = await metaPromise;
+  const rawTags = $("tags-input")?.value.trim() || "";
+  if (rawTags) {
+    myMeta.tags = rawTags.split(",").map(s => s.trim()).filter(Boolean);
+  }
   const gbIn = parseFloat($("join-gb").value);
   myMeta.contribGB = Math.max(myMeta.phone ? 0.5 : 1, gbIn > 0 ? gbIn : (myMeta.contribGB || 1));
 
@@ -483,10 +570,18 @@ $("create-btn").addEventListener("click", () => { keepAwake(); start(true); });
 // (auto-rejoin removed: the user prefers to see what happened)
 $("join-btn").addEventListener("click", () => { keepAwake(); start(false); });
 $("code-input").addEventListener("keydown", (e) => { if (e.key === "Enter") start(false); });
-$("room-badge").addEventListener("click", () => {
-  navigator.clipboard?.writeText(roomCode);
-  log("swarm", "room code copied");
-});
+const initialCode = (new URLSearchParams(location.search).get("code") || new URLSearchParams(location.search).get("room") || "").trim().toUpperCase();
+if (initialCode && $("code-input")) $("code-input").value = initialCode;
+
+function copyRoomLink() {
+  const roomUrl = `${location.origin}${location.pathname}?code=${roomCode}`;
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(roomUrl).then(() => { toast("room join link copied"); log("swarm", "room link copied: " + roomUrl); })
+      .catch(() => { navigator.clipboard.writeText(roomCode); toast("room code copied"); });
+  } else { toast("room code: " + roomCode); }
+}
+
+$("room-badge").addEventListener("click", copyRoomLink);
 
 // ================= distributed inference =================
 
@@ -950,6 +1045,20 @@ async function aiPipeToken(id, needLogits = true) {
 }
 
 
+function broadcastOutput(msg, askerName) {
+  const mode = ai.outputVisibility || "all";
+  if (mode === "host-only") return;
+  if (mode === "asker-only") {
+    if (askerName && askerName !== myName) {
+      for (const [id, e] of conns) {
+        if (e.name === askerName) sendTo(id, msg);
+      }
+    }
+    return;
+  }
+  broadcastAll(msg);
+}
+
 async function aiGenerate(textArg, who) {
   const text = (textArg ?? $("ai-prompt").value).trim();
   const asker = who || myName;
@@ -972,7 +1081,15 @@ async function aiGenerate(textArg, who) {
 
   chatUser(asker, text);
   chatBotStart();
-  broadcastAll({ t: "ai-genstart", name: asker, text });
+  const visMode = ai.outputVisibility || "all";
+  if (visMode === "host-only" || (visMode === "asker-only" && asker !== myName)) {
+    for (const [id, e] of conns) {
+      if (visMode === "asker-only" && e.name === asker) sendTo(id, { t: "ai-genstart", name: asker, text });
+      else sendTo(id, { t: "ai-genstart-hidden", name: asker });
+    }
+  } else {
+    broadcastAll({ t: "ai-genstart", name: asker, text });
+  }
   mascot("Thinking… every word is taking a lap through the room.");
   aiStatus(`prefill: ${ids.length} tokens…`);
 
@@ -1029,7 +1146,7 @@ async function aiGenerate(textArg, who) {
       reply += piece;
       count++;
       chatBotUpdate(reply);
-      broadcastAll({ t: "ai-token", text: piece });
+      broadcastOutput({ t: "ai-token", text: piece }, asker);
       aiStatus(`generating… ${count} tok · ${(count / ((performance.now() - t0) / 1000)).toFixed(1)} tok/s`);
     };
     if (ai.engine.mtp && ai.engine.specStep) {
@@ -1118,13 +1235,27 @@ async function aiGenerate(textArg, who) {
     const secs = (performance.now() - t0) / 1000;
     const stats = `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices${capped ? ` · stopped: context full (${MAX_SEQ} tokens)` : ""}`;
     chatBotEnd(reply, stats);
-    broadcastAll({ t: "ai-gendone", stats });
+    if (visMode === "host-only" || (visMode === "asker-only" && asker !== myName)) {
+      for (const [id, e] of conns) {
+        if (visMode === "asker-only" && e.name === asker) sendTo(id, { t: "ai-gendone", stats });
+        else sendTo(id, { t: "ai-gendone-hidden", stats });
+      }
+    } else {
+      broadcastAll({ t: "ai-gendone", stats });
+    }
     mascot("Done. Anyone in the room can ask the next one.");
     aiStatus(`ready — prefill ${((t0 - tPre) / 1000).toFixed(1)}s, ${stats}`);
   } catch (err) {
     aiStatus("generation failed: " + err.message);
     chatBotEnd("\u26a0 " + err.message, "");
-    broadcastAll({ t: "ai-gendone", stats: "failed: " + err.message });   // unlock everyone's send box
+    if (visMode === "host-only" || (visMode === "asker-only" && asker !== myName)) {
+      for (const [id, e] of conns) {
+        if (visMode === "asker-only" && e.name === asker) sendTo(id, { t: "ai-gendone", stats: "failed: " + err.message });
+        else sendTo(id, { t: "ai-gendone-hidden", stats: "failed: " + err.message });
+      }
+    } else {
+      broadcastAll({ t: "ai-gendone", stats: "failed: " + err.message });
+    }
   }
   ai.busy = false;
   $("ai-send").disabled = false;
@@ -1230,6 +1361,23 @@ async function aiOnData(from, d) {
       if (w) { ai.waiters.delete(d.pos); w(unpackWire(d)); }
       break;
     }
+    case "ai-visibility-change":
+      ai.outputVisibility = d.mode;
+      if (d.mode !== "all") toast(`Host set output visibility to: ${d.mode}`);
+      break;
+    case "ai-genstart-hidden":
+      ai.remoteReply = "";
+      chatUser(d.name, "[Prompt submitted - output restricted by host]");
+      chatBotStart();
+      chatBotUpdate("*(Compute worker active - output text is restricted to authorized devices)*");
+      $("ai-send").disabled = true;
+      mascot(`${d.name} asked something. Computing…`);
+      break;
+    case "ai-gendone-hidden":
+      chatBotEnd("*(Generation finished - computed by swarm)*", d.stats || "");
+      $("ai-send").disabled = false;
+      mascot("Your turn. Ask anything.");
+      break;
     case "ai-genstart":
       ai.remoteReply = "";
       chatUser(d.name, d.text);
@@ -1257,6 +1405,11 @@ async function aiOnData(from, d) {
   }
 }
 
+$("ai-visibility")?.addEventListener("change", (e) => {
+  ai.outputVisibility = e.target.value;
+  broadcastAll({ t: "ai-visibility-change", mode: ai.outputVisibility });
+  toast(`output visibility set to ${e.target.value}`);
+});
 $("ai-start").addEventListener("click", aiStartAnywhere);
 $("cache-clear").addEventListener("click", async (ev) => {
   ev.preventDefault();
