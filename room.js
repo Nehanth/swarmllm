@@ -42,6 +42,9 @@ const PREFIX = "swarmllm-room-";
 const rand = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n)))
   .map(b => "ABCDEFGHJKMNPQRSTVWXYZ23456789"[b % 30]).join("");
 
+// per-tab id, sent in hello: a reload keeps it (sessionStorage), a second device never shares it,
+// so the host can tell a reloaded tab from a namesake that is still alive
+const TAB = (() => { try { return sessionStorage.swarmTab ||= crypto.randomUUID(); } catch { return crypto.randomUUID(); } })();
 let peer = null;          // my PeerJS peer
 let isHost = false;
 let roomCode = null;
@@ -297,12 +300,18 @@ function onData(from, d) {
   if (d.t && d.t.startsWith("ai-")) { aiOnData(from, d); return; }
   switch (d.t) {
     case "hello":
-      e.name = d.name; e.meta = d.meta;
+      e.name = d.name; e.meta = d.meta; e.tab = d.tab;
       members.set(from, { name: d.name, meta: d.meta });
       ensureCard(from, d.name, d.meta);
       if (isHost) {
-        // a reloaded tab comes back under the same name with a new peer id: leave + join
-        for (const [oid, oe] of conns) if (oid !== from && oe.name === d.name) peerGone(oid, d.name);
+        // a reloaded tab comes back with a new peer id but the same tab id: leave + join. An older
+        // peer without a tab id is matched by name, and only when the old link looks dead already
+        // (a second live device with the same name is not a reload)
+        for (const [oid, oe] of conns) {
+          if (oid === from) continue;
+          const reload = d.tab ? oe.tab === d.tab : (oe.name === d.name && (!oe.conn?.open || Date.now() - (oe.pongAt || 0) > 5000));
+          if (reload) peerGone(oid, d.name);
+        }
         roster.set(from, { name: d.name, meta: d.meta }); broadcastRoster();
         ai.exclude.delete(from);
         if (d.died) log("swarm", `${d.name} came back \u2014 its tab died ${d.died.ago}s ago during "${d.died.during}"`);
@@ -369,7 +378,7 @@ function meshConnect(targetId) {
   const conn = peer.connect(targetId, { reliable: true });
   conn.on("open", () => {
     wire(conn, undefined, undefined, true);
-    conn.send({ t: "hello", name: myName, meta: myMeta });
+    conn.send({ t: "hello", name: myName, meta: myMeta, tab: TAB });
   });
 }
 
@@ -457,7 +466,7 @@ async function start(create) {
       wire(conn, "host", undefined, true);
       let died = null;
       try { const c = JSON.parse(localStorage.getItem("swarm-crumb") || "null"); if (c && Date.now() - c.t < 10 * 60 * 1000) died = { during: c.s, ago: Math.round((Date.now() - c.t) / 1000) }; } catch {}
-      conn.send({ t: "hello", name: myName, meta: myMeta, died });
+      conn.send({ t: "hello", name: myName, meta: myMeta, tab: TAB, died });
       enterRoom();
     });
   });
@@ -470,7 +479,7 @@ async function start(create) {
         return;
       }
       wire(conn);
-      conn.send({ t: "hello", name: myName, meta: myMeta });
+      conn.send({ t: "hello", name: myName, meta: myMeta, tab: TAB });
     });
   });
 
