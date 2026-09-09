@@ -15,7 +15,7 @@ One file per item. Each has a status, the reason it matters, a design sketch, an
 | 09 | [Overlapping laps across the network (PipeInfer-style)](09-lap-overlap.md) | later | research · [#9](https://github.com/Nehanth/swarmllm/issues/9) |
 | 10 | [Expert-split mixture-of-experts across a room](10-moe-expert-split.md) | later | research · [#10](https://github.com/Nehanth/swarmllm/issues/10) |
 | 11 | [Native peer for headless GPUs](11-native-peer.md) | later | planned · [#11](https://github.com/Nehanth/swarmllm/issues/11) |
-| 12 | [Stop, fail fast, re-deal: the room survives launch day](12-room-survives-launch-day.md) | now | planned · [#12](https://github.com/Nehanth/swarmllm/issues/12) |
+| 12 | [Stop, fail fast, re-deal: the room survives launch day](12-room-survives-launch-day.md) | now | in progress (re-deal on leave/join/manual landed; Stop button open) · [#12](https://github.com/Nehanth/swarmllm/issues/12) |
 | 13 | [Multi-turn conversation and an honest context limit](13-multi-turn-context.md) | now | planned · [#13](https://github.com/Nehanth/swarmllm/issues/13) |
 | 14 | [Pre-flight check, join links, and a model ladder that says what this room can run](14-preflight-and-join-links.md) | now | planned · [#14](https://github.com/Nehanth/swarmllm/issues/14) |
 | 15 | [Self-hosted signaling, vendored PeerJS, and a status canary](15-self-hosted-signaling-and-status.md) | now | planned · [#15](https://github.com/Nehanth/swarmllm/issues/15) |

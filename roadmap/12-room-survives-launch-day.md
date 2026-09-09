@@ -1,6 +1,6 @@
 # 12 · Stop, fail fast, re-deal: the room survives launch day
 
-**Phase:** now · **Status:** planned
+**Phase:** now · **Status:** in progress (PR: re-deal on leave/join/manual, single-turn; guest Stop button still open)
 
 ## Why
 Two ways a room dies on Monday, both permanent. A friend closes their tab mid-answer: `conn.on("close")` (room.js:190–198) only removes the card, so the host waits out the 30 s / 90 s lap timeouts (865, 930, 968), `aiGenerate`'s catch leaves `ai.engine` set (1029–1033), `aiStart` early-returns on `ai.engine` (715), and nothing re-enables the start button (only `updateNeed` when `!ai.engine`, or the load-failure path at 805). Everyone reloads and re-types the code; guests whose host left still read "cluster online". Or a wrong-direction answer: the decode loops run to EOS or a literal 400 tokens (999, 1016) with no abort path, and at 3.5–6 tok/s cross-network that locks every screen behind `ai-busy` (1156) for up to two minutes. Roadmap 03 (spare copies, replay) is the right end state but is weeks away; this is the floor it sits on, and the master plan's NEXT metric ("median room survives one peer departure") is unreachable without it.

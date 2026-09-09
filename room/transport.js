@@ -33,7 +33,8 @@ export function attachWire(link, conn, onFrame, { ordered = true } = {}) {
 
 export function wireReady(link) { return link.chans.some((c) => c.readyState === "open"); }
 
-// msg: { t, pos|basePos, n?, spec?, data: Uint16Array (f16) }
+// msg: { t, pos|basePos, n?, spec?, v?, data: Uint16Array (f16) }; v is the plan version
+// (header bytes 18-19, 0 when absent) so a worker can drop frames from a plan it no longer serves
 export function sendFrame(link, msg) {
   const kind = KINDS.indexOf(msg.t);
   if (kind < 0) throw new Error("not a wire kind: " + msg.t);
@@ -51,7 +52,7 @@ export function sendFrame(link, msg) {
     const buf = new ArrayBuffer(HDR + len), dv = new DataView(buf);
     dv.setUint16(0, MAGIC); dv.setUint8(2, kind); dv.setUint8(3, msg.spec ? 1 : 0);
     dv.setUint32(4, id); dv.setUint32(8, pos >>> 0); dv.setUint16(12, msg.n || 1);
-    dv.setUint16(14, k); dv.setUint16(16, nSlices); dv.setUint32(20, bytes.length);
+    dv.setUint16(14, k); dv.setUint16(16, nSlices); dv.setUint16(18, msg.v || 0); dv.setUint32(20, bytes.length);
     new Uint8Array(buf, HDR).set(bytes.subarray(off, off + len));
     off += len;
     // round-robin over associations so a block never waits on one congestion window
@@ -66,7 +67,7 @@ function receive(link, buf, onFrame) {
   const dv = new DataView(buf);
   if (dv.getUint16(0) !== MAGIC) return;
   const kind = dv.getUint8(2), spec = dv.getUint8(3), id = dv.getUint32(4), pos = dv.getUint32(8), n = dv.getUint16(12);
-  const k = dv.getUint16(14), nSlices = dv.getUint16(16), total = dv.getUint32(20);
+  const k = dv.getUint16(14), nSlices = dv.getUint16(16), v = dv.getUint16(18), total = dv.getUint32(20);
   let r = link.rx.get(id);
   if (!r) { r = { parts: new Array(nSlices), got: 0, n: nSlices, buf: new Uint8Array(total), t: performance.now() }; link.rx.set(id, r); }
   if (r.parts[k]) return;   // duplicate
@@ -78,7 +79,7 @@ function receive(link, buf, onFrame) {
   link.recv++;
   const data = new Uint16Array(r.buf.buffer, 0, total >> 1);
   const t = KINDS[kind];
-  const msg = { t, enc: "f16", data, n, spec: spec ? 1 : 0 };
+  const msg = { t, enc: "f16", data, n, spec: spec ? 1 : 0, v };
   if (t === "ai-hidden" || t === "ai-hiddenret") msg.pos = pos; else msg.basePos = pos;
   onFrame(msg);
   // drop half-received frames older than 30 s so a lost slice cannot leak memory

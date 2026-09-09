@@ -152,6 +152,8 @@
   #ai-model { font-family: var(--mono); font-size: 12.5px; border-radius: 100px; padding: 9px 16px; }
   #ai-status { font-family: var(--mono); font-size: 11.5px; color: var(--muted); flex: 1; min-width: 160px; }
   #ai-status:empty { display: none; }
+  #ai-redeal { font-family: var(--mono); font-size: 11px; padding: 6px 12px; border-radius: 100px; }
+  #ai-redeal[hidden] { display: none; }
   #ai-need { width: 100%; display: flex; flex-direction: column; gap: 6px; }
   /* panel states: pick -> loading -> online */
   #ai-panel.loading #ai-model, #ai-panel.loading #ai-start, #ai-panel.loading #ai-need,
@@ -362,6 +364,7 @@
       </div>
       <span id="ai-status">split across every device in the room</span>
       <button id="ai-start" class="primary">start</button>
+      <button id="ai-redeal" class="secondary" hidden>re-deal layers</button>
     </div>
       <div id="ai-loading" style="display:none">
         <div id="ldg-title"></div>
