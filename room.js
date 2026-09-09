@@ -11,6 +11,7 @@ import { esc, md } from "./room/markdown.js";
 import { aiSample } from "./room/sampling.js";
 import { MODELS, NEED_GB, MAX_SEQ, MAX_NEW, MIN_ROOM } from "./room/models.js";
 import { makeLink, attachWire, wireReady, sendFrame } from "./room/transport.js";
+import { planSplit, describeSplit, planNote } from "./room/plan.js";
 
 // Hidden-state transport (room/transport.js). ?wire=off falls back to PeerJS messages;
 // ?wire=slice uses one sliced channel; ?wire=stripeN spreads slices over N peer connections.
@@ -758,6 +759,16 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
 }
 
 // ---- host ----
+// planner inputs from the room: pledges in bytes, WebGPU flag, and the autotune ms per device
+// (ai.speed, filled from ai-ready) — see room/plan.js
+function aiMembersForPlan() {
+  const pledgeOf = (m) => ((m?.contribGB ?? (m?.maxBufGB ? m.maxBufGB * 0.5 : 0.5))) * 2 ** 30;
+  const speed = ai.speed || new Map();
+  return {
+    host: { id: peer.id, name: myName, pledgeBytes: pledgeOf(myMeta), ms: speed.get(peer.id) },
+    workers: [...conns].map(([id, e]) => ({ id, name: e.name || id, pledgeBytes: pledgeOf(e.meta), webgpu: e.meta?.webgpu !== false, ms: speed.get(id) })),
+  };
+}
 function biggestPeerId() {
   const gb = (m) => m?.contribGB ?? 0;
   let best = peer.id, bestGB = gb(myMeta);
@@ -785,10 +796,7 @@ async function aiStart(modelArg) {
     ai.role = "host";
     const modelKey = $("ai-model").value;
     const M = MODELS[modelKey];
-    ai.chain = [...conns.keys()].sort();
     ai.plan = new Map();                      // name -> load message, so a reloaded device can be re-seated
-    ai.chainNames = ai.chain.map((id) => conns.get(id)?.name || id);
-    const n = ai.chain.length + 1;
     let L, layerBytes, embedBytes, cfg = null;
     if (M.kind === "qwen35") {
       aiStatus("reading model index\u2026 (11 MB)");
@@ -816,26 +824,16 @@ async function aiStart(modelArg) {
       layerBytes = (2 * d * d + 2 * kvDim * d + 3 * cfg.intermediate_size * d) * 4;
       embedBytes = cfg.vocab_size * d * 4;
     }
-    const pledgeOf = (m) => ((m?.contribGB ?? (m?.maxBufGB ? m.maxBufGB * 0.5 : 0.5))) * 2 ** 30;
-    const parts = [
-      { cap: Math.max(pledgeOf(myMeta) - embedBytes, layerBytes / 2) },
-      ...ai.chain.map((id) => ({ cap: Math.max(pledgeOf(conns.get(id)?.meta), layerBytes / 2) })),
-    ];
-    const totalCap = parts.reduce((s, p) => s + p.cap, 0);
-    const assigned = parts.map((p) => Math.floor(L * p.cap / totalCap));
-    const fracs = parts.map((p, i) => ({ i, f: L * p.cap / totalCap - assigned[i] })).sort((a, b) => b.f - a.f);
-    let rem = L - assigned.reduce((a, b) => a + b, 0);
-    for (let k = 0; k < rem; k++) assigned[fracs[k % fracs.length].i]++;
-    for (let i = 1; i < assigned.length; i++)
-      if (assigned[i] === 0) { const j = assigned.indexOf(Math.max(...assigned)); assigned[j]--; assigned[i]++; }
-    const ranges = [];
-    let acc = 0;
-    for (const a of assigned) { ranges.push([acc, acc + a]); acc += a; }
-
-    const needGB = (L * layerBytes + embedBytes) / 2 ** 30;
-    const haveGB = parts.reduce((s, p) => s + p.cap, embedBytes) / 2 ** 30;
+    ai.dims = { L, layerBytes, embedBytes };
+    ai.modelKey = modelKey;
+    const plan = planSplit({ ...ai.dims, ...aiMembersForPlan(), prev: null });
+    const needGB = plan.needBytes / 2 ** 30, haveGB = plan.haveBytes / 2 ** 30;
+    if (!plan.fits) throw new Error(`this model needs ~${needGB.toFixed(1)} GB of layers but the room holds ${plan.held} of ${plan.L} \u2014 add a device or raise a pledge`);
     if (needGB > haveGB * 1.15)
       log("swarm", `\u26a0 this model needs ~${needGB.toFixed(1)} GB but the room pledged ~${haveGB.toFixed(1)} GB \u2014 it may not fit`);
+    ai.chain = plan.chain.map((c) => c.id);
+    ai.chainNames = ai.chain.map((id) => conns.get(id)?.name || id);
+    const ranges = [plan.hostRange, ...plan.chain.map((c) => c.range)];
 
     ai.deferred = [];
     ai.chain.forEach((id, i) => {
@@ -851,10 +849,9 @@ async function aiStart(modelArg) {
     });
     ai.layersByName = Object.fromEntries([[myName, `${ranges[0][0]}\u2013${ranges[0][1] - 1}`], ...ai.chain.map((id, i) => [conns.get(id)?.name || id, `${ranges[i + 1][0]}\u2013${ranges[i + 1][1] - 1}`])]);
     broadcastAll({ t: "ai-layers", by: ai.layersByName });
-    const splitDesc = [`you ${assigned[0]}+embed`, ...ai.chain.map((id, i) =>
-      `${conns.get(id)?.name || id} ${assigned[i + 1]}`)].join(" \u00b7 ");
-    log("swarm", `${M.label} \u2014 layer split by pledge: ${splitDesc}`);
+    log("swarm", describeSplit(plan, (id) => conns.get(id)?.name || id, M.label));
     await aiLoadShard(modelKey, ranges[0], true, true);
+    const n = ai.chain.length + 1;
     aiStatus(n === 1
       ? `solo: all ${L} layers local \u2014 ready`
       : `layers ${ranges[0][0]}\u2013${ranges[0][1] - 1} ready \u00b7 syncing with ${ai.chain.length} device${ai.chain.length > 1 ? "s" : ""}\u2026`);
