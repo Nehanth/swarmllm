@@ -11,14 +11,14 @@ Browsers in a room form a WebRTC mesh (PeerJS signaling for the introduction onl
 | `ai-wait {v}` | host → worker | no layers in plan `v`: free the GPU, keep the bytes in the Cache API (a warm spare) |
 | `ai-progress {pct}` / `ai-hostprog` | worker ↔ host | download progress for the room UI |
 | `ai-ready {v, ms?}` | worker → host | layers for plan `v` loaded and the link to `next` is up; `ms` = autotune time of one 5120×17408 q4 matvec on this GPU, feeds the speed weight |
-| `ai-error {v?, message}` | worker → host | load failed (`v` set: the host excludes the device from the next plan) or a GPU/NaN error while serving |
-| `ai-ready-all` | host → all | every device reported ready for the current plan; re-sent after every completed plan, so a late joiner gets it too |
+| `ai-error {v?, message}` | worker → host | load failed (`v` set: the host excludes the device from the plan right after `v`, and tries it again in later plans; the re-deal button clears the exclusion) or a GPU/NaN error while serving. A worker whose load for `v` was superseded by `v+1` sends nothing |
+| `ai-ready-all` | host → all | every device reported ready for the current plan; re-sent after every completed plan, so a late joiner gets it too. A late joiner without WebGPU (no plan is dealt for it) gets it straight from its `hello` while the room is online |
 | `ai-layers {v, model, by, state, note}` | host → all | room state broadcast: `state` ∈ loading · online · generating · redealing · waiting, `by` = `{name: "lo–hi"}`, `note` = the status line to show (may be empty). Also sent to a device that joins a running room |
 | `ai-reset` | host → all | new conversation: caches and states back to position 0 |
 | `ai-genstart` / `ai-token` / `ai-gendone {stats}` | host → all | mirror the question and streamed answer to every screen. `stats` is the tok/s line, `failed: …`, or `stopped: <name> left (layers a–b)` when a chain member left mid-answer |
 | `ai-ask` / `ai-busy` | guest → host | anyone in the room can ask; one generation at a time, and only while the room is `online` |
 
-`ai-next` (re-seating a reloaded device into its old slot by name) is gone: a reload is a leave followed by a join, handled by the planner like any other.
+`ai-next` (re-seating a reloaded device into its old slot by name) is gone: a reload is a leave followed by a join, handled by the planner like any other. `hello {name, meta, tab, died?}` carries a per-tab id (`tab`, from `sessionStorage`: a reload keeps it, a second device never shares it); the host treats a new peer as the reload of an old one only when the tab ids match, so two live devices with the same display name are two devices. A `hello` without `tab` (older peer) matches by name only when the old link is closed or silent for 5 s.
 
 ## Compute frames
 
@@ -28,7 +28,7 @@ Browsers in a room form a WebRTC mesh (PeerJS signaling for the introduction onl
 | `ai-hidden-b {basePos, n, spec?}` → … → `ai-hiddenret-b` | `n` hidden states (multiple of the batch width; up to 16) | batched prefill (`spec` absent) or speculative verify (`spec: 1`: the recurrent state is snapshotted after every non-final column) |
 | `ai-rollback {k}` | — | host rejected drafts after column `k`; workers restore recurrent state to the snapshot after column `k` |
 
-Hidden states travel as binary frames: an f16-packed `Uint16Array` (10 KB for `dim = 5120`) with the wire format flag `WIRE_F16`; decoders accept f32 for older peers. Frames are correlated by position (`pos` / `basePos`), and the host keeps a timeout per outstanding lap. Header bytes 18–19 carry the plan version `v`: a worker drops a frame whose `v` differs from the plan it holds, and the host drops a return whose `v` is not the answer in flight (`v = 0`, from an older peer, is accepted).
+Hidden states travel as binary frames: an f16-packed `Uint16Array` (10 KB for `dim = 5120`) with the wire format flag `WIRE_F16`; decoders accept f32 for older peers. Frames are correlated by position (`pos` / `basePos`), and the host keeps a timeout per outstanding lap. Header bytes 18–19 carry the plan version `v`: a worker drops a frame whose `v` differs from the plan it holds, and the host drops a return whose `v` is not the answer in flight. `v = 0` (a peer older than this protocol) is accepted on both sides.
 
 ## Ordering guarantees
 
@@ -38,18 +38,21 @@ Hidden states travel as binary frames: an f16-packed `Uint16Array` (10 KB for `d
 
 ## Room states
 
-`idle → loading → online ⇄ generating`, with `redealing` and `waiting` as the two ways the room changes shape. The host owns the state and mirrors it with `ai-layers`; `body[data-state]` and `body[data-plan]` expose it on every screen (the emulator reads them).
+`idle → loading → online ⇄ generating`, with `redealing` and `waiting` as the two ways the room changes shape, and `over` as the end on a joiner's screen. The host owns the state and mirrors it with `ai-layers`; `body[data-state]` and `body[data-plan]` expose it on every screen (the emulator reads them).
 
 | State | Meaning |
 |---|---|
 | `idle` | no model started; `start` is enabled when the pledges cover the model |
 | `loading` | plan 1 is being loaded by every device |
 | `online` | the current plan is served by every chain member; questions are accepted |
-| `generating` | an answer is in flight. **The chain serving it is frozen** (`ai.gen = {v, chain}`): a join, a leave or the re-deal button only queue a plan, applied right after `ai-gendone` |
+| `generating` | an answer is in flight. **The chain serving it is frozen** (`ai.gen = {v, chain}`): a join, a leave or the re-deal button only queue a plan, applied right after `ai-gendone` (the button reads "re-deal after this answer"). A plan already ticking down its 300 ms coalescing window when a question starts is held back the same way |
 | `redealing` | a new plan is out (`ai-load`/`ai-wait` sent); devices whose range changed are reloading, unchanged ones re-linked. Back to `online` when every chain member of the new plan reported `ai-ready {v}` |
-| `waiting` | the remaining pledges cannot hold the model (`Σ maxLayers < L`); the room says "waiting for a device" and re-plans as soon as someone joins |
+| `waiting` | the remaining pledges cannot hold the model (`Σ maxLayers < L`); the room says "waiting for a device" and re-plans as soon as someone joins. The last served plan is remembered as `prev` for that re-plan, so survivors keep their order and the host its range when they still fit |
+| `over` | joiners only: the link to the host is gone (PeerJS close, ICE `failed`, or 7.5 s without any message from the host — it pings every 2.5 s idle, every 500 ms while answering). The answer on screen ends with "stopped: the host left", Send unlocks, the pane says "the host left — this room is over"; no further transitions |
 
-A **leave** (connection closed, ICE `failed`, ICE `disconnected` for more than 1.5 s, three missed pongs ≈ 7.5 s while idle, or — while an answer is in flight — 2 s without any message from a chain member, the host pinging that chain every 500 ms; a late pong un-marks the peer and re-plans with it) of a chain member during `generating` ends that answer at once: the host rejects every outstanding lap with `stopped: <name> left (layers a–b)`, emits `ai-gendone` with that text so every Send box unlocks, keeps its engine, and re-plans over the remaining devices. There is no `ai-stop` message in v1: the host stops locally by rejecting laps and the room learns it through `ai-gendone`. A device whose host left is told "the host left — this room is over".
+A **leave** (connection closed, ICE `failed`, ICE `disconnected` for more than 1.5 s, three missed pongs ≈ 7.5 s while idle, or — while an answer is in flight — 2 s without any message from a chain member, the host pinging that chain every 500 ms; a late pong un-marks the peer and re-plans with it; a watchdog tick that itself came late, because the host's own thread stalled, refreshes the budget instead of judging silence it could not observe) of a chain member during `generating` ends that answer at once: the host rejects every outstanding lap with `stopped: <name> left (layers a–b)`, emits `ai-gendone` with that text so every Send box unlocks, keeps its engine, and re-plans over the remaining devices. There is no `ai-stop` message in v1: the host stops locally by rejecting laps and the room learns it through `ai-gendone`. A device whose host left is told "the host left — this room is over".
+
+All of this runs on the AI host, which the code assumes is also the room host (the creator: the leave/join hooks — `close`, ICE, `hello`, pong revive — are wired on `isHost`, the planner and watchdogs on `ai.role === "host"`). `aiStartAnywhere` picks the biggest pledge as boss; when that is a joiner, leaves and joins do not re-plan (the hooks are no-ops there). Making the two coincide, or moving the hooks to the AI host, is open.
 
 A **join** while the model runs gets a fair share at the next plan (the newcomer is appended to the chain; survivors keep their order, so each survivor's new range overlaps its old one and only the delta is loaded — from the Cache API on desktops). Every answer starts from `ai-reset` and position 0 (single turn), so no state migrates across a plan. The manual **re-deal** button runs the same planner. Pledge changes after start do not re-plan in v1.
 
@@ -73,7 +76,7 @@ g. **repair**, deterministic: while some `assigned_i > maxLayers_i` (lowest inde
 
 h. **ranges** = prefix sums in order, host first: `hostRange = [0, a0)`, worker k `[acc, acc + a_k)`. The host keeps embed + head + MTP.
 
-Worked example, Qwen 3.8 27B Q4_0 (64 layers of 223 970 464 B; embed + head + MTP 2 023 303 168 B). Host 16 GiB, desktop 1 GiB, phone 0.5 GiB: caps 14.12 / 1 / 0.5 GiB, maxLayers 67 / 4 / 2, chain sorted by id (phone before desktop here) → host `[0,58)`, phone `[58,60)`, desktop `[60,64)`; the log line reads `layer split by pledge×speed: you 58+embed · phone-e2e 2 · worker-e2e 4`. The desktop leaves: the host pin (58) would leave 6 layers for a phone that holds 2, so the deal is proportional → host `[0,62)`, phone `[62,64)`, note `re-dealing: you takes layers 0–61`. With a 14 GiB host instead, the same leave gives `Σ maxLayers = 58 + 2 = 60 < 64` → `fits: false`, "waiting for a device — room holds 60 of 64 layers". These literals are pinned in `tests/unit/plan_test.js`.
+Worked example, Qwen 3.8 27B Q4_0 (64 layers of 223 970 464 B; embed + head + MTP 2 023 303 168 B). Host 16 GiB, desktop 1 GiB, phone 0.5 GiB: caps 14.12 / 1 / 0.5 GiB, maxLayers 67 / 4 / 2, chain sorted by id (phone before desktop here) → host `[0,58)`, phone `[58,60)`, desktop `[60,64)`; the log line reads `layer split by pledge×speed: you 58+embed · phone-e2e 2 · worker-e2e 4`. The desktop leaves: the host pin (58) would leave 6 layers for a phone that holds 2, so the deal is proportional → host `[0,62)`, phone `[62,64)`, note `re-dealing: host takes layers 0–61` (the note is broadcast, so it carries the host's name, "host" here, not "you"; the host-local split line keeps "you"). With a 14 GiB host instead, the same leave gives `Σ maxLayers = 58 + 2 = 60 < 64` → `fits: false`, "waiting for a device — room holds 60 of 64 layers". These literals are pinned in `tests/unit/plan_test.js`.
 
 **Cache affinity in v1 is structural:** stable order plus contiguity means survivors reload only the delta of their range, served from the Cache API on desktops (phones and the safetensors model never cache). A worker → host report of cached layers, and spare copies of a range, are roadmap 03.
 
