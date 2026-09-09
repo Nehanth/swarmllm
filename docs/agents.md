@@ -30,6 +30,7 @@ Model files live in `models/` (git-ignored). The 27B loads in ~2 minutes; plan r
 - Profile by skipping kernel families (`benchmarks/bench_breakdown.js`); timestamp queries cost 3× just by being on.
 - Vercel refuses deploys whose commits have an email that isn't on GitHub; `git config user.email` must match.
 - The room page is served at `/room`; `curl` the alias's `/room`, not `/p2p.html`, to verify a deploy.
+- Test a branch on the production origin so it shares the cached weights: `swarmllm.ai/try/<branch-slug>/room` (slug = the branch name with `/` as `-`, e.g. `feat/redeal` → `feat-redeal`). `vercel.json` rewrites `/try/:branch/*` to that branch's preview deployment; the Cache API is per origin, so a preview URL of its own would download the model again. Links inside the pages are relative for this reason.
 
 ## Layout
 `engine/engine.js` is a barrel; implementation is in `engine/{dense,qwen35,gguf,tokenizer,sampling,quant,autotune,selftest,safetensors}.js` and `engine/wgsl/*.js`. Tests in `tests/` (goldens in `tests/golden`, CPU references in `tests/reference`, no-GPU tests in `tests/unit`). Benchmarks in `benchmarks/`. Docs in `docs/`.

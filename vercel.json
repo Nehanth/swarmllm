@@ -1,6 +1,25 @@
 {
   "framework": null,
   "trailingSlash": false,
-  "rewrites": [{ "source": "/room", "destination": "/p2p.html" }],
-  "redirects": [{ "source": "/p2p.html", "destination": "/room", "permanent": false }]
+  "rewrites": [
+    {
+      "source": "/try/:branch/:path*",
+      "destination": "https://swarmllm-git-:branch-nehanths-projects.vercel.app/:path*"
+    },
+    {
+      "source": "/try/:branch",
+      "destination": "https://swarmllm-git-:branch-nehanths-projects.vercel.app/"
+    },
+    {
+      "source": "/room",
+      "destination": "/p2p.html"
+    }
+  ],
+  "redirects": [
+    {
+      "source": "/p2p.html",
+      "destination": "/room",
+      "permanent": false
+    }
+  ]
 }

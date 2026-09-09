@@ -5,6 +5,7 @@ All notable changes to SwarmLLM. Format follows [Keep a Changelog](https://keepa
 ## [Unreleased]
 
 ### Added
+- `swarmllm.ai/try/<branch>/room` serves a branch's preview deployment under the production origin, so it uses the weights already cached there instead of downloading the model again.
 - Room topology is linear, not a mesh: every device keeps one link to the host; chain neighbours connect only when the layers are dealt (`ensureLink`). A 64-device room opens 126 links instead of 2,016. Workers draw the device list from the host's roster. `?signal=host:port` points the room at a self-hosted PeerServer.
 - Room emulator (`npm run e2e`): `--devices N --phones K`, local PeerServer, 27B from local disk, room-log error capture, fail-fast on load errors. 16 devices on the 27B verified on GB10.
 - Hidden-state wire (`room/transport.js`): activations travel on a dedicated data channel as ≤4.6 KB slices, striped over several peer connections (`?wire=stripeN`, default 4; `?wire=off` to disable). On a 100 ms link a token's hidden state now crosses a hop in 51 ms instead of 152, and a depth-5 verify block in 52 ms instead of 355 (docs/bench-log.md, transport section). Bytes only, output unchanged.
