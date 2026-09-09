@@ -133,6 +133,10 @@
   .peer-stats { font-family: var(--mono); font-size: 11px; margin-top: 10px; display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); }
   .peer-stats b { color: var(--accent); font-weight: 500; }
   .peer-card button { margin-top: 12px; font-family: var(--mono); font-size: 11px; padding: 6px 12px; border-radius: 100px; }
+  .host-section { border-top: 1px dashed var(--border); padding-top: 10px; margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+  .host-section[hidden] { display: none; }
+  .host-section label { font-family: var(--mono); font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; }
+  .host-select { font-family: var(--mono); font-size: 11.5px; padding: 6px 10px; border-radius: 8px; width: 100%; }
 
   /* ---- ai panel ---- */
   #ai-panel {
@@ -362,6 +366,15 @@
       </div>
       <span id="ai-status">split across every device in the room</span>
       <button id="ai-start" class="primary">start</button>
+    </div>
+    <div id="host-controls" class="host-section" hidden>
+      <label for="ai-visibility">who sees the chat</label>
+      <select id="ai-visibility" class="host-select">
+        <option value="all">everyone in the room</option>
+        <option value="host">only me</option>
+        <option value="asker">only whoever asked</option>
+      </select>
+      <div class="side-hint">every device still computes the answer; this only decides who sees the text</div>
     </div>
       <div id="ai-loading" style="display:none">
         <div id="ldg-title"></div>

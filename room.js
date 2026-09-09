@@ -9,6 +9,7 @@ import { Qwen35Engine } from "./engine/qwen35.js";
 import { WIRE_F16, badF32, f32ToB64, packF16, unpackF16, asU16, packWire, unpackWire, asF32, b64ToF32 } from "./room/wire.js";
 import { esc, md } from "./room/markdown.js";
 import { aiSample } from "./room/sampling.js";
+import { chatRecipients } from "./room/visibility.js";
 import { MODELS, NEED_GB, MAX_SEQ, MAX_NEW, MIN_ROOM } from "./room/models.js";
 import { makeLink, attachWire, wireReady, sendFrame } from "./room/transport.js";
 
@@ -178,7 +179,8 @@ function enterRoom() {
   $("room-badge").style.display = "block";
   $("room-badge").textContent = roomCode;
   $("side-code").textContent = roomCode;
-  $("side-code").addEventListener("click", () => { navigator.clipboard?.writeText(roomCode); toast("room code copied"); });
+  $("side-code").addEventListener("click", copyRoomLink);
+  if (isHost) $("host-controls").hidden = false;
   peerCard("self", myName, myMeta, true);
   updateCluster();
   log("swarm", `room ${roomCode} — share this code with your other devices`);
@@ -287,6 +289,7 @@ function onData(from, d) {
       if (isHost) {
         roster.set(from, { name: d.name, meta: d.meta }); broadcastRoster();
         aiRejoin(from, d.name);
+        if (ai.visibility !== "all") sendTo(from, { t: "ai-visibility", mode: ai.visibility });
       }
       break;
     case "ai-next": ai.next = d.next; ensureLink(d.next); break;
@@ -483,10 +486,17 @@ $("create-btn").addEventListener("click", () => { keepAwake(); start(true); });
 // (auto-rejoin removed: the user prefers to see what happened)
 $("join-btn").addEventListener("click", () => { keepAwake(); start(false); });
 $("code-input").addEventListener("keydown", (e) => { if (e.key === "Enter") start(false); });
-$("room-badge").addEventListener("click", () => {
-  navigator.clipboard?.writeText(roomCode);
-  log("swarm", "room code copied");
-});
+// the room code badge copies a join link; a page opened with ?code=ABCD has the code filled in
+function copyRoomLink() {
+  const url = `${location.origin}${location.pathname}?code=${roomCode}`;
+  if (!navigator.clipboard) { toast("room code: " + roomCode); return; }
+  navigator.clipboard.writeText(url).then(() => toast("join link copied")).catch(() => { navigator.clipboard.writeText(roomCode); toast("room code copied"); });
+}
+$("room-badge").addEventListener("click", copyRoomLink);
+{
+  const code = (new URLSearchParams(location.search).get("code") || "").trim().toUpperCase();
+  if (code) $("code-input").value = code;
+}
 
 // ================= distributed inference =================
 
@@ -562,6 +572,7 @@ const rangeBytesOf = (url) => async (info) => {
 };
 
 let ai = {
+  visibility: "all",   // who sees the chat: all | host | asker (room/visibility.js)
   engine: null, tok: null, cfg: null, device: null,
   role: null,            // "host" | "worker"
   chain: [],             // host: worker peer ids in pipeline order
@@ -950,7 +961,15 @@ async function aiPipeToken(id, needLogits = true) {
 }
 
 
-async function aiGenerate(textArg, who) {
+// who sees the chat: the host's dropdown. The full message goes to the screens allowed to see
+// the text, the hidden stand-in (same type, `hidden: true`) to the others, so every screen still
+// locks and unlocks its Send box with the answer.
+function sendChat(msg, askerId) {
+  const { full, hidden } = chatRecipients(ai.visibility || "all", askerId, [...conns.keys()]);
+  for (const id of full) sendTo(id, msg);
+  if (msg.t !== "ai-token") for (const id of hidden) sendTo(id, { t: msg.t, name: msg.name, stats: msg.stats, hidden: true });
+}
+async function aiGenerate(textArg, who, askerId = peer.id) {
   const text = (textArg ?? $("ai-prompt").value).trim();
   const asker = who || myName;
   if (!text || ai.busy === "gen" || !ai.engine) return;
@@ -972,7 +991,7 @@ async function aiGenerate(textArg, who) {
 
   chatUser(asker, text);
   chatBotStart();
-  broadcastAll({ t: "ai-genstart", name: asker, text });
+  sendChat({ t: "ai-genstart", name: asker, text }, askerId);
   mascot("Thinking… every word is taking a lap through the room.");
   aiStatus(`prefill: ${ids.length} tokens…`);
 
@@ -1029,7 +1048,7 @@ async function aiGenerate(textArg, who) {
       reply += piece;
       count++;
       chatBotUpdate(reply);
-      broadcastAll({ t: "ai-token", text: piece });
+      sendChat({ t: "ai-token", text: piece }, askerId);
       aiStatus(`generating… ${count} tok · ${(count / ((performance.now() - t0) / 1000)).toFixed(1)} tok/s`);
     };
     if (ai.engine.mtp && ai.engine.specStep) {
@@ -1118,13 +1137,13 @@ async function aiGenerate(textArg, who) {
     const secs = (performance.now() - t0) / 1000;
     const stats = `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices${capped ? ` · stopped: context full (${MAX_SEQ} tokens)` : ""}`;
     chatBotEnd(reply, stats);
-    broadcastAll({ t: "ai-gendone", stats });
+    sendChat({ t: "ai-gendone", stats }, askerId);
     mascot("Done. Anyone in the room can ask the next one.");
     aiStatus(`ready — prefill ${((t0 - tPre) / 1000).toFixed(1)}s, ${stats}`);
   } catch (err) {
     aiStatus("generation failed: " + err.message);
     chatBotEnd("\u26a0 " + err.message, "");
-    broadcastAll({ t: "ai-gendone", stats: "failed: " + err.message });   // unlock everyone's send box
+    sendChat({ t: "ai-gendone", stats: "failed: " + err.message }, askerId);   // unlock everyone's send box
   }
   ai.busy = false;
   $("ai-send").disabled = false;
@@ -1230,15 +1249,19 @@ async function aiOnData(from, d) {
       if (w) { ai.waiters.delete(d.pos); w(unpackWire(d)); }
       break;
     }
+    case "ai-visibility":
+      ai.visibility = d.mode;
+      toast(d.mode === "all" ? "the host shows the chat to everyone" : d.mode === "host" ? "the host keeps the chat private" : "the host shows each answer to whoever asked");
+      break;
     case "ai-genstart":
       ai.remoteReply = "";
-      chatUser(d.name, d.text);
+      chatUser(d.name, d.hidden ? "asked something (the host keeps the chat private)" : d.text);
       chatBotStart();
       $("ai-send").disabled = true;
       mascot(`${d.name} asked something. Thinking…`);
       break;
     case "ai-token": ai.remoteReply = (ai.remoteReply || "") + d.text; chatBotUpdate(ai.remoteReply); break;
-    case "ai-gendone": chatBotEnd(ai.remoteReply || "", d.stats); $("ai-send").disabled = false; mascot("Your turn. Ask anything."); break;
+    case "ai-gendone": chatBotEnd(d.hidden ? "answer hidden by the host" : (ai.remoteReply || ""), d.stats); $("ai-send").disabled = false; mascot("Your turn. Ask anything."); break;
     case "ai-ready-all":
       aiLoading(false);
       $("ai-panel").classList.add("online");
@@ -1251,13 +1274,18 @@ async function aiOnData(from, d) {
     case "ai-ask":
       if (ai.role !== "host") break;
       if (ai.busy === "gen") { sendTo(from, { t: "ai-busy" }); break; }
-      aiGenerate(d.text, d.name);
+      aiGenerate(d.text, d.name, from);
       break;
     case "ai-busy": toast("the swarm is still answering, try again in a moment"); break;
   }
 }
 
 $("ai-start").addEventListener("click", aiStartAnywhere);
+$("ai-visibility").addEventListener("change", (e) => {
+  ai.visibility = e.target.value;
+  broadcastAll({ t: "ai-visibility", mode: ai.visibility });
+  toast(ai.visibility === "all" ? "everyone sees the chat" : ai.visibility === "host" ? "only you see the chat" : "each answer goes to whoever asked");
+});
 $("cache-clear").addEventListener("click", async (ev) => {
   ev.preventDefault();
   try { await caches.delete("swarmllm-weights-v1"); weightCache = null; toast("cached weights cleared"); } catch { toast("could not clear the cache"); }
