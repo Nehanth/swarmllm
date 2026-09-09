@@ -244,17 +244,24 @@ try {
     await tabs.host.waitForTimeout(1000);
   }
   const wire = {}; for (const [n, p] of Object.entries(tabs)) wire[n] = await p.evaluate(() => window.swarmDebug?.());
+  // every tab's final status line (workers: "serving layers a–b"), and with --verbose its room log
+  const serving = {}; for (const [n, p] of Object.entries(tabs)) serving[n] = await p.evaluate(() => { const s = window.swarmPlan?.() || {}; return { status: document.getElementById("ai-status").textContent.slice(0, 120), v: s.v, range: s.range, engineLayers: s.engineLayers, next: s.next }; });
+  if (flag("verbose")) for (const [n, p] of Object.entries(tabs)) console.error(n + " log:\n  " + (await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent.slice(0, 200)))).join("\n  "));
   // the room's own log carries GPU validation errors that never reach the console
   const roomErrs = {}; for (const [n, p] of Object.entries(tabs)) roomErrs[n] = await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => t.includes("⚠")).map((t) => t.slice(0, 160)));
   const nRoomErrs = Object.values(roomErrs).reduce((a, e) => a + e.length, 0);
-  const ok = results.every((s) => s.phase === "interrupted" ? s.status.startsWith("stopped:") : s.status.startsWith("ready"))
+  // a reply that is mostly symbols means a device served the wrong weights or a frame was garbled:
+  // the round "completed" but the pipeline is broken (seen once after a re-deal: "﹤﹤﹤`;`;`;")
+  const garbled = (t) => { const w = (t.match(/[A-Za-z]{3,}/g) || []).length; return t.length > 20 && w < t.length / 40; };
+  for (const s of results) if (s.phase !== "interrupted" && garbled(s.reply)) s.garbled = true;
+  const ok = results.every((s) => s.phase === "interrupted" ? s.status.startsWith("stopped:") : s.status.startsWith("ready") && !s.garbled)
     && Object.values(errs).every((e) => e.length === 0) && nRoomErrs === 0
     && (JOIN_AFTER === undefined || waiting || lateOnline === true)
     && (!EXPECT_WAITING || waiting)
     && (!unlocked || Object.values(unlocked).every(Boolean))
     && (!event || planAfter > planBefore);
   const linkSummary = Object.fromEntries(Object.entries(wire).map(([n, l]) => [n, (l || []).map((x) => `${x.name}:${x.chans}ch ${x.sent}/${x.recv}`).join(", ")]));
-  console.log(JSON.stringify({ ok, wire: WIRE, model: MODEL, devices: DEVICES, phones: PHONES, code, event, plans: { before: planBefore, after: planAfter }, splitBefore, splitAfter, note, unlocked, waiting, results, links: DEVICES > 6 ? Object.fromEntries(Object.entries(linkSummary).slice(0, 4)) : linkSummary, errors: Object.fromEntries(Object.entries(errs).filter(([, v]) => v.length)), roomErrors: { count: nRoomErrs, first: Object.fromEntries(Object.entries(roomErrs).filter(([, v]) => v.length).map(([k, v]) => [k, v.slice(0, 2)]).slice(0, 3)) } }, null, 1));
+  console.log(JSON.stringify({ ok, wire: WIRE, model: MODEL, devices: DEVICES, phones: PHONES, code, event, plans: { before: planBefore, after: planAfter }, splitBefore, splitAfter, note, unlocked, waiting, serving, results, links: DEVICES > 6 ? Object.fromEntries(Object.entries(linkSummary).slice(0, 4)) : linkSummary, errors: Object.fromEntries(Object.entries(errs).filter(([, v]) => v.length)), roomErrors: { count: nRoomErrs, first: Object.fromEntries(Object.entries(roomErrs).filter(([, v]) => v.length).map(([k, v]) => [k, v.slice(0, 2)]).slice(0, 3)) } }, null, 1));
   process.exitCode = ok ? 0 : 1;
 } catch (e) {
   console.error("FAILED:", String(e).slice(0, 400));

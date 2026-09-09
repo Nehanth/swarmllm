@@ -273,7 +273,7 @@ function sendTo(id, obj) { const e = conns.get(id); if (e?.conn?.open) e.conn.se
 // debug: per-peer wire state (channels open, frames sent/received) — `swarmDebug()` in the console
 window.swarmDebug = () => [...conns].map(([id, e]) => ({ id, name: e.name, chans: e.link?.chans.filter((c) => c.readyState === "open").length ?? 0, sent: e.link?.sent ?? 0, recv: e.link?.recv ?? 0 }));
 // debug + emulator: the current layer plan and room state — `swarmPlan()` in the console
-window.swarmPlan = () => ({ v: ai.planV, state: ai.state, chain: ai.plan?.chain, layersByName: ai.layersByName });
+window.swarmPlan = () => ({ v: ai.planV, state: ai.state, chain: ai.plan?.chain, layersByName: ai.layersByName, range: ai.range, engineLayers: ai.engine ? [ai.engine.lo, ai.engine.hi] : null, next: ai.next, role: ai.role });
 // activations go over the sliced wire channel when it is up, else as a normal message
 function sendHidden(id, msg) {
   const e = conns.get(id);
