@@ -125,7 +125,7 @@ export function planNote(prevPlan, plan, nameOf) {
   for (const id of ids) {
     const now = plan.ranges[id], was = prevPlan?.ranges?.[id];
     const gained = count(now) - count(was);
-    if (!was && count(now) > 0 || gained > 0) notes.push(`${nameOf(id)} takes layers ${now[0]}–${now[1] - 1}`);
+    if ((!was && count(now) > 0) || gained > 0) notes.push(`${nameOf(id)} takes layers ${now[0]}–${now[1] - 1}`);
     else if (gained < 0) notes.push(`${nameOf(id)} gives up ${-gained}`);
   }
   for (const id of plan.idle) if (count(prevPlan?.ranges?.[id]) > 0) notes.push(`${nameOf(id)} stands by`);

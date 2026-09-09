@@ -656,7 +656,7 @@ function setState(state, note) {
   if (ai.role !== "host") return;
   if (state === "online") $("ai-send").disabled = false; else if (state !== "generating") $("ai-send").disabled = true;
   const rd = $("ai-redeal");
-  rd.hidden = !(state === "online" || state === "waiting" || state === "redealing");
+  rd.hidden = !/^(online|waiting|redealing|generating)$/.test(state);   // during generating a click queues the plan
   if (state === "online") rd.textContent = "re-deal layers";
   broadcastAll({ t: "ai-layers", v: ai.planV, model: ai.modelKey, by: ai.layersByName || {}, state, note: note || "" });
 }
@@ -871,10 +871,9 @@ function aiQuiesce() { return ai.inflight ? new Promise((r) => ai.quiesce.push(r
 // (ai.speed, filled from ai-ready) — see room/plan.js
 function aiMembersForPlan() {
   const pledgeOf = (m) => ((m?.contribGB ?? (m?.maxBufGB ? m.maxBufGB * 0.5 : 0.5))) * 2 ** 30;
-  const speed = ai.speed || new Map();
   return {
-    host: { id: peer.id, name: myName, pledgeBytes: pledgeOf(myMeta), ms: speed.get(peer.id) },
-    workers: [...conns].filter(([id]) => !gone.has(id)).map(([id, e]) => ({ id, name: e.name || id, pledgeBytes: pledgeOf(e.meta), webgpu: e.meta?.webgpu !== false, ms: speed.get(id) })),
+    host: { id: peer.id, name: myName, pledgeBytes: pledgeOf(myMeta), ms: ai.speed.get(peer.id) },
+    workers: [...conns].filter(([id]) => !gone.has(id)).map(([id, e]) => ({ id, name: e.name || id, pledgeBytes: pledgeOf(e.meta), webgpu: e.meta?.webgpu !== false, ms: ai.speed.get(id) })),
   };
 }
 function biggestPeerId() {
@@ -963,7 +962,8 @@ async function applyPlan(reason) {
   const prev = ai.plan || ai.lastPlan || null;
   const M = MODELS[ai.modelKey];
   const first = !ai.engine;
-  const nameOf = (id) => id === peer.id ? "you" : (conns.get(id)?.name || id);
+  const nameOf = (id) => id === peer.id ? "you" : (conns.get(id)?.name || id);        // host-local log line
+  const noteName = (id) => id === peer.id ? myName : (conns.get(id)?.name || id);     // the note goes to every screen
   // a device that failed plan v-1 sits this one out; a later plan tries it again (docs: "from the next plan")
   const exclude = new Set([...ai.exclude].filter(([, fv]) => fv === v - 1).map(([id]) => id));
   for (const [id, fv] of ai.exclude) if (fv < v - 1) ai.exclude.delete(id);
@@ -986,7 +986,8 @@ async function applyPlan(reason) {
   ai.busy = ai.busy === true ? true : "plan";
   plan.chain.forEach((c, i) => sendTo(c.id, { t: "ai-load", v, model: ai.modelKey, range: c.range, next: i + 1 < plan.chain.length ? plan.chain[i + 1].id : "host", host: peer.id }));
   for (const id of plan.idle) sendTo(id, { t: "ai-wait", v });
-  const note = prev ? planNote(prev, plan, nameOf) : "";
+  const note = prev ? planNote(prev, plan, noteName) : "";
+  ai.note = note || "re-dealing layers"; ai.reProg = {};
   log("swarm", describeSplit(plan, nameOf, M.label) + (!first && reason ? ` (${reason})` : ""));
   if (prev) log("swarm", note || "layer split unchanged");
   setState(first ? "loading" : "redealing", first ? "" : (note || "re-dealing layers"));
@@ -1318,8 +1319,7 @@ async function aiOnData(from, d) {
       ai.next = d.next;
       ai.hostId = d.host;
       ai.loadQ = ai.loadQ.then(async () => {
-        if (d.v !== ai.planV) return;   // superseded while an earlier load was running
-        ai.next = d.next; ai.hostId = d.host;
+        if (d.v !== ai.planV) return;   // superseded while an earlier load was running (ai.next/hostId already hold the newest)
         // same model and range as the engine already holds: rewire only, no reload
         const same = ai.engine && ai.model === d.model && ai.range?.[0] === d.range[0] && ai.range?.[1] === d.range[1];
         const superseded = () => d.v !== ai.planV;   // a newer ai-load arrived: stop waiting on this plan's neighbour
@@ -1356,7 +1356,11 @@ async function aiOnData(from, d) {
       if (e?.card) e.card.querySelector(".bw").textContent = "dl " + d.pct + "%";
       ai.prog = ai.prog || {}; ai.progAt = ai.progAt || {};
       ai.prog[e?.name || from] = d.pct; ai.progAt[e?.name || from] = Date.now(); loadCardRender();
-      if (ai.state === "redealing" && /^re-dealing/.test($("ai-status").textContent)) aiStatus(`re-dealing: ${e?.name || from} loading ${d.pct}%`);
+      if (ai.state === "redealing" && /^re-dealing/.test($("ai-status").textContent)) {   // keep "who takes what", append who is still loading
+        ai.reProg = ai.reProg || {}; ai.reProg[e?.name || from] = d.pct;
+        const loading = Object.entries(ai.reProg).filter(([, p]) => p < 100).map(([n, p]) => `${n} ${p}%`);
+        aiStatus(ai.note + (loading.length ? " \u00b7 " + loading.join(" \u00b7 ") : ""));
+      }
       break;
     case "ai-reset": try { ai.engine?.reset?.(); } catch {} break;
     case "ai-layers":   // room state broadcast from the host

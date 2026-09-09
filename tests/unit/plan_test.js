@@ -189,7 +189,7 @@ Deno.test("plan: worked 27B example (docs/protocol.md)", () => {
   const p1 = planSplit({ ...w(16, [phone]), prev: p0 });
   eq(p1.ranges, { h: [0, 62], p: [62, 64] }, "after the desktop left");
   eq(p1.pinned, false);
-  eq(planNote(p0, p1, (id) => ({ h: "you", p: "phone-e2e" })[id]), "re-dealing: you takes layers 0–61");
+  eq(planNote(p0, p1, (id) => ({ h: "host", p: "phone-e2e" })[id]), "re-dealing: host takes layers 0–61");   // the note is broadcast: real names, no "you"
   // with a 14 GiB host the room no longer holds the model without the desktop
   const q0 = planSplit(w(14, [phone, desk]));
   eq(q0.ranges, { h: [0, 58], p: [58, 60], w: [60, 64] }, "14 + 1 + 0.5 GiB");
