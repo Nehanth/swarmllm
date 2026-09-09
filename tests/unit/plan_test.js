@@ -168,6 +168,12 @@ Deno.test("plan: join appends the newcomer last with at least one layer", () => 
   eq(p.chain.map((c) => c.id), ["a", "b", "c", "d"], "survivors first, newcomer last");
   assert(count(p, "d") >= 1, "newcomer has layers");
   assert(/D takes layers/.test(planNote(first, p, (id) => id.toUpperCase())), "note names the newcomer");
+  // the previous plan is passed as planSplit returned it (chain entries are objects): the
+  // survivors' order must come from it, not from the id sort (a re-deal in the room shuffled the
+  // chain and reloaded every survivor before this was checked)
+  const shuffled = { ...first, chain: [first.chain[2], first.chain[0], first.chain[1]] };
+  const q = planSplit({ ...joined, prev: shuffled });
+  eq(q.chain.map((c) => c.id), ["c", "a", "b", "d"], "previous chain order kept, newcomer last");
 });
 
 Deno.test("plan: worked 27B example (docs/protocol.md)", () => {

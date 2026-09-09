@@ -5,7 +5,7 @@
 // planSplit({ L, layerBytes, embedBytes, host, workers, prev, exclude })
 //   host:    { id, name?, pledgeBytes, ms? }
 //   workers: [{ id, name, pledgeBytes, webgpu, ms? }] in any order
-//   prev:    { chain: [ids], ranges: {id: [lo, hi]}, hostRange: [lo, hi] } from the previous plan, or null
+//   prev:    the previous planSplit result (or { chain: [ids], ranges: {id: [lo, hi]}, hostRange }), or null
 //   exclude: Set of ids that must not be dealt layers (failed to load)
 // -> { fits: true, needBytes, haveBytes, hostId, hostRange, chain: [{id, name, range}], idle: [ids],
 //      ranges: {id: [lo, hi]}, assigned: [host, ...chain], weights: {id: {cap, s, w, maxLayers}}, pinned }
@@ -31,7 +31,8 @@ export function planSplit({ L, layerBytes, embedBytes, host, workers, prev = nul
   let order;
   if (!prev) order = [...eligible].sort();
   else {
-    const kept = prev.chain.filter((id) => elig.has(id));
+    // prev.chain: ids, or the {id, name, range} entries of a previous planSplit result
+    const kept = prev.chain.map((c) => typeof c === "string" ? c : c.id).filter((id) => elig.has(id));
     const keptSet = new Set(kept);
     order = [...kept, ...eligible.filter((id) => !keptSet.has(id)).sort()];
   }
