@@ -47,6 +47,7 @@ const rand = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n)))
 const TAB = (() => { try { return sessionStorage.swarmTab ||= crypto.randomUUID(); } catch { return crypto.randomUUID(); } })();
 let peer = null;          // my PeerJS peer
 let isHost = false;
+let hostLink = null;      // joiner: peer id of the room host (the link the host-silence watchdog watches)
 let roomCode = null;
 let myName = null;
 let myMeta = {};
@@ -232,14 +233,18 @@ function wire(conn, name, meta, initiator = false) {
   });
   conn.on("error", () => {});
   // a dead tab shows up as ICE failure long before PeerJS closes the connection; a
-  // "disconnected" that does not recover in 1.5 s counts too (host side only: the host
-  // re-plans and a false alarm is undone when the link comes back)
+  // "disconnected" that does not recover in 1.5 s counts too on the host (it re-plans, and a
+  // false alarm is undone when the link comes back). A joiner watches its host link for the
+  // terminal "failed" only: the room is over, there is nothing to undo.
   const pc = conn.peerConnection;
   if (pc && isHost) pc.addEventListener("iceconnectionstatechange", () => {
     const st = pc.iceConnectionState;
     if (st === "failed") peerGone(conn.peer, entry.name);
     else if (st === "disconnected") setTimeout(() => { if (conns.get(conn.peer) === entry && !/^(connected|completed)$/.test(pc.iceConnectionState)) peerGone(conn.peer, entry.name); }, 1500);
     else if ((st === "connected" || st === "completed") && gone.has(conn.peer)) { gone.delete(conn.peer); if (ai.role === "host" && ai.state !== "idle") schedulePlan(`${entry.name} is back`); }
+  });
+  else if (pc && name === "host") pc.addEventListener("iceconnectionstatechange", () => {
+    if (pc.iceConnectionState === "failed" && conns.get(conn.peer) === entry) { log("swarm", "lost the link to the host"); hostGone(); }
   });
   return entry;
 }
@@ -408,6 +413,10 @@ let idleTick = Date.now();
 setInterval(() => {
   broadcastAll({ t: "ping", ts: performance.now() });
   const now = Date.now(), stalled = now - idleTick > 5000; idleTick = now;
+  if (!isHost && hostLink) {   // joiner: the host pings every 2.5 s (500 ms while answering); 7.5 s of silence = the host is gone
+    const h = conns.get(hostLink);
+    if (h && !ai.hostGone) { if (stalled) h.pongAt = now; else if (now - (h.pongAt || now) > 7500) { log("swarm", "no word from the host for 7.5 s"); hostGone(); } }
+  }
   if (ai.role !== "host") return;
   for (const id of ai.chain) { const e = conns.get(id); if (!e) continue; if (stalled) e.pongAt = now; else if (now - (e.pongAt || now) > 7500) peerGone(id, e.name); }
 }, 2500);
@@ -470,6 +479,7 @@ async function start(create) {
     }, 15000);
     conn.on("open", () => {
       clearTimeout(timeout);
+      hostLink = conn.peer;
       wire(conn, "host", undefined, true);
       let died = null;
       try { const c = JSON.parse(localStorage.getItem("swarm-crumb") || "null"); if (c && Date.now() - c.t < 10 * 60 * 1000) died = { during: c.s, ago: Math.round((Date.now() - c.t) / 1000) }; } catch {}
@@ -1023,7 +1033,7 @@ function hostGone() {
   aiLoading(false);
   $("ai-send").disabled = false;
   $("ai-panel").classList.remove("online");
-  document.body.dataset.state = "over";
+  ai.state = "over"; document.body.dataset.state = "over";
   aiStatus("the host left \u2014 this room is over");
   $("ai-empty").textContent = "the host left. create a new room to keep going.";
 }

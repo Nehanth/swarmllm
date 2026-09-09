@@ -17,9 +17,13 @@
 //   npm run e2e -- --phone --redeal                         press the host's re-deal button
 //   npm run e2e -- --model qwen3.8-27b --leave phone --leave-at 5      the 27B (spec decode) survives a leave (~7 min)
 //   npm run e2e -- --model qwen3.8-27b --host-gb 14 --leave worker --expect-waiting   room too small after the leave
-// --leave takes a tab key (worker, worker2, phone, …; never host). With --leave the host pledge
-// grows by the departed pledge so the survivors still hold the model. Desktop tabs share one
-// browser context and therefore one Cache API, so a late desktop joiner is artificially warm.
+//   npm run e2e -- --phone --leave host --leave-at 1.5 --expect-over   the host tab dies mid-answer: every other
+//                                                            tab must reach body[data-state]="over" with Send enabled
+//   npm run e2e -- --phone --redeal --verbose     also print every tab's room log
+// --leave takes a tab key (worker, worker2, phone, …; host only with --expect-over, the room is over then).
+// With --leave the host pledge grows by the departed pledge so the survivors still hold the model.
+// Desktop tabs share one browser context and therefore one Cache API, so a late desktop joiner is
+// artificially warm.
 //
 // The phone tab gets a mobile user agent (the room then treats it as a phone: 0.5 GB pledge,
 // 256 MB buffer cap, no weight cache) and a 4x CPU throttle. Needs `npm install` (playwright)
@@ -47,9 +51,9 @@ const NEED = { "qwen3.8-27b": 16.5, "qwen3-4b": 4.6, "qwen3-1.7b": 2.0, "qwen3-0
 // re-deal scenarios: --leave <tab> --leave-at <s> (close that tab s seconds into round 0),
 // --join-after <s> (one more desktop tab joins s seconds after online), --redeal (host button),
 // --expect-waiting (the run passes when the room ends up waiting for a device)
-const LEAVE = arg("leave"), LEAVE_AT = +arg("leave-at", 1.5), JOIN_AFTER = arg("join-after"), REDEAL = flag("redeal"), EXPECT_WAITING = flag("expect-waiting");
-if (LEAVE === "host") { console.error("--leave host: when the host leaves the room is over; pick a worker or phone tab"); process.exit(2); }
-const LEAVE_GB = LEAVE ? (LEAVE.startsWith("phone") ? 0.5 : 1) : 0;
+const LEAVE = arg("leave"), LEAVE_AT = +arg("leave-at", 1.5), JOIN_AFTER = arg("join-after"), REDEAL = flag("redeal"), EXPECT_WAITING = flag("expect-waiting"), EXPECT_OVER = flag("expect-over");
+if (LEAVE === "host" && !EXPECT_OVER) { console.error("--leave host: when the host leaves the room is over; pass --expect-over to test that, or pick a worker or phone tab"); process.exit(2); }
+const LEAVE_GB = LEAVE ? (LEAVE === "host" ? 0 : LEAVE.startsWith("phone") ? 0.5 : 1) : 0;
 const HOST_GB = arg("host-gb", String(Math.max(2, Math.ceil(NEED + 0.5 - (DEVICES - 1 - PHONES) * 1 - PHONES * 0.5 + LEAVE_GB))));
 // GGUF files already on this machine stand in for Hugging Face (Range requests served from disk)
 const LOCAL = { "Qwen3.8-27B-Q4_0.gguf": "models/q38/model.gguf", "Qwen3-0.6B-Q8_0.gguf": "models/qwen/model.gguf", "Qwen3-1.7B-Q8_0.gguf": "models/qwen17/model.gguf" };
@@ -147,7 +151,7 @@ const roundResult = async (phase) => {
   return { phase, status: st, reply };
 };
 
-try {
+try { main: {
   if (LEAVE && !tabs[LEAVE]) throw new Error(`--leave ${LEAVE}: no such tab (have ${Object.keys(tabs).join(", ")})`);
   for (const p of Object.values(tabs)) await p.goto(BASE);
   for (const p of Object.values(tabs)) await p.waitForFunction(() => document.getElementById("join-gb").value !== "", null, { timeout: 60000 });
@@ -179,6 +183,32 @@ try {
 
   const results = [];
   let event = null, tEvent = 0, r = 0, splitAfter = "", note = "", planAfter = planBefore, unlocked = null, lateOnline = null, waiting = false;
+  if (LEAVE === "host") {
+    // the host tab dies mid-answer: every other tab must notice on its own (ICE failed or 7.5 s
+    // of host silence; PeerJS' own close comes 15-30 s later), end the answer, unlock Send and
+    // show "this room is over" (body[data-state]="over")
+    await ask();
+    await tabs.host.waitForTimeout(LEAVE_AT * 1000);
+    const st0 = await tabs.host.textContent("#ai-status");
+    const inFlight = /^prefill|^generating/.test(st0);
+    const tLeave = Date.now();
+    await tabs.host.close(); delete tabs.host;
+    log("closed host", inFlight ? "mid-answer" : `between answers (${st0.slice(0, 60)})`);
+    const over = {};
+    for (const [n, p] of Object.entries(tabs)) {
+      try { await p.waitForFunction(() => document.body.dataset.state === "over", null, { timeout: 30000 }); } catch {}
+      over[n] = await p.evaluate(() => ({ state: document.body.dataset.state, sendEnabled: !document.getElementById("ai-send").disabled, status: document.getElementById("ai-status").textContent.slice(0, 120), bubble: (([...document.querySelectorAll(".m.bot .stats")].pop() || {}).textContent || "").slice(0, 80) }));
+      over[n].afterMs = Date.now() - tLeave;
+      log(n + ":", JSON.stringify(over[n]));
+    }
+    if (flag("verbose")) for (const [n, p] of Object.entries(tabs)) console.error(n + " log:\n  " + (await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent.slice(0, 200)))).join("\n  "));
+    const roomErrs = {}; for (const [n, p] of Object.entries(tabs)) roomErrs[n] = await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => t.includes("\u26a0")).map((t) => t.slice(0, 160)));
+    const nRoomErrs = Object.values(roomErrs).reduce((a, e) => a + e.length, 0);
+    const ok = Object.values(over).every((o) => o.state === "over" && o.sendEnabled) && Object.values(errs).every((e) => e.length === 0) && nRoomErrs === 0;
+    console.log(JSON.stringify({ ok, wire: WIRE, model: MODEL, devices: DEVICES, phones: PHONES, code, event: { kind: "leave", tab: "host", at: LEAVE_AT, inFlight }, over, errors: Object.fromEntries(Object.entries(errs).filter(([, v]) => v.length)), roomErrors: { count: nRoomErrs, first: roomErrs } }, null, 1));
+    process.exitCode = ok ? 0 : 1;
+    break main;
+  }
   if (LEAVE) {
     // round 0 starts, then the tab closes LEAVE_AT seconds later (mid-answer, unless the
     // answer was already over); the host must report "stopped: X left" within ~2 s
@@ -263,7 +293,7 @@ try {
   const linkSummary = Object.fromEntries(Object.entries(wire).map(([n, l]) => [n, (l || []).map((x) => `${x.name}:${x.chans}ch ${x.sent}/${x.recv}`).join(", ")]));
   console.log(JSON.stringify({ ok, wire: WIRE, model: MODEL, devices: DEVICES, phones: PHONES, code, event, plans: { before: planBefore, after: planAfter }, splitBefore, splitAfter, note, unlocked, waiting, serving, results, links: DEVICES > 6 ? Object.fromEntries(Object.entries(linkSummary).slice(0, 4)) : linkSummary, errors: Object.fromEntries(Object.entries(errs).filter(([, v]) => v.length)), roomErrors: { count: nRoomErrs, first: Object.fromEntries(Object.entries(roomErrs).filter(([, v]) => v.length).map(([k, v]) => [k, v.slice(0, 2)]).slice(0, 3)) } }, null, 1));
   process.exitCode = ok ? 0 : 1;
-} catch (e) {
+} } catch (e) {
   console.error("FAILED:", String(e).slice(0, 400));
   for (const [n, p] of Object.entries(tabs)) { try { console.error(n + ":", await status(p)); } catch {} }
   console.error("errors:", JSON.stringify(errs));
