@@ -13,13 +13,17 @@ Two ways a room dies on Monday, both permanent. A friend closes their tab mid-an
 - **Read `died`.** The joiner already sends `hello.died` from the localStorage crumb (361–362) and the `hello` handler ignores it; surface it as "phone came back; its tab was killed 40 s ago while streaming blk.30" so people learn that backgrounding Safari kills the peer.
 - `ai-stop` is a new message and "degraded" is a new room state, so this file is the GOVERNANCE design note; `docs/protocol.md` gets a row for each. Roadmap 03 then adds spares and automatic replay on top of the same degraded → re-deal state and should be reworded to say so.
 
-- **Join mid-generation.** A device that joins while an answer is streaming does nothing today until the next model start (layers are dealt once in `aiStart`). Two cases: joining while idle should let the host re-run `planSplit()` with a "re-deal to include X" prompt, cached ranges reloading in seconds; joining during an answer must never change that answer, so the newcomer preloads a *backup* copy of an existing slice instead (roadmap 03's spare copies). Re-deal covers departures, spares cover arrivals; both reuse the `ensureLink` neighbour connects from the linear topology.
+- **Automatic re-deal, prepared in the background, flipped at the next question.** The chain that is serving an answer is frozen for that answer. Joins and leaves both trigger a re-plan (`planSplit()` over measured time per layer and memory, not pledged memory alone):
+  - *Join:* the newcomer takes a fair share and the others give up layers, so every device gains headroom (this is what "more devices scale what fits" means; each extra hop costs a little speed and the docs say so). The newcomer and any device gaining layers preload their new slices while the current answer streams; when every preload reports ready the host flips the plan at the next question and re-prefills the conversation on the new chain. Devices that gave up layers free the GPU memory but keep the bytes in the Cache API, which makes them warm spares.
+  - *Leave:* the answer in flight stops (its layers are gone). The departed range goes first to whoever still has it cached, reloaded in seconds, and only hits the network if nobody does. If a spare already holds that slice (roadmap 03) the host flips to it directly. The next question works without anyone reloading.
+  - *Manual re-deal button* on the host for "find the best split now", same planner, for when the automatic one was skipped or the room changed shape.
 
 ## Done when
 - In a three-device room, closing one tab mid-answer surfaces the failure within 2 s, offers "Re-deal", and the next question is answered without anyone reloading.
 - Pressing Stop on any screen ends generation within one lap and every Send box unlocks.
 - A guest whose host left sees "this room is over" rather than "cluster online".
-- A device joining a three-device room mid-answer holds a slice by the next question without any reload, and joining during an answer never changes that answer's output.
+- A device joining a three-device room mid-answer is serving a slice by the next question without any reload, and joining during an answer never changes that answer's output.
+- A device leaving mid-answer stops that answer within 2 s; the next question is answered by the remaining devices, with the departed range reloaded from cache where any device still has it.
 - `docs/protocol.md` documents `ai-stop` and the degraded state. Fail-fast, the guest message and the start-button fix are ordinary bug-fix PRs and land first.
 ```
 
