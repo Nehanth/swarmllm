@@ -962,9 +962,9 @@ async function aiPipeToken(id, needLogits = true) {
     ai.pos++;
     return null;
   }
-  const tHostCompute = performance.now();
+  const tLap = performance.now();
   let h = await ai.engine.embedRun(id, pos);
-  const hostComputeMs = performance.now() - tHostCompute;
+  const hostComputeMs = performance.now() - tLap;
   if (badF32(h)) throw new Error(`NaN after HOST layers (pos ${pos}) — host GPU kernel issue`);
   if (ai.chain.length) {
     const returned = new Promise((res, rej) => {
@@ -974,16 +974,15 @@ async function aiPipeToken(id, needLogits = true) {
     const tHostEncode = performance.now();
     const wire = packWire(h);
     const hostEncodeMs = performance.now() - tHostEncode;
-    const tLap = performance.now();
     sendHidden(ai.chain[0], { t: "ai-hidden", pos, hops: [], ...wire });
     const ret = await returned;
+    // lapMs stops here, before the final unpack — matches the spec-verify lap timer
+    // below, so hostPackMs (compute + encode only) lines up with what lapMs measured
     const lapMs = performance.now() - tLap;
-    const tHostDecode = performance.now();
     h = unpackWire(ret);
-    const hostDecodeMs = performance.now() - tHostDecode;
     if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos}) — check peer status lines`);
     ai.lastHidden = h;
-    recordHopTelemetry(lapMs, ret.hops || [], round1(hostComputeMs + hostEncodeMs + hostDecodeMs));
+    recordHopTelemetry(lapMs, ret.hops || [], round1(hostComputeMs + hostEncodeMs));
   } // solo mode: engine holds every layer, embedRun already produced the final hidden
   if (!needLogits) { ai.pos++; return null; }   // prefill: skip the head entirely
   const logits = await ai.engine.headFromHidden(h);
@@ -1054,10 +1053,10 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
         const NCW = W;
         const basePos = ai.pos;
         const hb = new Float32Array(nChunks * NCW * hdim);
-        const tHostCompute = performance.now();
+        const tLap = performance.now();
         for (let c = 0; c < nChunks; c++)
           hb.set(await ai.engine.embedRunBatch(ids.slice(i + c * NCW, i + (c + 1) * NCW), basePos + c * NCW), c * NCW * hdim);
-        const hostComputeMs = performance.now() - tHostCompute;
+        const hostComputeMs = performance.now() - tLap;
         if (badF32(hb)) throw new Error(`NaN in batched prefill (pos ${basePos})`);
         if (ai.chain.length) {
           const returned = new Promise((res, rej) => {
@@ -1067,7 +1066,6 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
           const tHostEncode = performance.now();
           const wire = packWire(hb);
           const hostEncodeMs = performance.now() - tHostEncode;
-          const tLap = performance.now();
           sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * NCW, hops: [], ...wire });
           const ret = await returned;
           const lapMs = performance.now() - tLap;
@@ -1116,13 +1114,13 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
           const hostEncodeMs = performance.now() - tHostEncode;
           sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos: pos, n: tokens.length, spec: 1, hops: [], ...wire });
           const ret = await returned;
+          // dt stops here, before the final unpack, so it lines up with hostComputeMs
+          // + hostEncodeMs below (neither includes decode either)
           const dt = performance.now() - tLap;
-          const tHostDecode = performance.now();
           const h = unpackWire(ret);
-          const hostDecodeMs = performance.now() - tHostDecode;
           if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos})`);
           ai.lapMs = ai.lapMs ? 0.7 * ai.lapMs + 0.3 * dt : dt;
-          recordHopTelemetry(dt, ret.hops || [], round1(hostComputeMs + hostEncodeMs + hostDecodeMs));
+          recordHopTelemetry(dt, ret.hops || [], round1(hostComputeMs + hostEncodeMs));
           return h;
         },
         onReject: async (k) => { for (const id of ai.chain) sendTo(id, { t: "ai-rollback", k }); },
