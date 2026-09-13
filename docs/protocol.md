@@ -19,11 +19,13 @@ Browsers in a room form a WebRTC mesh (PeerJS signaling for the introduction onl
 
 | Message | Payload | Use |
 |---|---|---|
-| `ai-hidden {pos}` → … → `ai-hiddenret` | one hidden state | single-token decode lap |
-| `ai-hidden-b {basePos, n, spec?}` → … → `ai-hiddenret-b` | `n` hidden states (multiple of the batch width; up to 16) | batched prefill (`spec` absent) or speculative verify (`spec: 1`: the recurrent state is snapshotted after every non-final column) |
+| `ai-hidden {pos, hops[]}` → … → `ai-hiddenret` | one hidden state | single-token decode lap |
+| `ai-hidden-b {basePos, n, spec?, hops[]}` → … → `ai-hiddenret-b` | `n` hidden states (multiple of the batch width; up to 16) | batched prefill (`spec` absent) or speculative verify (`spec: 1`: the recurrent state is snapshotted after every non-final column) |
 | `ai-rollback {k}` | — | host rejected drafts after column `k`; workers restore recurrent state to the snapshot after column `k` |
 
 Hidden states travel as binary frames: an f16-packed `Uint16Array` (10 KB for `dim = 5120`) with the wire format flag `WIRE_F16`; decoders accept f32 for older peers. Frames are correlated by position (`pos` / `basePos`), and the host keeps a timeout per outstanding lap.
+
+The host starts every lap with `hops: []`; each worker that forwards a frame appends one entry, `{peer, computeMs, encodeMs, bytes}` (`room/telemetry.js`), so `hops[i]` corresponds to `ai.chain[i]` by construction. Durations are `performance.now()` deltas taken on that device alone — peer clocks are not synchronized, so nothing compares a timestamp across devices. `computeMs` times that worker's forward pass, `encodeMs` its `packWire` call, and `bytes` is the outgoing frame's wire size. The host derives `transport = lapMs − Σ hops[].computeMs − host's own pack/compute`, cross-checked against `conns.get(next).rtt` (pinged every 2.5 s), and rolls per-peer/transport p50/p90 into `ai.hopStats` — surfaced on each peer's card and in the generation crumb. See `docs/research/network-scheduler.md` §2.4 (roadmap 25 · A4).
 
 ## Ordering guarantees
 
