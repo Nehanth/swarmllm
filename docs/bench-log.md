@@ -45,6 +45,31 @@ One row per merged PR that changes speed, measured in the room on real devices, 
 |---|---|---|---|---|---|---|
 | Sep 4 | #29 prefill GEMM | MacBook (Chrome, Metal) 62 layers + embed/head, iPhone 2 layers | `japan` | 13.8 s → **8.5 s** (1.62×) | 7.3 → 7.7 tok/s (unchanged, within noise) | first answer in each room; both runs hit the 512-token context overflow (#31) after ~300 generated tokens, which does not affect the prefill number |
 
+## Per-hop telemetry (cross-network, roadmap 25 · A4)
+
+Measured 2026-09-13: MacBook Air M1 8 GB (Brave, Shields off for the local origin) as
+host + iPhone 13 Safari as worker (auto-assigned a 0.5 GB pledge), same WiFi, local
+HTTPS via mkcert. Qwen3 0.6B Q8, default transport (`?wire=stripe4`), `japan` prompt
+(verbatim, see "Standard prompts" above), second answer in the room (past the
+conservative first-answer speculation depth). Generation: 400 tok · 12.4 tok/s · 2
+devices.
+
+`window.swarmHopStats()` on the host, read after the run:
+
+| | p50 | p90 |
+|---|---|---|
+| iPhone compute (`hops[].computeMs`) | 30 ms | 35 ms |
+| Derived transport (`lapMs − Σ computeMs − host pack/compute`, §2.4) | 10 ms | 64.2 ms |
+
+Two bugs surfaced and were fixed during an earlier exploratory run on this same setup
+(a one-word "meaning" prompt, not reported above), before the japan numbers were taken:
+the default striped wire (`room/transport.js`) has its own fixed binary header that
+doesn't carry arbitrary JSON fields, so `hops[]` needs a small trailer on the frame's
+final slice rather than riding on the message object directly; and the lap timer's
+start point didn't originally match what `hostPackMs` accounted for, which floored
+the derived transport at zero on every lap. Both are covered by
+`tests/unit/transport_test.js` and `tests/unit/telemetry_test.js`.
+
 ## Hidden-state transport (data channel)
 
 Measured 2026-09-04 on the GB10: two headless Chromium 131 tabs on one machine, loopback shaped with netem to a 100 ms round trip (50 ms each way), one-way delay of one message, p50 over 10 samples, 1 s apart, RTCDataChannel ordered+reliable unless noted. Harness: two RTCPeerConnections over host candidates, sender stamps `performance.timeOrigin + now` in a 16-byte header.
