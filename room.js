@@ -12,6 +12,7 @@ import { aiSample } from "./room/sampling.js";
 import { chatRecipients } from "./room/visibility.js";
 import { MODELS, NEED_GB, MAX_SEQ, MAX_NEW, MIN_ROOM } from "./room/models.js";
 import { makeLink, attachWire, wireReady, sendFrame } from "./room/transport.js";
+import { round1, makeHopStats, recordLap, summarizeHopStats } from "./room/telemetry.js";
 
 // Hidden-state transport (room/transport.js). ?wire=off falls back to PeerJS messages;
 // ?wire=slice uses one sliced channel; ?wire=stripeN spreads slices over N peer connections.
@@ -137,6 +138,7 @@ function peerCard(id, name, meta, self) {
       <span>rtt <b class="rtt">—</b></span>
       <span>bw <b class="bw">—</b></span>
       <span>buf <b class="buf">—</b></span>
+      <span title="per-hop compute time, p50/p90 over this room's laps">hop <b class="hop">—</b></span>
     </div>
     ${self ? "" : '<button class="bw-btn">test bandwidth</button>'}`;
   card.querySelector(".pname").textContent = name + (self ? " (you)" : "");
@@ -261,6 +263,9 @@ ensureLink.pending = new Set();
 function sendTo(id, obj) { conns.get(id)?.conn.send(obj); }
 // debug: per-peer wire state (channels open, frames sent/received) — `swarmDebug()` in the console
 window.swarmDebug = () => [...conns].map(([id, e]) => ({ id, name: e.name, chans: e.link?.chans.filter((c) => c.readyState === "open").length ?? 0, sent: e.link?.sent ?? 0, recv: e.link?.recv ?? 0 }));
+// debug (host only): per-hop compute p50/p90 + derived transport p50/p90, for a bench-log
+// row — `swarmHopStats()` in the console (roadmap 25 · A4)
+window.swarmHopStats = () => summarizeHopStats(ai.hopStats);
 // activations go over the sliced wire channel when it is up, else as a normal message
 function sendHidden(id, msg) {
   const e = conns.get(id);
@@ -579,9 +584,25 @@ let ai = {
   next: null,            // worker: peer id to forward hidden to, or "host"
   readyPeers: new Set(),
   pos: 0,
-  waiters: new Map(),    // pos -> resolve(hiddenF32) for host awaiting return
+  waiters: new Map(),    // pos / "b"+basePos -> resolve(rawFrame) for host awaiting return;
+                          // rawFrame carries hops[] alongside the packed hidden state
+  hopStats: makeHopStats(),   // host: per-peer computeMs + derived transportMs (roadmap 25 · A4)
   busy: false,
 };
+
+// host: fold one lap's hops[] into ai.hopStats and reflect p50/p90 onto each chain
+// peer's card. hostPackMs is the host's own compute+pack+unpack share of lapMs —
+// see docs/research/network-scheduler.md §2.4 for the transport formula.
+function recordHopTelemetry(lapMs, hops, hostPackMs) {
+  if (!hops.length) return;
+  recordLap(ai.hopStats, { lapMs, hops, hostPackMs });
+  const { perHop } = summarizeHopStats(ai.hopStats);
+  ai.chainNames?.forEach((name, i) => {
+    const s = perHop[name];
+    const card = conns.get(ai.chain[i])?.card;
+    if (s && card) card.querySelector(".hop").textContent = `${s.p50}/${s.p90}ms`;
+  });
+}
 
 function aiStatus(s) { $("ai-status").textContent = s; crumb(s); }
 // breadcrumb: if iOS kills the tab, the reloaded page can say where it died
@@ -941,17 +962,28 @@ async function aiPipeToken(id, needLogits = true) {
     ai.pos++;
     return null;
   }
+  const tHostCompute = performance.now();
   let h = await ai.engine.embedRun(id, pos);
+  const hostComputeMs = performance.now() - tHostCompute;
   if (badF32(h)) throw new Error(`NaN after HOST layers (pos ${pos}) — host GPU kernel issue`);
   if (ai.chain.length) {
     const returned = new Promise((res, rej) => {
       ai.waiters.set(pos, res);
       setTimeout(() => { ai.waiters.delete(pos); rej(new Error("pipeline timeout (peer gone?)")); }, 30000);
     });
-    sendHidden(ai.chain[0], { t: "ai-hidden", pos, ...packWire(h) });
-    h = await returned;
+    const tHostEncode = performance.now();
+    const wire = packWire(h);
+    const hostEncodeMs = performance.now() - tHostEncode;
+    const tLap = performance.now();
+    sendHidden(ai.chain[0], { t: "ai-hidden", pos, hops: [], ...wire });
+    const ret = await returned;
+    const lapMs = performance.now() - tLap;
+    const tHostDecode = performance.now();
+    h = unpackWire(ret);
+    const hostDecodeMs = performance.now() - tHostDecode;
     if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos}) — check peer status lines`);
     ai.lastHidden = h;
+    recordHopTelemetry(lapMs, ret.hops || [], round1(hostComputeMs + hostEncodeMs + hostDecodeMs));
   } // solo mode: engine holds every layer, embedRun already produced the final hidden
   if (!needLogits) { ai.pos++; return null; }   // prefill: skip the head entirely
   const logits = await ai.engine.headFromHidden(h);
@@ -1022,16 +1054,26 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
         const NCW = W;
         const basePos = ai.pos;
         const hb = new Float32Array(nChunks * NCW * hdim);
+        const tHostCompute = performance.now();
         for (let c = 0; c < nChunks; c++)
           hb.set(await ai.engine.embedRunBatch(ids.slice(i + c * NCW, i + (c + 1) * NCW), basePos + c * NCW), c * NCW * hdim);
+        const hostComputeMs = performance.now() - tHostCompute;
         if (badF32(hb)) throw new Error(`NaN in batched prefill (pos ${basePos})`);
         if (ai.chain.length) {
           const returned = new Promise((res, rej) => {
             ai.waiters.set("b" + basePos, res);
             setTimeout(() => { ai.waiters.delete("b" + basePos); rej(new Error("pipeline timeout (batch prefill)")); }, 90000);
           });
-          sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * NCW, ...packWire(hb) });
-          await returned;
+          const tHostEncode = performance.now();
+          const wire = packWire(hb);
+          const hostEncodeMs = performance.now() - tHostEncode;
+          const tLap = performance.now();
+          sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * NCW, hops: [], ...wire });
+          const ret = await returned;
+          const lapMs = performance.now() - tLap;
+          // the returned hidden state is discarded here (roadmap 25 · A5 will turn
+          // this into an ack), so there is no host-decode cost to account for
+          recordHopTelemetry(lapMs, ret.hops || [], round1(hostComputeMs + hostEncodeMs));
         }
         ai.pos = basePos + nChunks * NCW;
         i += nChunks * NCW;
@@ -1063,16 +1105,24 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
             const m = Math.min(NC, n - c);
             hb.set(await ai.engine.embedRunBatch(tokens.slice(c, c + m), pos + c, { base: c, total: n }), c * hdim);
           }
+          const hostComputeMs = performance.now() - tLap;
           if (badF32(hb)) throw new Error(`NaN after HOST layers (pos ${pos})`);
           const returned = new Promise((res, rej) => {
             ai.waiters.set("b" + pos, res);
             setTimeout(() => { ai.waiters.delete("b" + pos); rej(new Error("pipeline timeout (verify)")); }, 90000);
           });
-          sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos: pos, n: tokens.length, spec: 1, ...packWire(hb) });
-          const h = await returned;
-          if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos})`);
+          const tHostEncode = performance.now();
+          const wire = packWire(hb);
+          const hostEncodeMs = performance.now() - tHostEncode;
+          sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos: pos, n: tokens.length, spec: 1, hops: [], ...wire });
+          const ret = await returned;
           const dt = performance.now() - tLap;
+          const tHostDecode = performance.now();
+          const h = unpackWire(ret);
+          const hostDecodeMs = performance.now() - tHostDecode;
+          if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos})`);
           ai.lapMs = ai.lapMs ? 0.7 * ai.lapMs + 0.3 * dt : dt;
+          recordHopTelemetry(dt, ret.hops || [], round1(hostComputeMs + hostEncodeMs + hostDecodeMs));
           return h;
         },
         onReject: async (k) => { for (const id of ai.chain) sendTo(id, { t: "ai-rollback", k }); },
@@ -1123,8 +1173,10 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
       if (!done && count >= maxNew) capped = maxNew < MAX_NEW;
       ai.pos = ai.engine.pos;
       const st = ai.engine.mtp.stats;
+      const transport = ai.hopStats.transportMs.length ? summarizeHopStats(ai.hopStats).transport : null;
       if (st.drafts) crumb(`spec: ${st.accepted}/${st.drafts} drafts accepted${ai.lapMs ? ` · lap ${Math.round(ai.lapMs)}ms` : ""}`
-        + (ai.chain.length ? ` · K tok/s ${kc.cand.map((k) => `${k}:${kc.ema[k] ? kc.ema[k].toFixed(1) : "-"}`).join(" ")} · tokens by K ${JSON.stringify(kc.used)}` : ""));
+        + (ai.chain.length ? ` · K tok/s ${kc.cand.map((k) => `${k}:${kc.ema[k] ? kc.ema[k].toFixed(1) : "-"}`).join(" ")} · tokens by K ${JSON.stringify(kc.used)}` : "")
+        + (transport ? ` · transport ${transport.p50}/${transport.p90}ms (p50/p90)` : ""));
     } else {
       for (let i = 0; i < maxNew; i++) {
         const next = aiSample(logits);
@@ -1210,12 +1262,18 @@ async function aiOnData(from, d) {
       const wdim = ai.engine.dims.dim;
       const hb = new Float32Array(nTok * wdim);
       const NC = ai.engine.NC || 4;
+      const tCompute = performance.now();
       for (let c = 0; c < nTok; c += NC) {
         const m = Math.min(NC, nTok - c);
         hb.set(await ai.engine.runHiddenBatch(xs.subarray(c * wdim, (c + m) * wdim), d.basePos + c, d.spec ? { base: c, total: nTok } : false), c * wdim);
       }
+      const computeMs = performance.now() - tCompute;
       if (badF32(hb)) { aiStatus(`\u26a0 NaN in batched prefill on this device`); sendTo(ai.hostId, { t: "ai-error", message: "NaN in batched prefill" }); }
-      const bmsg = { basePos: d.basePos, n: nTok, ...packWire(hb) };
+      const tEncode = performance.now();
+      const wireOut = packWire(hb);
+      const encodeMs = performance.now() - tEncode;
+      const hop = { peer: myName, computeMs: round1(computeMs), encodeMs: round1(encodeMs), bytes: wireOut.data.byteLength };
+      const bmsg = { basePos: d.basePos, n: nTok, hops: [...(d.hops || []), hop], ...wireOut };
       if (ai.next === "host") sendHidden(ai.hostId, { t: "ai-hiddenret-b", ...bmsg });
       else sendHidden(ai.next, { t: "ai-hidden-b", ...bmsg });
       break;
@@ -1226,8 +1284,10 @@ async function aiOnData(from, d) {
       break;
     }
     case "ai-hiddenret-b": {
+      // host: resolve with the raw frame (unpacked lazily by the caller) so hops[]
+      // travels back alongside the hidden state
       const w = ai.waiters.get("b" + d.basePos);
-      if (w) { ai.waiters.delete("b" + d.basePos); w(unpackWire(d)); }
+      if (w) { ai.waiters.delete("b" + d.basePos); w(d); }
       break;
     }
     case "ai-hidden": {
@@ -1235,18 +1295,25 @@ async function aiOnData(from, d) {
       if (!ai.engine) return;
       const hin = unpackWire(d);
       if (badF32(hin)) { aiStatus(`\u26a0 NaN ARRIVED at this device (pos ${d.pos}) — upstream peer broken`); }
+      const tCompute = performance.now();
       const h = await ai.engine.runHidden(hin, d.pos);
+      const computeMs = performance.now() - tCompute;
       if (badF32(h)) { aiStatus(`\u26a0 NaN PRODUCED by this device (pos ${d.pos}, layers ${ai.range[0]}\u2013${ai.range[1] - 1}) — GPU kernel issue here`); sendTo(ai.hostId, { t: "ai-error", message: `NaN produced on worker layers ${ai.range[0]}\u2013${ai.range[1] - 1}` }); }
-      const msg = { pos: d.pos, ...packWire(h) };
+      const tEncode = performance.now();
+      const wireOut = packWire(h);
+      const encodeMs = performance.now() - tEncode;
+      const hop = { peer: myName, computeMs: round1(computeMs), encodeMs: round1(encodeMs), bytes: wireOut.data.byteLength };
+      const msg = { pos: d.pos, hops: [...(d.hops || []), hop], ...wireOut };
       if (ai.next === "host") sendHidden(ai.hostId, { t: "ai-hiddenret", ...msg });
       else sendHidden(ai.next, { t: "ai-hidden", ...msg });
       if (d.pos % 8 === 0) aiStatus(`serving layers ${ai.range[0]}–${ai.range[1] - 1} — pos ${d.pos}`);
       break;
     }
     case "ai-hiddenret": {
-      // host: pipeline round-trip complete
+      // host: pipeline round-trip complete; resolve with the raw frame so hops[]
+      // travels back alongside the hidden state
       const w = ai.waiters.get(d.pos);
-      if (w) { ai.waiters.delete(d.pos); w(unpackWire(d)); }
+      if (w) { ai.waiters.delete(d.pos); w(d); }
       break;
     }
     case "ai-visibility":
