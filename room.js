@@ -223,7 +223,25 @@ function wire(conn, name, meta, initiator = false) {
     if (isHost) {   // on the host a closed link means the device left; workers wait for the roster
       dropCard(conn.peer); members.delete(conn.peer); roster.delete(conn.peer); broadcastRoster();
       log("swarm", `${e?.name || conn.peer} left`);
-    } else if (conn.peer === ai.hostId || entry.name === "host") log("swarm", "lost the link to the host");
+      ai.readyPeers.delete(conn.peer);
+      if (ai.chain?.includes(conn.peer)) {
+        log("swarm", `⚠ chain member ${e?.name || conn.peer} departed`);
+        if (ai.busy === "gen") {
+          ai.aborted = true;
+          for (const [, waiterRes] of ai.waiters) waiterRes(null);
+          ai.waiters.clear();
+          broadcastAll({ t: "ai-gendone", stats: `stopped: ${e?.name || conn.peer} left` });
+        }
+        $("ai-redeal").style.display = "block";
+        aiStatus(`⚠ ${e?.name || conn.peer} left — re-dealing layers…`);
+        aiRedeal();
+      }
+    } else if (conn.peer === ai.hostId || entry.name === "host") {
+      log("swarm", "lost the link to the host — room ended");
+      toast("Host disconnected — room ended");
+      aiStatus("Host disconnected — start or join a new room");
+      $("ai-panel").classList.remove("online");
+    }
     updateCluster();
   });
   conn.on("error", () => {});
@@ -976,8 +994,11 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
   try { ai.engine.reset?.(); } catch {}
   ai.pos = 0;
   broadcastAll({ t: "ai-reset" });
+  ai.aborted = false;
   ai.busy = "gen";
   $("ai-prompt").value = "";
+  $("ai-send").style.display = "none";
+  $("ai-stop").style.display = "inline-block";
   $("ai-send").disabled = true;
   const V = ai.tok.vocab;
   const imStart = V["<|im_start|>"], imEnd = V["<|im_end|>"], eot = V["<|endoftext|>"];
@@ -1018,6 +1039,7 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
       // NC-1 tokens costs one network lap each
       const widths = [NC, ...[8, 4].filter((w) => w < NC)];
       for (const W of widths) while (ids.length - 1 - i >= W) {
+        if (ai.aborted) break;
         const nChunks = Math.max(1, Math.min(Math.floor(16 / W), Math.floor((ids.length - 1 - i) / W)));
         const NCW = W;
         const basePos = ai.pos;
@@ -1037,13 +1059,14 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
         i += nChunks * NCW;
         aiStatus(`prefill: ${i}/${ids.length} tokens\u2026`);
       }
-      for (; i < ids.length; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);
+      for (; i < ids.length && !ai.aborted; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);
     } else {
-      for (let i = 0; i < ids.length; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);
+      for (let i = 0; i < ids.length && !ai.aborted; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);
     }
     const t0 = performance.now();
     let count = 0, reply = "";
     const emit = (tok) => {
+      if (ai.aborted) return;
       const piece = ai.tok.decode([tok]);
       reply += piece;
       count++;
@@ -1101,7 +1124,7 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
       // answer) before the loop, or the reply starts one word late
       let next = aiSample(logits), done = false;
       if (next === imEnd || next === eot) done = true; else emit(next);
-      while (!done && count < maxNew) {
+      while (!done && count < maxNew && !ai.aborted) {
         // a speculative step touches positions pos .. pos+K (K drafts verified in one pass) and
         // drafts one more; shrink K near the end of the context and stop before it overflows
         let K = pickK();
@@ -1126,7 +1149,7 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
       if (st.drafts) crumb(`spec: ${st.accepted}/${st.drafts} drafts accepted${ai.lapMs ? ` · lap ${Math.round(ai.lapMs)}ms` : ""}`
         + (ai.chain.length ? ` · K tok/s ${kc.cand.map((k) => `${k}:${kc.ema[k] ? kc.ema[k].toFixed(1) : "-"}`).join(" ")} · tokens by K ${JSON.stringify(kc.used)}` : ""));
     } else {
-      for (let i = 0; i < maxNew; i++) {
+      for (let i = 0; i < maxNew && !ai.aborted; i++) {
         const next = aiSample(logits);
         if (next === imEnd || next === eot) { await aiPipeToken(next, false); break; }
         emit(next);
@@ -1135,8 +1158,8 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
       }
     }
     const secs = (performance.now() - t0) / 1000;
-    const stats = `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices${capped ? ` · stopped: context full (${MAX_SEQ} tokens)` : ""}`;
-    chatBotEnd(reply, stats);
+    const stats = ai.aborted ? "stopped by user" : `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices${capped ? ` · stopped: context full (${MAX_SEQ} tokens)` : ""}`;
+    chatBotEnd(reply + (ai.aborted ? " [Stopped]" : ""), stats);
     sendChat({ t: "ai-gendone", stats }, askerId);
     mascot("Done. Anyone in the room can ask the next one.");
     aiStatus(`ready — prefill ${((t0 - tPre) / 1000).toFixed(1)}s, ${stats}`);
@@ -1146,6 +1169,8 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
     sendChat({ t: "ai-gendone", stats: "failed: " + err.message }, askerId);   // unlock everyone's send box
   }
   ai.busy = false;
+  $("ai-send").style.display = "inline-block";
+  $("ai-stop").style.display = "none";
   $("ai-send").disabled = false;
 }
 
@@ -1279,6 +1304,41 @@ async function aiOnData(from, d) {
     case "ai-busy": toast("the swarm is still answering, try again in a moment"); break;
   }
 }
+
+function aiStop() {
+  ai.aborted = true;
+  if (ai.role === "host") {
+    broadcastAll({ t: "ai-stop" });
+    aiStatus("generation stopped");
+    toast("generation stopped");
+  } else if (ai.hostId) {
+    sendTo(ai.hostId, { t: "ai-stop" });
+    toast("stop request sent to host");
+  }
+  $("ai-send").style.display = "inline-block";
+  $("ai-stop").style.display = "none";
+  $("ai-send").disabled = false;
+}
+
+async function aiRedeal() {
+  if (ai.role !== "host" || !ai.model) return;
+  log("swarm", "re-dealing layers across remaining active devices…");
+  aiStatus("re-dealing layers across active devices…");
+  ai.readyPeers.clear();
+  $("ai-redeal").style.display = "none";
+  ai.chain = [...conns.keys()].sort();
+  ai.chainNames = ai.chain.map((id) => conns.get(id)?.name || id);
+  if (!ai.chain.length && !ai.engine) return;
+  aiStart(ai.model);
+}
+
+$("mesh-btn")?.addEventListener("click", () => {
+  $("code-input").value = "LOCAL";
+  keepAwake();
+  start(false);
+});
+$("ai-stop")?.addEventListener("click", aiStop);
+$("ai-redeal")?.addEventListener("click", aiRedeal);
 
 $("ai-start").addEventListener("click", aiStartAnywhere);
 $("ai-visibility").addEventListener("change", (e) => {

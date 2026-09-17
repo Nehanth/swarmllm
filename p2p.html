@@ -339,6 +339,7 @@
   <div class="join-row">
     <button id="create-btn" class="primary">Create room</button>
     <button id="join-btn">Join room</button>
+    <button id="mesh-btn" title="Auto-discover & join local Wi-Fi swarm without typing a code">Auto-join Local Swarm</button>
   </div>
   <div id="join-pledge">give <button class="step" id="gb-minus" type="button">−</button><input id="join-gb" type="number" min="1" max="64" step="1" value="1" inputmode="numeric"><button class="step" id="gb-plus" type="button">+</button> GB of memory</div>
   <div id="join-status"></div>
@@ -375,6 +376,7 @@
         <option value="asker">only whoever asked</option>
       </select>
       <div class="side-hint">every device still computes the answer; this only decides who sees the text</div>
+      <button id="ai-redeal" style="margin-top:6px; width:100%; display:none;">Re-deal Layers (Degraded Swarm)</button>
     </div>
       <div id="ai-loading" style="display:none">
         <div id="ldg-title"></div>
@@ -395,7 +397,11 @@
       <div class="lc-note">each device fetches only its own layers, in step with the room</div>
     </div>
     <div id="ai-output"></div>
-    <div id="ai-row"><input id="ai-prompt" placeholder="ask the swarm…"><button id="ai-send" class="primary">Send</button></div>
+    <div id="ai-row">
+      <input id="ai-prompt" placeholder="ask the swarm…">
+      <button id="ai-send" class="primary">Send</button>
+      <button id="ai-stop" class="primary" style="display:none; background:var(--err); border-color:var(--err);">Stop</button>
+    </div>
   </main>
 </div>
 
