@@ -590,7 +590,7 @@ const rangeBytesOf = (url) => async (info) => {
 };
 
 let ai = {
-  visibility: "all",   // who sees the chat: all | host | asker (room/visibility.js)
+  visibility: "host",   // who sees the chat: host (default) | all | asker (room/visibility.js)
   engine: null, tok: null, cfg: null, device: null,
   role: null,            // "host" | "worker"
   chain: [],             // host: worker peer ids in pipeline order
@@ -983,7 +983,7 @@ async function aiPipeToken(id, needLogits = true) {
 // the text, the hidden stand-in (same type, `hidden: true`) to the others, so every screen still
 // locks and unlocks its Send box with the answer.
 function sendChat(msg, askerId) {
-  const { full, hidden } = chatRecipients(ai.visibility || "all", askerId, [...conns.keys()]);
+  const { full, hidden } = chatRecipients(ai.visibility || "host", askerId, [...conns.keys()]);
   for (const id of full) sendTo(id, msg);
   if (msg.t !== "ai-token") for (const id of hidden) sendTo(id, { t: msg.t, name: msg.name, stats: msg.stats, hidden: true });
 }
