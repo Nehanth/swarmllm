@@ -15,3 +15,6 @@ local-server/
 models/
 presentation/
 .claude/
+
+# the DevConf talk deck ships its own demo video
+!devconf/demo.mp4

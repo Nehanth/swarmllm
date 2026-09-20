@@ -15,3 +15,6 @@ package.json
 CITATION.cff
 AUTHORS
 LICENSE
+
+# the DevConf talk deck (swarmllm.ai/devconf) needs its demo video deployed
+!devconf/demo.mp4
