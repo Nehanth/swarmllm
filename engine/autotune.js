@@ -37,6 +37,13 @@ export async function autotuneCoop(device, { dIn = 5120, dOut = 17408, kind = "q
         device.queue.submit([enc.finish()]);
         return device.queue.onSubmittedWorkDone();
       };
+      // a device that needs >20 ms for one of these is a software rasterizer (SwiftShader) or
+      // hopeless anyway: timing 500 dispatches would take minutes, so keep the default
+      if (!results.length) {
+        const t1 = performance.now();
+        await run(1);
+        if (performance.now() - t1 > 20) { for (const b of [qs, sc, x, y]) b.destroy(); return { wg: 256, rows: 4, results, skipped: "slow device" }; }
+      }
       // warm up: GPUs ramp clocks under sustained load; short bursts measure the ramp
       const tw = performance.now();
       while (performance.now() - tw < (results.length ? 40 : 250)) await run(20);
