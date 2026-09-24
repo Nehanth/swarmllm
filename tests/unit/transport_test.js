@@ -46,3 +46,18 @@ Deno.test("transport refuses when no channel is open", () => {
   const link = makeLink(); link.chans.push({ readyState: "connecting", send() {} });
   if (sendFrame(link, { t: "ai-hidden", pos: 0, data: new Uint16Array(8) })) throw new Error("should refuse");
 });
+Deno.test("transport: frames that complete out of order are delivered in send order", () => {
+  const link = makeLink(), out = []; fakeChannels(link, 4, out);
+  const mk = (pos) => { const d = new Uint16Array(5120 * 4); d.fill(pos); return { t: "ai-hidden-b", basePos: pos, n: 4, data: d }; };
+  sendFrame(link, mk(0)); const first = out.length;
+  sendFrame(link, mk(4));
+  sendFrame(link, { t: "ai-hidden-b", basePos: 8, n: 4, rb: 2, reset: 1, data: new Uint16Array(5120 * 4) });
+  const got = []; const deliver = receiver((m) => got.push(m));
+  // every slice of frames 2 and 3 first, then frame 1's
+  for (const { buf } of out.slice(first)) deliver(buf);
+  if (got.length) throw new Error("delivered before frame 1 completed");
+  for (const { buf } of out.slice(0, first)) deliver(buf);
+  const order = got.map((m) => m.basePos).join(",");
+  if (order !== "0,4,8") throw new Error("order " + order);
+  if (got[2].rb !== 2 || got[2].reset !== 1 || got[0].rb !== undefined) throw new Error("flags lost");
+});

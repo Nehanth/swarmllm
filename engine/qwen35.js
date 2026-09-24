@@ -991,7 +991,9 @@ export class Qwen35Engine {
     }
     for (; i < ids.length; i++) {
       await this.prefillToken(ids[i]);
-      if (this.mtp && this.mtpFill !== false && i + 1 < ids.length) await this.mtpRun(null, ids[i + 1], i + 1, false);
+      // the draft cache entry for the next token sits at the next position (this.pos after the
+      // prefillToken above), which is i + 1 only when the prompt started at position 0
+      if (this.mtp && this.mtpFill !== false && i + 1 < ids.length) await this.mtpRun(null, ids[i + 1], this.pos, false);
       if (i % 8 === 7) await this.device.queue.onSubmittedWorkDone();
     }
     await this.device.queue.onSubmittedWorkDone();

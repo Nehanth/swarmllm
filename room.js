@@ -7,11 +7,15 @@ import { f32ToF16, f16ToF32, parseGGUFHeader, ggufWeights, ggufShardBytes, GGML_
   from "./engine/gguf.js";
 import { Qwen35Engine } from "./engine/qwen35.js";
 import { WIRE_F16, badF32, f32ToB64, packF16, unpackF16, asU16, packWire, unpackWire, asF32, b64ToF32 } from "./room/wire.js";
-import { esc, md } from "./room/markdown.js";
-import { aiSample } from "./room/sampling.js";
+import { esc, md, mdChat } from "./room/markdown.js";
+import { pickSampler, SAMPLING } from "./room/sampling.js";
 import { chatRecipients } from "./room/visibility.js";
-import { MODELS, NEED_GB, MAX_SEQ, MAX_NEW, MIN_ROOM } from "./room/models.js";
-import { makeLink, attachWire, wireReady, sendFrame } from "./room/transport.js";
+import { MODELS, NEED_GB, MAX_SEQ, MAX_NEW, MAX_NEW_THINKING, MIN_ROOM } from "./room/models.js";
+import { makeLink, attachWire, wireReady, sendFrame, PROTOCOL } from "./room/transport.js";
+import { PERSONAS, specials, fitContext, reusablePrefix } from "./room/conversation.js";
+import { planSplit, ladder, bestFit, codeFromLocation } from "./room/plan.js";
+import { qrSVG } from "./room/qr.js";
+import { probe as preflight, deviceKind } from "./room/preflight.js";
 
 // Hidden-state transport (room/transport.js). ?wire=off falls back to PeerJS messages;
 // ?wire=slice uses one sliced channel; ?wire=stripeN spreads slices over N peer connections.
@@ -55,9 +59,7 @@ const roster = new Map();
 // --- GPU capability probe (runs at page load so the join screen can offer
 // contribution presets) ---
 async function probeGPU() {
-  const meta = { ua: navigator.userAgent.includes("iPhone") ? "iPhone" :
-                     navigator.userAgent.includes("Mac") ? "Mac" :
-                     navigator.userAgent.includes("Android") ? "Android" : "Device",
+  const meta = { ua: deviceKind({ ua: navigator.userAgent, touchPoints: navigator.maxTouchPoints || 0, mobile: !!navigator.userAgentData?.mobile }),
                  webgpu: false, gpu: "no WebGPU", maxBufGB: 0 };
   if (navigator.gpu) {
     try {
@@ -106,6 +108,8 @@ async function measureBudgetGB(adapter, capGB) {
   } catch { return 0; }
 }
 
+// the join screen says up front whether this browser can hold layers, and what to do if not
+preflight().then((v) => { if (!v.ok && !$("join-status").textContent) { $("join-status").textContent = v.line; $("join-status").classList.add("warn"); } });
 // probe once at load; fill the contribution selector
 const metaPromise = (async () => {
   const m = await probeGPU();
@@ -150,7 +154,21 @@ function peerCard(id, name, meta, self) {
 }
 
 let wasReady = false;
+// The model ladder: every model with what this room still needs for it, smallest first. Until
+// someone picks a model by hand, the select follows the largest model the room can run.
+let modelTouched = false;
+const shortName = (key) => (MODELS[key]?.label || key).split("\u00b7")[0].replace(/^Qwen\s*[\d.]+\s+/, "").trim();
+function renderLadder(pledged) {
+  const el = $("ai-ladder"); if (!el) return;
+  el.innerHTML = ladder(NEED_GB, pledged).map((x) => `<button type="button" class="rung${x.ok ? " ok" : ""}${x.key === $("ai-model").value ? " sel" : ""}" data-k="${x.key}" title="needs ~${x.need} GB">${esc(shortName(x.key))} <b>${x.ok ? "\u2713" : "+" + x.short + " GB"}</b></button>`).join("");
+}
+$("ai-ladder").addEventListener("click", (e) => {
+  const b = e.target.closest(".rung"); if (!b || $("ai-model").disabled) return;
+  $("ai-model").value = b.dataset.k; modelTouched = true; updateCluster();
+});
 function updateNeed(pledged) {
+  if (!modelTouched && !ai.engine && !ai.busy && !$("ai-model").disabled) $("ai-model").value = bestFit(NEED_GB, pledged);
+  renderLadder(pledged);
   const need = NEED_GB[$("ai-model").value] || 1;
   const ok = pledged >= need;
   $("need-fill").style.width = Math.min(100, pledged / need * 100).toFixed(1) + "%";
@@ -162,11 +180,12 @@ function updateNeed(pledged) {
   if (ok && !wasReady) { $("ai-start").classList.remove("unlocked"); void $("ai-start").offsetWidth; $("ai-start").classList.add("unlocked"); }
   wasReady = ok;
 }
-$("ai-model").addEventListener("change", () => updateCluster());
+$("ai-model").addEventListener("change", () => { modelTouched = true; updateCluster(); });
 function updateCluster() {
   const all = [myMeta, ...[...members.values()].map(m => m.meta)];
   const gpus = all.filter(m => m && m.webgpu).length;
-  const pledged = all.reduce((s, m) => s + (m?.contribGB || 0), 0);
+  // only devices with WebGPU hold layers; the others join as ask-only guests
+  const pledged = all.reduce((s, m) => s + (m?.webgpu ? m?.contribGB || 0 : 0), 0);
   updateNeed(pledged);
   const mem = all.reduce((s, m) => s + (m?.budgetGB || m?.maxBufGB || 0), 0);
   $("cluster-summary").textContent =
@@ -179,7 +198,7 @@ function enterRoom() {
   $("room-badge").style.display = "block";
   $("room-badge").textContent = roomCode;
   $("side-code").textContent = roomCode;
-  $("side-code").addEventListener("click", copyRoomLink);
+  $("side-code").addEventListener("click", openShare);
   if (isHost) $("host-controls").hidden = false;
   peerCard("self", myName, myMeta, true);
   updateCluster();
@@ -219,11 +238,13 @@ function wire(conn, name, meta, initiator = false) {
   conn.on("data", (d) => onData(conn.peer, d));
   conn.on("close", () => {
     const e = conns.get(conn.peer);
+    if (e && e.conn !== conn) return;   // an older link to the same device
     conns.delete(conn.peer);
     if (isHost) {   // on the host a closed link means the device left; workers wait for the roster
       dropCard(conn.peer); members.delete(conn.peer); roster.delete(conn.peer); broadcastRoster();
       log("swarm", `${e?.name || conn.peer} left`);
-    } else if (conn.peer === ai.hostId || entry.name === "host") log("swarm", "lost the link to the host");
+      aiPeerLeft(conn.peer, e?.name);
+    } else if (conn.peer === PREFIX + roomCode) { log("swarm", "lost the link to the host"); hostGone(); }
     updateCluster();
   });
   conn.on("error", () => {});
@@ -280,27 +301,34 @@ function onData(from, d) {
     return;
   }
   const e = conns.get(from);
-  if (d.t && d.t.startsWith("ai-")) { aiOnData(from, d); return; }
+  if (!d || typeof d.t !== "string") return;
+  if (d.t.startsWith("ai-")) { aiOnData(from, d); return; }
   switch (d.t) {
     case "hello":
+      // one protocol per room: a tab from an older or newer deploy is told to reload
+      if (d.v !== PROTOCOL) {
+        sendTo(from, { t: "bye", reason: `this room runs SwarmLLM protocol ${PROTOCOL} and your tab runs ${d.v ?? 1}: reload both pages so they match` });
+        log("swarm", `${d.name || from} runs a different SwarmLLM version (protocol ${d.v ?? 1}); asked it to reload`);
+        break;
+      }
       e.name = d.name; e.meta = d.meta;
       members.set(from, { name: d.name, meta: d.meta });
       ensureCard(from, d.name, d.meta);
       if (isHost) {
         roster.set(from, { name: d.name, meta: d.meta }); broadcastRoster();
         aiRejoin(from, d.name);
+        if (d.died) log("swarm", `${d.name} came back: its tab was killed ${d.died.ago} s ago while ${d.died.during}. Phones kill background tabs; keep the screen on.`);
         if (ai.visibility !== "all") sendTo(from, { t: "ai-visibility", mode: ai.visibility });
+        aiWelcome(from);
       }
       break;
-    case "ai-next": ai.next = d.next; ensureLink(d.next); break;
-    case "ai-reset": try { ai.engine?.reset?.(); } catch {} break;
-    case "ai-layers": ai.layersByName = d.by; loadCardRender(); break;
-    case "ai-start-req":
-      if (MODELS[d.model]) $("ai-model").value = d.model;   // every screen shows the model that was actually started
-      $("ai-start").disabled = true; $("ai-model").disabled = true;
-      if (d.boss !== peer.id) { aiLoading(true, `starting ${MODELS[d.model]?.label.split("\u00b7")[0].trim()}`); $("ldg-sub").textContent = `${d.by} pressed start`; $("ldg-fill").style.width = "0%"; }
-      if (d.boss === peer.id) { toast(`${d.by} started ${MODELS[d.model]?.label.split("\u00b7")[0].trim()}`); aiStart(d.model); }
-      else aiStatus(`${d.by} started the model\u2026`);
+    case "leaving":   // the tab is closing: treat the link as gone now instead of waiting for ICE to time out
+      conns.get(from)?.conn.close();
+      break;
+    case "bye":
+      toast(d.reason);
+      log("swarm", d.reason);
+      if (from === PREFIX + roomCode) { $("room-over").hidden = false; $("room-over-why").textContent = d.reason; }
       break;
     case "roster": {
       // the host's view of the room: draw a card per device, no mesh connections
@@ -357,7 +385,7 @@ function meshConnect(targetId) {
   const conn = peer.connect(targetId, { reliable: true });
   conn.on("open", () => {
     wire(conn, undefined, undefined, true);
-    conn.send({ t: "hello", name: myName, meta: myMeta });
+    conn.send({ t: "hello", name: myName, meta: myMeta, v: PROTOCOL });
   });
 }
 
@@ -376,6 +404,9 @@ async function bwTest(id) {
   }
   sendTo(id, { t: "bw-end" });
 }
+
+// a closing tab says so, so the others fail fast (the data channel close can take ~30 s to surface)
+window.addEventListener("pagehide", () => { try { broadcastAll({ t: "leaving" }); } catch {} });
 
 // --- ping loop ---
 setInterval(() => broadcastAll({ t: "ping", ts: performance.now() }), 2500);
@@ -428,7 +459,7 @@ async function start(create) {
       wire(conn, "host", undefined, true);
       let died = null;
       try { const c = JSON.parse(localStorage.getItem("swarm-crumb") || "null"); if (c && Date.now() - c.t < 10 * 60 * 1000) died = { during: c.s, ago: Math.round((Date.now() - c.t) / 1000) }; } catch {}
-      conn.send({ t: "hello", name: myName, meta: myMeta, died });
+      conn.send({ t: "hello", name: myName, meta: myMeta, died, v: PROTOCOL });
       enterRoom();
     });
   });
@@ -441,7 +472,7 @@ async function start(create) {
         return;
       }
       wire(conn);
-      conn.send({ t: "hello", name: myName, meta: myMeta });
+      conn.send({ t: "hello", name: myName, meta: myMeta, v: PROTOCOL });
     });
   });
 
@@ -486,16 +517,40 @@ $("create-btn").addEventListener("click", () => { keepAwake(); start(true); });
 // (auto-rejoin removed: the user prefers to see what happened)
 $("join-btn").addEventListener("click", () => { keepAwake(); start(false); });
 $("code-input").addEventListener("keydown", (e) => { if (e.key === "Enter") start(false); });
-// the room code badge copies a join link; a page opened with ?code=ABCD has the code filled in
+// Join links: swarmllm.ai/r/ABCD opens this page and joins the room with no typing. Served
+// elsewhere (a local static server, the emulator), the link keeps this page's path and query
+// (signal=, wire=) and adds ?code=.
+function roomLink() {
+  if (location.pathname === "/room" || location.pathname.startsWith("/r/")) return `${location.origin}/r/${roomCode}`;
+  const q = new URLSearchParams(location.search); q.set("code", roomCode);
+  return `${location.origin}${location.pathname}?${q}`;
+}
 function copyRoomLink() {
-  const url = `${location.origin}${location.pathname}?code=${roomCode}`;
+  const url = roomLink();
   if (!navigator.clipboard) { toast("room code: " + roomCode); return; }
   navigator.clipboard.writeText(url).then(() => toast("join link copied")).catch(() => { navigator.clipboard.writeText(roomCode); toast("room code copied"); });
 }
-$("room-badge").addEventListener("click", copyRoomLink);
-{
-  const code = (new URLSearchParams(location.search).get("code") || "").trim().toUpperCase();
-  if (code) $("code-input").value = code;
+function openShare() {
+  const url = roomLink();
+  $("share-qr").innerHTML = qrSVG(url, { size: 220 });
+  $("share-url").textContent = url;
+  $("share-code").textContent = roomCode;
+  $("share-native").hidden = !navigator.share;
+  $("share").hidden = false;
+}
+$("room-badge").addEventListener("click", openShare);
+$("share-btn").addEventListener("click", openShare);
+$("share-close").addEventListener("click", () => { $("share").hidden = true; });
+$("share").addEventListener("click", (e) => { if (e.target === $("share")) $("share").hidden = true; });
+$("share-copy").addEventListener("click", copyRoomLink);
+$("share-native").addEventListener("click", () => navigator.share?.({ title: "Join my SwarmLLM room", text: `Room ${roomCode}: lend this device's GPU to a model we run together`, url: roomLink() }).catch(() => {}));
+$("room-over-new").addEventListener("click", () => { location.href = location.pathname.startsWith("/r/") ? "/room" : location.pathname.replace(/\?.*$/, ""); });
+// a link with a room code fills it in and joins once the GPU probe is done
+const linkCode = codeFromLocation(location.pathname, location.search, location.hash);
+if (linkCode) {
+  $("code-input").value = linkCode;
+  $("join-status").textContent = `joining room ${linkCode}\u2026`;
+  metaPromise.then(() => { if (!peer) start(false); });
 }
 
 // ================= distributed inference =================
@@ -574,13 +629,23 @@ const rangeBytesOf = (url) => async (info) => {
 let ai = {
   visibility: "all",   // who sees the chat: all | host | asker (room/visibility.js)
   engine: null, tok: null, cfg: null, device: null,
-  role: null,            // "host" | "worker"
+  role: null,            // "host" | "worker" | "guest"
   chain: [],             // host: worker peer ids in pipeline order
   next: null,            // worker: peer id to forward hidden to, or "host"
   readyPeers: new Set(),
   pos: 0,
-  waiters: new Map(),    // pos -> resolve(hiddenF32) for host awaiting return
+  waiters: new Map(),    // host: lap key (pos, or "b" + basePos) -> { res, rej } for a frame on its way round the chain
   busy: false,
+  abort: false,          // host: Stop was pressed; the decode loop ends after the lap in flight
+  degraded: false,       // host: a device in the chain left; generation needs a re-deal first
+  askerId: null,         // host: who asked the question being answered
+  conv: { turns: [] },   // host: the conversation (room/conversation.js)
+  fed: [],               // host: the exact tokens every device's caches hold, in order; null = unknown, reset first
+  pendingCtl: {},        // host: control for the chain that rides on the next frame ({ reset } or { rb })
+  settings: { persona: "default", sampling: "creative", thinking: false },
+  transcript: [],        // host: [{ name, text, reply, stats }] for devices that join later
+  teleBy: new Map(),     // host: worker id -> compute ms per frame kind, from ai-tele
+  q: Promise.resolve(),  // worker: frames run strictly one after another, in arrival order
 };
 
 function aiStatus(s) { $("ai-status").textContent = s; crumb(s); }
@@ -593,7 +658,7 @@ function aiLoading(show, title) {
   $("ai-panel").classList.toggle("loading", !!show);
   $("load-card").classList.toggle("on", !!show);
   $("ai-empty").style.display = show ? "none" : "";
-  if (show) { $("lc-model").textContent = MODELS[$("ai-model").value]?.label.split("\u00b7")[0].trim() || ""; loadCardRender(); }
+  if (show) { $("lc-model").textContent = MODELS[$("ai-model").value]?.label.split("·")[0].trim() || ""; loadCardRender(); }
 }
 function loadCardRender() {
   const rows = $("lc-rows"); if (!rows) return;
@@ -602,7 +667,7 @@ function loadCardRender() {
   rows.innerHTML = names.map((nm) => {
     const pct = Math.max(0, Math.min(100, (ai.prog || {})[nm] ?? 0));
     const l = layersOf(nm);
-    return `<div class="lc-row${pct >= 100 ? " done" : ""}"><div class="n">${nm}${l ? `<small>layers ${l}</small>` : ""}</div><div class="bar"><div class="fill" style="width:${pct}%"></div></div><div class="pct">${pct >= 100 ? "ready" : pct + "%"}</div></div>`;
+    return `<div class="lc-row${pct >= 100 ? " done" : ""}"><div class="n">${esc(String(nm))}${l ? `<small>layers ${l}</small>` : ""}</div><div class="bar"><div class="fill" style="width:${pct}%"></div></div><div class="pct">${pct >= 100 ? "ready" : pct + "%"}</div></div>`;
   }).join("");
 }
 function aiProgress(done, total, note) {
@@ -611,34 +676,92 @@ function aiProgress(done, total, note) {
   $("ldg-sub").textContent = `${(done / 2 ** 20).toFixed(0)} MB of ${(total / 2 ** 20).toFixed(0)} MB · ${pct}%` + (note ? " · " + note : "");
 }
 function aiOut() { const o = $("ai-output"); o.style.display = "block"; $("ai-empty").style.display = "none"; return o; }
+
+// ---- chat transcript ----
+// A bot message keeps its answer as pieces ({ t: text, d: 1 when the token was an accepted
+// speculative draft }) so "show drafts" can re-render it with the drafted tokens marked.
 let botEl = null;
+let draftView = false;
+function scrollChat() { const o = $("ai-output"); o.scrollTop = o.scrollHeight; }
 function chatUser(name, text) {
   const o = aiOut();
   const m = document.createElement("div");
   m.className = "m user";
-  m.innerHTML = `<div class="who">${esc(name)}</div><div class="bubble">${esc(text)}</div>`;
-  o.appendChild(m); o.scrollTop = o.scrollHeight;
+  m.innerHTML = `<div class="who">${esc(name)}</div><div class="bubble">${esc(text).replace(/\n/g, "<br>")}</div>`;
+  m.dataset.name = name; m.dataset.text = text;
+  o.appendChild(m); scrollChat();
 }
 function chatBotStart() {
   const o = aiOut();
   const m = document.createElement("div");
   m.className = "m bot";
   m.innerHTML = `<div class="who">swarm</div><div class="bubble"><span class="cursor"></span></div>`;
-  o.appendChild(m); o.scrollTop = o.scrollHeight;
+  m.pieces = [];
+  o.appendChild(m); scrollChat();
   botEl = m;
 }
-function chatBotUpdate(raw) {
-  if (!botEl) chatBotStart();
-  botEl.querySelector(".bubble").innerHTML = md(raw) + '<span class="cursor"></span>';
-  $("ai-output").scrollTop = $("ai-output").scrollHeight;
+function renderBot(m, live) {
+  const b = m.querySelector(".bubble");
+  if (draftView && m.pieces.length) {
+    b.classList.add("drafts");
+    b.innerHTML = m.pieces.map((p) => p.d ? `<span class="dr">${esc(p.t)}</span>` : esc(p.t)).join("") + (live ? '<span class="cursor"></span>' : "");
+  } else {
+    b.classList.remove("drafts");
+    b.innerHTML = mdChat(m.pieces.map((p) => p.t).join("")) + (live ? '<span class="cursor"></span>' : "");
+  }
 }
-function chatBotEnd(raw, stats) {
+function chatBotPiece(text, d) {
   if (!botEl) chatBotStart();
-  botEl.querySelector(".bubble").innerHTML = md(raw);
+  botEl.pieces.push({ t: text, d: d ? 1 : 0 });
+  renderBot(botEl, true);
+  scrollChat();
+}
+function chatBotEnd(note, stats) {
+  if (!botEl) chatBotStart();
+  if (note) botEl.pieces = [{ t: note, d: 0 }];
+  renderBot(botEl, false);
   if (stats) { const s = document.createElement("div"); s.className = "stats"; s.textContent = stats; botEl.appendChild(s); }
   botEl = null;
 }
+function setDraftView(on) {
+  draftView = on;
+  $("draft-view").classList.toggle("on", on);
+  $("draft-view").textContent = on ? "hide drafts" : "show drafts";
+  for (const m of document.querySelectorAll("#ai-output .m.bot")) if (m.pieces) renderBot(m, m === botEl);
+  if (on) toast("tinted words were guessed by the draft head and confirmed by the whole swarm in one lap");
+}
+function exportChat() {
+  const lines = [`# SwarmLLM room ${roomCode || ""}`, "", `_${new Date().toISOString().slice(0, 16).replace("T", " ")} · ${MODELS[ai.model || $("ai-model").value]?.label || ""}_`, ""];
+  for (const m of document.querySelectorAll("#ai-output .m")) {
+    if (m.classList.contains("user")) lines.push(`**${m.dataset.name || "?"}:** ${m.dataset.text || ""}`, "");
+    else if (m.pieces) {
+      lines.push(m.pieces.map((p) => p.t).join(""), "");
+      const st = m.querySelector(".stats")?.textContent;
+      if (st) lines.push(`<sub>${st}</sub>`, "");
+    }
+  }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/markdown" }));
+  a.download = `swarm-chat-${roomCode || "room"}.md`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
 
+// Send turns into Stop while an answer streams: always on the host, on the asker's screen for
+// guests (the host honours ai-stop from the asker only).
+function setBusyUI(busy, canStop) {
+  const b = $("ai-send");
+  b.classList.toggle("stop", !!(busy && canStop));
+  b.textContent = busy && canStop ? "Stop" : "Send";
+  b.disabled = !!(busy && !canStop);
+  $("ai-row").classList.toggle("busy", !!busy);
+}
+function setCtx(used, max) {
+  const el = $("ctx-meter"); if (!el) return;
+  if (!used) { el.textContent = ""; return; }
+  el.textContent = `context ${used} / ${max}`;
+  el.classList.toggle("warn", used > max * 0.8);
+}
 
 async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
   const M = MODELS[modelKey];
@@ -779,7 +902,7 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
 
 // ---- host ----
 function biggestPeerId() {
-  const gb = (m) => m?.contribGB ?? 0;
+  const gb = (m) => (m?.webgpu ? m?.contribGB ?? 0 : 0);
   let best = peer.id, bestGB = gb(myMeta);
   for (const [id, e] of conns) if (gb(e.meta) > bestGB || (gb(e.meta) === bestGB && id < best)) { best = id; bestGB = gb(e.meta); }
   return best;
@@ -789,10 +912,10 @@ function aiStartAnywhere() {
   const boss = biggestPeerId();
   if (boss === peer.id) { aiStart(model); return; }
   $("ai-start").disabled = true; $("ai-model").disabled = true;
-  aiLoading(true, `starting ${MODELS[model].label.split("\u00b7")[0].trim()}`);
+  aiLoading(true, `starting ${MODELS[model].label.split("·")[0].trim()}`);
   $("ldg-sub").textContent = `${conns.get(boss)?.name || "the biggest device"} is dealing the layers`;
   $("ldg-fill").style.width = "0%";
-  aiStatus(`asked ${conns.get(boss)?.name || "the biggest device"} to start ${MODELS[model].label.split("\u00b7")[0].trim()}\u2026`);
+  aiStatus(`asked ${conns.get(boss)?.name || "the biggest device"} to start ${MODELS[model].label.split("·")[0].trim()}…`);
   broadcastAll({ t: "ai-start-req", model, boss, by: myName });
 }
 async function aiStart(modelArg) {
@@ -803,15 +926,19 @@ async function aiStart(modelArg) {
   $("ai-model").disabled = true;
   try {
     ai.role = "host";
+    ai.degraded = false;
+    ai.readyPeers = new Set();
+    ai.teleBy = new Map();
     const modelKey = $("ai-model").value;
     const M = MODELS[modelKey];
-    ai.chain = [...conns.keys()].sort();
+    // devices without WebGPU join as ask-only guests: they get the chat, not layers
+    ai.chain = [...conns.keys()].filter((id) => conns.get(id)?.meta?.webgpu).sort();
     ai.plan = new Map();                      // name -> load message, so a reloaded device can be re-seated
     ai.chainNames = ai.chain.map((id) => conns.get(id)?.name || id);
     const n = ai.chain.length + 1;
     let L, layerBytes, embedBytes, cfg = null;
     if (M.kind === "qwen35") {
-      aiStatus("reading model index\u2026 (11 MB)");
+      aiStatus("reading model index… (11 MB)");
       ai.G = await fetchGGUFHeader(M.gguf);
       ai.GModel = modelKey;
       L = ai.G.meta["qwen35.block_count"] - (ai.G.meta["qwen35.nextn_predict_layers"] || 0);
@@ -824,7 +951,7 @@ async function aiStart(modelArg) {
 
     // real per-shard byte costs (gguf: from the file's own index)
     if (M.kind === "gguf") {
-      aiStatus("reading model index\u2026");
+      aiStatus("reading model index…");
       ai.G = await fetchGGUFHeader(M.gguf, false);
       ai.GModel = modelKey;
       layerBytes = Object.values(ggmlLayerNames(0))
@@ -837,25 +964,14 @@ async function aiStart(modelArg) {
       embedBytes = cfg.vocab_size * d * 4;
     }
     const pledgeOf = (m) => ((m?.contribGB ?? (m?.maxBufGB ? m.maxBufGB * 0.5 : 0.5))) * 2 ** 30;
-    const parts = [
-      { cap: Math.max(pledgeOf(myMeta) - embedBytes, layerBytes / 2) },
-      ...ai.chain.map((id) => ({ cap: Math.max(pledgeOf(conns.get(id)?.meta), layerBytes / 2) })),
-    ];
-    const totalCap = parts.reduce((s, p) => s + p.cap, 0);
-    const assigned = parts.map((p) => Math.floor(L * p.cap / totalCap));
-    const fracs = parts.map((p, i) => ({ i, f: L * p.cap / totalCap - assigned[i] })).sort((a, b) => b.f - a.f);
-    let rem = L - assigned.reduce((a, b) => a + b, 0);
-    for (let k = 0; k < rem; k++) assigned[fracs[k % fracs.length].i]++;
-    for (let i = 1; i < assigned.length; i++)
-      if (assigned[i] === 0) { const j = assigned.indexOf(Math.max(...assigned)); assigned[j]--; assigned[i]++; }
-    const ranges = [];
-    let acc = 0;
-    for (const a of assigned) { ranges.push([acc, acc + a]); acc += a; }
+    const caps = [Math.max(pledgeOf(myMeta) - embedBytes, layerBytes / 2),
+      ...ai.chain.map((id) => Math.max(pledgeOf(conns.get(id)?.meta), layerBytes / 2))];
+    const { assigned, ranges } = planSplit(L, caps);
 
     const needGB = (L * layerBytes + embedBytes) / 2 ** 30;
-    const haveGB = parts.reduce((s, p) => s + p.cap, embedBytes) / 2 ** 30;
+    const haveGB = caps.reduce((s, c) => s + c, embedBytes) / 2 ** 30;
     if (needGB > haveGB * 1.15)
-      log("swarm", `\u26a0 this model needs ~${needGB.toFixed(1)} GB but the room pledged ~${haveGB.toFixed(1)} GB \u2014 it may not fit`);
+      log("swarm", `⚠ this model needs ~${needGB.toFixed(1)} GB but the room pledged ~${haveGB.toFixed(1)} GB — it may not fit`);
 
     ai.deferred = [];
     ai.chain.forEach((id, i) => {
@@ -864,20 +980,20 @@ async function aiStart(modelArg) {
         next: i + 1 < ai.chain.length ? ai.chain[i + 1] : "host",
         host: peer.id,
       };
-      const small = false;   // everyone downloads at once (phones used to wait; the wait itself was the problem)
-      ai.plan.set(conns.get(id)?.name || id, { msg, small });
-      if (small) { ai.deferred.push({ id, msg }); sendTo(id, { t: "ai-wait" }); }
-      else sendTo(id, msg);
+      ai.plan.set(conns.get(id)?.name || id, { msg, small: false });
+      sendTo(id, msg);
     });
-    ai.layersByName = Object.fromEntries([[myName, `${ranges[0][0]}\u2013${ranges[0][1] - 1}`], ...ai.chain.map((id, i) => [conns.get(id)?.name || id, `${ranges[i + 1][0]}\u2013${ranges[i + 1][1] - 1}`])]);
+    ai.layersByName = Object.fromEntries([[myName, `${ranges[0][0]}–${ranges[0][1] - 1}`], ...ai.chain.map((id, i) => [conns.get(id)?.name || id, `${ranges[i + 1][0]}–${ranges[i + 1][1] - 1}`])]);
     broadcastAll({ t: "ai-layers", by: ai.layersByName });
     const splitDesc = [`you ${assigned[0]}+embed`, ...ai.chain.map((id, i) =>
-      `${conns.get(id)?.name || id} ${assigned[i + 1]}`)].join(" \u00b7 ");
-    log("swarm", `${M.label} \u2014 layer split by pledge: ${splitDesc}`);
+      `${conns.get(id)?.name || id} ${assigned[i + 1]}`)].join(" · ");
+    log("swarm", `${M.label} — layer split by pledge: ${splitDesc}`);
     await aiLoadShard(modelKey, ranges[0], true, true);
     aiStatus(n === 1
-      ? `solo: all ${L} layers local \u2014 ready`
-      : `layers ${ranges[0][0]}\u2013${ranges[0][1] - 1} ready \u00b7 syncing with ${ai.chain.length} device${ai.chain.length > 1 ? "s" : ""}\u2026`);
+      ? `solo: all ${L} layers local — ready`
+      : `layers ${ranges[0][0]}–${ranges[0][1] - 1} ready · syncing with ${ai.chain.length} device${ai.chain.length > 1 ? "s" : ""}…`);
+    ai.fed = [];                              // fresh engines everywhere: nothing cached yet
+    ai.pendingCtl = {};
     aiMaybeReady();
   } catch (err) {
     clearInterval(ai.progTimer);
@@ -891,6 +1007,60 @@ async function aiStart(modelArg) {
   }
 }
 
+// Deal the layers again over whoever is in the room now: after a device left (the room is
+// degraded) or to bring in devices that joined after the start. Cached ranges reload in seconds;
+// the conversation is kept and re-prefilled on the next question.
+async function aiRedeal() {
+  if (ai.role !== "host" || ai.busy === "gen") return;
+  const model = ai.model || $("ai-model").value;
+  failWaiters(new Error("re-dealing the layers"));
+  ai.engine = null; ai.busy = false; ai.fed = null;
+  $("ai-panel").classList.remove("online");
+  $("ai-row").style.display = "none";
+  showRedeal(false);
+  broadcastAll({ t: "ai-redeal", by: myName, model });
+  aiLoading(true, "re-dealing the layers");
+  await aiStart(model);
+}
+function showRedeal(on, why) {
+  const b = $("ai-redeal");
+  b.hidden = !on || ai.role !== "host";
+  if (why) $("redeal-why").textContent = why;
+  $("redeal-why").hidden = b.hidden;
+}
+// devices with a GPU that are in the room but hold no layers (joined after the start)
+function sparePeers() { return [...conns.keys()].filter((id) => conns.get(id)?.meta?.webgpu && !ai.chain.includes(id)); }
+function offerRedealForNewcomers() {
+  if (ai.role !== "host" || !ai.engine || ai.degraded) return;
+  const spare = sparePeers();
+  if (spare.length) showRedeal(true, `${spare.map((id) => conns.get(id)?.name || id).join(", ")} joined after the start; re-deal to give ${spare.length > 1 ? "them" : "it"} layers`);
+}
+
+// a device in the chain left: every lap in flight fails now instead of timing out, and the room
+// waits for a re-deal
+function aiPeerLeft(id, name) {
+  if (ai.role !== "host") return;
+  if (!ai.chain.includes(id)) { offerRedealForNewcomers(); if (!sparePeers().length && !ai.degraded) showRedeal(false); return; }
+  const layers = ai.layersByName?.[name];
+  const why = `${name || "a device"} left${layers ? ` (layers ${layers})` : ""}`;
+  ai.degraded = true;
+  ai.readyPeers.delete(id);
+  ai.fed = null;
+  failWaiters(new Error(why));
+  $("ai-row").style.display = ai.engine ? "flex" : "none";
+  aiStatus(`${why} — re-deal the layers to keep going`);
+  showRedeal(true, `${why}. Re-deal to split the model over the devices still here; cached layers reload in seconds.`);
+  broadcastAll({ t: "ai-degraded", why });
+}
+
+// a newcomer while the room is online gets the chat as a guest, and the conversation so far
+function aiWelcome(id) {
+  if (ai.role !== "host" || !ai.engine || ai.readyPeers.size < ai.chain.length || ai.chain.includes(id)) return;
+  sendTo(id, { t: "ai-ready-all", model: ai.model });
+  if (ai.visibility === "all" && ai.transcript.length) sendTo(id, { t: "ai-history", items: ai.transcript.slice(-20) });
+  offerRedealForNewcomers();
+}
+
 // a device whose tab got reloaded comes back with a new peer id: put it back in its slot
 function aiRejoin(newId, name) {
   if (ai.role !== "host" || !ai.plan?.has(name)) return;
@@ -899,67 +1069,231 @@ function aiRejoin(newId, name) {
   const oldId = ai.chain[i];
   ai.chain[i] = newId;
   ai.readyPeers.delete(oldId);
-  const { msg, small } = ai.plan.get(name);
+  const { msg } = ai.plan.get(name);
   const fresh = { ...msg, next: i + 1 < ai.chain.length ? ai.chain[i + 1] : "host", host: peer.id };
   if (i > 0) sendTo(ai.chain[i - 1], { t: "ai-next", next: newId });
-  const dIdx = ai.deferred?.findIndex((d) => d.id === oldId) ?? -1;
-  if (dIdx >= 0) { ai.deferred[dIdx] = { id: newId, msg: fresh }; sendTo(newId, { t: "ai-wait" }); }
-  else sendTo(newId, fresh);
+  sendTo(newId, fresh);
+  ai.fed = null;                            // its fresh engine holds nothing: re-prefill next time
   log("swarm", `${name} came back — reloading its layers`);
   aiStatus(`${name} reconnected, reloading its layers…`);
   $("ai-row").style.display = ai.readyPeers.size >= ai.chain.length ? "flex" : "none";
 }
 function aiMaybeReady() {
   if (ai.role !== "host" || !ai.engine) return;
-  if (ai.deferred?.length && ai.readyPeers.size >= ai.chain.length - ai.deferred.length) {
-    // host and the big devices are done: now the small ones fetch their few layers
-    const d = ai.deferred; ai.deferred = [];
-    aiStatus(`big devices ready — loading ${d.length} small device(s) now…`);
-    for (const { id, msg } of d) sendTo(id, msg);
-    return;
-  }
   if (ai.readyPeers.size < ai.chain.length) return;
   const n = ai.chain.length + 1;
+  ai.degraded = false;
+  ai.busy = false;
+  showRedeal(false);
   aiStatus(`cluster online — ${n} device${n > 1 ? "s" : ""}, ${ai.cfg.num_hidden_layers} layers split ${n} ways`);
   clearInterval(ai.progTimer);
   $("ai-panel").classList.add("online");
   $("ai-row").style.display = "flex";
+  $("chat-tools").hidden = false;
+  $("new-chat").hidden = false;
   $("ai-empty").textContent = "cluster online. ask anything.";
   $("ai-prompt").focus();
-  broadcastAll({ t: "ai-ready-all" });
+  broadcastAll({ t: "ai-ready-all", model: ai.model });
+  pushMap(0, null, false, true);
+  offerRedealForNewcomers();
   mascot("Cluster online! Ask anything. Everyone in the room can.");
 }
 
-// run one token through the whole pipeline, returns logits
-async function aiPipeToken(id, needLogits = true) {
+// ---- laps ----
+// A lap is one frame's trip round the chain. Its waiter resolves with the returned hidden
+// state(s), or rejects on timeout or as soon as a device in the chain leaves.
+function lapWait(key, ms, what) {
+  return new Promise((res, rej) => {
+    const timer = setTimeout(() => { ai.waiters.delete(key); rej(new Error(`pipeline timeout (${what})`)); }, ms);
+    ai.waiters.set(key, {
+      res: (h) => { clearTimeout(timer); res(h); },
+      rej: (e) => { clearTimeout(timer); rej(e); },
+    });
+  });
+}
+function failWaiters(err) { for (const [k, w] of ai.waiters) { ai.waiters.delete(k); w.rej(err); } }
+function lapDone(key, h) { const w = ai.waiters.get(key); if (w) { ai.waiters.delete(key); w.res(h); } }
+// send a frame to the first device of the chain; a pending reset or rollback rides with it,
+// so it reaches every device strictly before the frame it applies to
+function sendChain(msg) {
+  const ctl = ai.pendingCtl; ai.pendingCtl = {};
+  sendHidden(ai.chain[0], { ...msg, ...ctl });
+}
+// forget the conversation state on every device: here now, on the chain with the next frame
+function resetState() {
+  try { ai.engine.reset?.(); } catch {}
+  ai.pos = 0;
+  ai.fed = [];
+  ai.pendingCtl = ai.chain.length ? { reset: 1 } : {};
+}
+
+// Speculative drafting reads the draft block's own KV cache, which prefill fills with the trunk's
+// final hidden state at every prompt position. Solo prefill does it inside the engine; in a room
+// the returned hidden states come back from the chain, so the host fills it as they arrive
+// (roadmap 25: +18–45% tokens per lap after a prompt). Drafts only change speed, never output.
+// ?fill=0 turns it off for A/B runs.
+const FILL_DRAFTS = new URLSearchParams(location.search).get("fill") !== "0";
+function fillDrafts(h, ids, i0, basePos, n) {
+  if (!FILL_DRAFTS || !ai.engine?.mtp) return;
+  const dim = ai.engine.dims.dim;
+  for (let c = 0; c < n; c++) {
+    const next = ids[i0 + c + 1];
+    if (next === undefined) break;
+    ai.engine.setHidden(h.subarray(c * dim, (c + 1) * dim));
+    ai.engine.mtpRun(null, next, basePos + c + 1, false);   // no readback: queued, returns at once
+  }
+}
+
+// run one token through the whole pipeline, returns logits (or null for a prompt token).
+// fillNext: the prompt token after this one, to fill the draft cache with this position's hidden.
+async function aiPipeToken(id, needLogits = true, fillNext) {
   const pos = ai.pos;
   if (!ai.chain.length && !needLogits) {
     // solo prefill: layers only, no head, no readback; sync every 8 tokens
     ai.engine.pos = pos;
     await ai.engine.prefillToken(id);
     if (pos % 8 === 7) await ai.device.queue.onSubmittedWorkDone();
-    ai.pos++;
+    ai.pos++; ai.fed?.push(id);
     return null;
   }
+  const tHost = performance.now();
   let h = await ai.engine.embedRun(id, pos);
   if (badF32(h)) throw new Error(`NaN after HOST layers (pos ${pos}) — host GPU kernel issue`);
   if (ai.chain.length) {
-    const returned = new Promise((res, rej) => {
-      ai.waiters.set(pos, res);
-      setTimeout(() => { ai.waiters.delete(pos); rej(new Error("pipeline timeout (peer gone?)")); }, 30000);
-    });
-    sendHidden(ai.chain[0], { t: "ai-hidden", pos, ...packWire(h) });
+    const hostMs = performance.now() - tHost;
+    const returned = lapWait(pos, 30000, "token");
+    sendChain({ t: "ai-hidden", pos, ...packWire(h) });
     h = await returned;
     if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos}) — check peer status lines`);
+    noteLap(performance.now() - tHost, hostMs);
     ai.lastHidden = h;
+    if (!needLogits && fillNext !== undefined) fillDrafts(h, [id, fillNext], 0, pos, 1);
   } // solo mode: engine holds every layer, embedRun already produced the final hidden
-  if (!needLogits) { ai.pos++; return null; }   // prefill: skip the head entirely
+  ai.pos++; ai.fed?.push(id);
+  if (!needLogits) return null;   // prefill: skip the head entirely
   const logits = await ai.engine.headFromHidden(h);
   if (badF32(logits)) throw new Error(`NaN in logits (pos ${ai.pos}) — head/lm_head kernel issue on host`);
-  ai.pos++;
   return logits;
 }
 
+// Prefill `ids` (the part of the conversation the caches do not hold yet) from ai.pos; returns
+// the logits after the last one.
+const PREFILL_WINDOW = 6;   // prefill rounds in flight round the chain at once
+async function aiPrefill(ids) {
+  if (!ai.chain.length && ai.engine.prefillTokens && ids.length > 1) {
+    // solo: batched prefill, several prompt tokens per GPU pass
+    ai.engine.pos = ai.pos;
+    await ai.engine.prefillTokens(ids.slice(0, -1));
+    ai.pos = ai.engine.pos;
+    ai.fed.push(...ids.slice(0, -1));
+    return aiPipeToken(ids[ids.length - 1]);
+  }
+  let i = 0;
+  if (ai.engine.embedRunBatch && ids.length > 5) {
+    // split: up to 16 prompt tokens per round, and several rounds in flight at once. Every device
+    // runs frames in send order, so round r+1 can enter the host's layers while round r is on a
+    // worker: the chain works like a pipeline instead of one device at a time.
+    const hdim = ai.engine.dims.dim;
+    const NC = ai.engine.NC || 4;   // columns per GPU pass
+    // step down 16 -> 8 -> 4 on the tail: without this a remainder of up to NC-1 tokens costs one
+    // network lap each
+    const widths = [NC, ...[8, 4].filter((w) => w < NC)];
+    const inflight = [];
+    try {
+      outer: for (const W of widths) while (ids.length - 1 - i >= W) {
+        if (ai.abort) break outer;
+        const nChunks = Math.max(1, Math.min(Math.floor(16 / W), Math.floor((ids.length - 1 - i) / W)));
+        const n = nChunks * W, basePos = ai.pos, i0 = i;
+        const hb = new Float32Array(n * hdim);
+        for (let c = 0; c < nChunks; c++)
+          hb.set(await ai.engine.embedRunBatch(ids.slice(i + c * W, i + (c + 1) * W), basePos + c * W), c * W * hdim);
+        if (badF32(hb)) throw new Error(`NaN in batched prefill (pos ${basePos})`);
+        if (ai.chain.length) {
+          while (inflight.length >= PREFILL_WINDOW) await inflight.shift();
+          const p = lapWait("b" + basePos, 90000, "batch prefill").then((h) => fillDrafts(h, ids, i0, basePos, n));
+          p.catch(() => {});
+          inflight.push(p);
+          sendChain({ t: "ai-hidden-b", basePos, n, ...packWire(hb) });
+        }
+        ai.pos = basePos + n;
+        ai.fed.push(...ids.slice(i0, i0 + n));
+        i += n;
+        aiStatus(`prefill: ${i}/${ids.length} tokens…`);
+      }
+      for (const p of inflight) await p;
+    } catch (err) { failWaiters(err); throw err; }
+  }
+  if (ai.abort) return null;
+  let logits = null;
+  for (; i < ids.length; i++) {
+    if (ai.abort) return null;
+    logits = await aiPipeToken(ids[i], i === ids.length - 1, ids[i + 1]);
+  }
+  return logits;
+}
+
+// ---- telemetry and the swarm map ----
+// Workers report their compute per frame kind (ai-tele); the host times each lap, so what is left
+// is the wire. The map shows the chain, what each device holds and how long its part takes.
+function noteLap(lapMs, hostMs) {
+  const L = ai.lapStat ||= { lap: 0, host: 0, n: 0 };
+  L.lap = L.n ? 0.7 * L.lap + 0.3 * lapMs : lapMs;
+  L.host = L.n ? 0.7 * L.host + 0.3 * hostMs : hostMs;
+  L.n++;
+}
+function mapNodes(kind = "spec") {
+  const nodes = [{ name: myName, layers: ai.layersByName?.[myName] || "", ms: ai.lapStat?.host, host: 1 }];
+  for (const id of ai.chain) {
+    const t = ai.teleBy.get(id) || {};
+    const name = conns.get(id)?.name || id;
+    nodes.push({ name, layers: ai.layersByName?.[name] || "", ms: t[kind] ?? t.spec ?? t.one });
+  }
+  return nodes;
+}
+function mapStats(tps, acc) {
+  const lap = ai.lapStat?.lap;
+  if (!ai.chain.length || !lap) return { tps, acc };
+  const gpu = mapNodes().reduce((s, x) => s + (x.ms || 0), 0);
+  return { tps, acc, lap: Math.round(lap), gpu: Math.round(gpu), net: Math.max(0, Math.round(lap - gpu)) };
+}
+function renderMap(nodes, st, live) {
+  const el = $("swarm-map"); if (!el || !nodes?.length) return;
+  el.hidden = false;
+  el.classList.toggle("live", !!live);
+  const lap = Math.max(120, Math.min(4000, st?.lap || 600));
+  el.style.setProperty("--lap", lap + "ms");
+  el.style.setProperty("--n", nodes.length);
+  el.querySelector(".sm-track").innerHTML = nodes.map((x, i) => `<div class="sm-node${x.host ? " host" : ""}" style="--i:${i}">
+      <div class="sm-dot"></div><div class="sm-name">${esc(String(x.name))}</div>
+      <div class="sm-sub">${x.host ? "embed · " : ""}${x.layers ? "L" + esc(String(x.layers)) : ""}${x.host ? " · head" : ""}</div>
+      <div class="sm-ms">${x.ms ? Math.round(x.ms) + " ms" : ""}</div></div>`).join('<div class="sm-link"><i></i></div>')
+    + (nodes.length > 1 ? '<div class="sm-link back"><i></i></div>' : "");
+  const bits = [];
+  if (st?.tps) bits.push(`${st.tps.toFixed(1)} tok/s`);
+  if (st?.lap) bits.push(`lap ${st.lap} ms = GPUs ${st.gpu} + wire ${st.net}`);
+  if (st?.acc != null) bits.push(`${Math.round(st.acc * 100)}% of drafts accepted`);
+  el.querySelector(".sm-meta").textContent = bits.join(" · ") || `${nodes.length} device${nodes.length > 1 ? "s" : ""} · every token takes a lap through all of them`;
+}
+let mapAt = 0;
+function pushMap(tps, acc, live, force) {
+  const now = performance.now();
+  if (!force && now - mapAt < 800) return;
+  mapAt = now;
+  const nodes = mapNodes(), st = mapStats(tps, acc);
+  renderMap(nodes, st, live);
+  broadcastAll({ t: "ai-map", nodes, st, live: live ? 1 : 0 });
+}
+// worker: EMA of compute ms per frame kind, reported to the host at most every 700 ms
+function teleNote(kind, ms) {
+  const T = ai.tele ||= { at: 0, k: {} };
+  const k = T.k[kind] ||= { ema: ms, n: 0 };
+  k.ema = k.n ? 0.7 * k.ema + 0.3 * ms : ms; k.n++;
+  const now = performance.now();
+  if (now - T.at > 700 && ai.hostId) {
+    T.at = now;
+    sendTo(ai.hostId, { t: "ai-tele", k: Object.fromEntries(Object.entries(T.k).map(([a, b]) => [a, Math.round(b.ema * 10) / 10])) });
+  }
+}
 
 // who sees the chat: the host's dropdown. The full message goes to the screens allowed to see
 // the text, the hidden stand-in (same type, `hidden: true`) to the others, so every screen still
@@ -967,92 +1301,68 @@ async function aiPipeToken(id, needLogits = true) {
 function sendChat(msg, askerId) {
   const { full, hidden } = chatRecipients(ai.visibility || "all", askerId, [...conns.keys()]);
   for (const id of full) sendTo(id, msg);
-  if (msg.t !== "ai-token") for (const id of hidden) sendTo(id, { t: msg.t, name: msg.name, stats: msg.stats, hidden: true });
+  if (msg.t !== "ai-token") for (const id of hidden) sendTo(id, { t: msg.t, name: msg.name, stats: msg.stats, asker: msg.asker, ctx: msg.ctx, hidden: true });
 }
+
 async function aiGenerate(textArg, who, askerId = peer.id) {
   const text = (textArg ?? $("ai-prompt").value).trim();
   const asker = who || myName;
   if (!text || ai.busy === "gen" || !ai.engine) return;
-  try { ai.engine.reset?.(); } catch {}
-  ai.pos = 0;
-  broadcastAll({ t: "ai-reset" });
+  if (ai.degraded) {
+    if (askerId === peer.id) toast("a device left: re-deal the layers first");
+    else sendTo(askerId, { t: "ai-busy", why: "a device left the room; the host has to re-deal the layers first" });
+    return;
+  }
   ai.busy = "gen";
-  $("ai-prompt").value = "";
-  $("ai-send").disabled = true;
-  const V = ai.tok.vocab;
-  const imStart = V["<|im_start|>"], imEnd = V["<|im_end|>"], eot = V["<|endoftext|>"];
-  const ids = [imStart, ...ai.tok.encode("user\n" + text), imEnd,
-    ...ai.tok.encode("\n"), imStart, ...ai.tok.encode("assistant\n")];
-  // qwen3 thinking models: pre-close the think block so answers come straight
-  if (V["<think>"] !== undefined && V["</think>"] !== undefined)
-    ids.push(V["<think>"], ...ai.tok.encode("\n\n"), V["</think>"], ...ai.tok.encode("\n\n"));
-  if (ids.some((t) => !Number.isInteger(t)))
-    throw new Error("tokenizer produced an invalid token id (special tokens missing) \u2014 " + JSON.stringify(ids.slice(0, 6)));
+  ai.abort = false;
+  ai.askerId = askerId;
+  if (askerId === peer.id) { $("ai-prompt").value = ""; growPrompt(); }
+  setBusyUI(true, true);
+  const S = specials(ai.tok);
+  const persona = PERSONAS[ai.settings.persona] || PERSONAS.default;
+  const thinking = !!ai.settings.thinking && S.think !== undefined;
+  const sample = pickSampler(ai.settings.sampling);
+  const eos = (t) => t === S.imEnd || t === S.eot;
 
   chatUser(asker, text);
   chatBotStart();
-  sendChat({ t: "ai-genstart", name: asker, text }, askerId);
+  sendChat({ t: "ai-genstart", name: asker, text, asker: askerId }, askerId);
   mascot("Thinking… every word is taking a lap through the room.");
-  aiStatus(`prefill: ${ids.length} tokens…`);
 
+  const answer = [];          // sampled ids of this answer, verbatim, for the next turn's history
+  let reply = "", count = 0, capped = false, dropped = 0, failed = null, stats = "";
+  const t0Gen = performance.now();
+  let tDecode = 0, tPre = 0, prefilled = 0, reused = 0;
   try {
-    // the prompt must fit the context with room for an answer; never silently truncate
-    if (ids.length > MAX_SEQ - MIN_ROOM)
-      throw new Error(`prompt is ${ids.length} tokens; this room's context is ${MAX_SEQ} tokens and an answer needs at least ${MIN_ROOM}. Shorten the prompt.`);
-    const maxNew = Math.min(MAX_NEW, MAX_SEQ - ids.length);   // answer cap for this prompt
-    let capped = false;   // set when generation stops because the context filled up
-    let logits = null;
-    const tPre = performance.now();
-    if (!ai.chain.length && ai.engine.prefillTokens && ids.length > 1) {
-      // solo: batched prefill, 4 prompt tokens per GPU pass
-      ai.engine.pos = ai.pos;
-      await ai.engine.prefillTokens(ids.slice(0, -1));
-      ai.pos = ai.engine.pos;
-      logits = await aiPipeToken(ids[ids.length - 1]);
-    } else if (ai.engine.embedRunBatch && ids.length > 5) {
-      // split: up to 16 prompt tokens per network round (4 GPU passes of 4)
-      let i = 0;
-      const hdim = ai.engine.dims.dim;
-      const NC = ai.engine.NC || 4;   // columns per GPU pass; up to 16 tokens per network round
-      // step down 16 -> 8 -> 4 on the tail: without this a remainder of up to
-      // NC-1 tokens costs one network lap each
-      const widths = [NC, ...[8, 4].filter((w) => w < NC)];
-      for (const W of widths) while (ids.length - 1 - i >= W) {
-        const nChunks = Math.max(1, Math.min(Math.floor(16 / W), Math.floor((ids.length - 1 - i) / W)));
-        const NCW = W;
-        const basePos = ai.pos;
-        const hb = new Float32Array(nChunks * NCW * hdim);
-        for (let c = 0; c < nChunks; c++)
-          hb.set(await ai.engine.embedRunBatch(ids.slice(i + c * NCW, i + (c + 1) * NCW), basePos + c * NCW), c * NCW * hdim);
-        if (badF32(hb)) throw new Error(`NaN in batched prefill (pos ${basePos})`);
-        if (ai.chain.length) {
-          const returned = new Promise((res, rej) => {
-            ai.waiters.set("b" + basePos, res);
-            setTimeout(() => { ai.waiters.delete("b" + basePos); rej(new Error("pipeline timeout (batch prefill)")); }, 90000);
-          });
-          sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos, n: nChunks * NCW, ...packWire(hb) });
-          await returned;
-        }
-        ai.pos = basePos + nChunks * NCW;
-        i += nChunks * NCW;
-        aiStatus(`prefill: ${i}/${ids.length} tokens\u2026`);
-      }
-      for (; i < ids.length; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);
-    } else {
-      for (let i = 0; i < ids.length; i++) logits = await aiPipeToken(ids[i], i === ids.length - 1);
-    }
+    // the conversation with this question, trimmed to fit, and how much the caches already hold
+    const fit = fitContext(ai.tok, { system: persona.system, turns: [...ai.conv.turns, { role: "user", text }], thinking }, MAX_SEQ, MIN_ROOM);
+    dropped = fit.dropped;
+    ai.conv.turns = fit.turns;
+    reused = reusablePrefix(ai.fed, fit.ids);
+    if (!reused) resetState();
+    const ids = fit.ids.slice(reused);
+    prefilled = ids.length;
+    const maxNew = Math.min(thinking ? MAX_NEW_THINKING : MAX_NEW, MAX_SEQ - fit.ids.length);
+    aiStatus(reused ? `prefill: ${ids.length} new tokens (${reused} already in the room's caches)…` : `prefill: ${ids.length} tokens…`);
+    const t0Pre = performance.now();
+    let logits = await aiPrefill(ids);
+    tPre = performance.now() - t0Pre;
+
     const t0 = performance.now();
-    let count = 0, reply = "";
-    const emit = (tok) => {
+    const emit = (tok, drafted) => {
       const piece = ai.tok.decode([tok]);
+      answer.push(tok);
       reply += piece;
       count++;
-      chatBotUpdate(reply);
-      sendChat({ t: "ai-token", text: piece }, askerId);
-      aiStatus(`generating… ${count} tok · ${(count / ((performance.now() - t0) / 1000)).toFixed(1)} tok/s`);
+      chatBotPiece(piece, drafted);
+      sendChat({ t: "ai-token", text: piece, d: drafted ? 1 : 0 }, askerId);
+      const tps = count / ((performance.now() - t0) / 1000);
+      aiStatus(`generating… ${count} tok · ${tps.toFixed(1)} tok/s`);
     };
-    if (ai.engine.mtp && ai.engine.specStep) {
-      // speculative decoding: the model's own draft head proposes up to 3 tokens,
+    let acc = null;
+    if (!logits) { /* stopped during prefill */ }
+    else if (ai.engine.mtp && ai.engine.specStep) {
+      // speculative decoding: the model's own draft head proposes up to K tokens,
       // one batched trunk pass verifies them (byte-identical to plain decoding)
       const spec = ai.chain.length ? {
         runTrunk: async (tokens, pos) => {
@@ -1064,22 +1374,19 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
             hb.set(await ai.engine.embedRunBatch(tokens.slice(c, c + m), pos + c, { base: c, total: n }), c * hdim);
           }
           if (badF32(hb)) throw new Error(`NaN after HOST layers (pos ${pos})`);
-          const returned = new Promise((res, rej) => {
-            ai.waiters.set("b" + pos, res);
-            setTimeout(() => { ai.waiters.delete("b" + pos); rej(new Error("pipeline timeout (verify)")); }, 90000);
-          });
-          sendHidden(ai.chain[0], { t: "ai-hidden-b", basePos: pos, n: tokens.length, spec: 1, ...packWire(hb) });
+          const hostMs = performance.now() - tLap;
+          const returned = lapWait("b" + pos, 90000, "verify");
+          sendChain({ t: "ai-hidden-b", basePos: pos, n: tokens.length, spec: 1, ...packWire(hb) });
           const h = await returned;
           if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${pos})`);
-          const dt = performance.now() - tLap;
-          ai.lapMs = ai.lapMs ? 0.7 * ai.lapMs + 0.3 * dt : dt;
+          noteLap(performance.now() - tLap, hostMs);
           return h;
         },
-        onReject: async (k) => { for (const id of ai.chain) sendTo(id, { t: "ai-rollback", k }); },
+        // the rollback rides on the next frame (sendChain), strictly before it on every device
+        onReject: async (k) => { ai.pendingCtl = { rb: k }; },
       } : {};
       if (ai.chain.length && ai.lastHidden) ai.engine.setHidden(ai.lastHidden);
       ai.engine.pos = ai.pos;
-      ai.lapMs = 0;
       // draft depth: pick by MEASURED tokens/sec per depth (K=3 warm-up, probe
       // 5 and 7 once, keep the best, re-probe now and then). Deep chains only
       // pay when the network round-trip dominates the lap; a lap-time
@@ -1096,12 +1403,13 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
         if (kc.step % 16 === 0) { const alt = kc.cand.filter((k) => k !== best); return alt[(kc.step / 16) % alt.length | 0]; }
         return best;
       };
+      const st0 = { ...ai.engine.mtp.stats };
       // the first answer token is sampled here; specStep treats it as already chosen for this
       // position and returns only the tokens after it, so it has to be emitted (or end the
       // answer) before the loop, or the reply starts one word late
-      let next = aiSample(logits), done = false;
-      if (next === imEnd || next === eot) done = true; else emit(next);
-      while (!done && count < maxNew) {
+      let next = sample(logits), done = false;
+      if (eos(next)) done = true; else emit(next, false);
+      while (!done && count < maxNew && !ai.abort) {
         // a speculative step touches positions pos .. pos+K (K drafts verified in one pass) and
         // drafts one more; shrink K near the end of the context and stop before it overflows
         let K = pickK();
@@ -1109,68 +1417,187 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
         if (roomLeft < 1) { capped = true; break; }
         K = Math.min(K, roomLeft, maxNew - count + 1);
         const tStep = performance.now();
-        const toks = await ai.engine.specStep(next, aiSample, K, spec);
+        const toks = await ai.engine.specStep(next, sample, K, spec);
+        // specStep wrote `next` and the accepted drafts; its last token is the next `next`
+        ai.fed.push(next, ...toks.slice(0, -1));
         const tps = toks.length / ((performance.now() - tStep) / 1000);
         kc.ema[K] = kc.n[K] ? 0.6 * kc.ema[K] + 0.4 * tps : tps;
         kc.n[K] = (kc.n[K] || 0) + 1; kc.used[K] = (kc.used[K] || 0) + toks.length;
-        for (const tk of toks) {
-          if (tk === imEnd || tk === eot) { done = true; break; }
-          if (count >= maxNew) { done = true; capped = maxNew < MAX_NEW; break; }
-          emit(tk);
+        for (let j = 0; j < toks.length; j++) {
+          const tk = toks[j];
+          if (eos(tk)) { done = true; break; }
+          if (count >= maxNew) { done = true; capped = true; break; }
+          emit(tk, j < toks.length - 1);   // all but the last were drafts the trunk accepted
         }
         next = toks[toks.length - 1];
+        const d = ai.engine.mtp.stats.drafts - st0.drafts;
+        acc = d ? (ai.engine.mtp.stats.accepted - st0.accepted) / d : null;
+        if (ai.chain.length) pushMap(count / ((performance.now() - t0) / 1000), acc, true);
       }
-      if (!done && count >= maxNew) capped = maxNew < MAX_NEW;
+      if (!done && count >= maxNew) capped = true;
       ai.pos = ai.engine.pos;
       const st = ai.engine.mtp.stats;
-      if (st.drafts) crumb(`spec: ${st.accepted}/${st.drafts} drafts accepted${ai.lapMs ? ` · lap ${Math.round(ai.lapMs)}ms` : ""}`
+      if (st.drafts) crumb(`spec: ${st.accepted}/${st.drafts} drafts accepted${ai.lapStat ? ` · lap ${Math.round(ai.lapStat.lap)}ms` : ""}`
         + (ai.chain.length ? ` · K tok/s ${kc.cand.map((k) => `${k}:${kc.ema[k] ? kc.ema[k].toFixed(1) : "-"}`).join(" ")} · tokens by K ${JSON.stringify(kc.used)}` : ""));
     } else {
-      for (let i = 0; i < maxNew; i++) {
-        const next = aiSample(logits);
-        if (next === imEnd || next === eot) { await aiPipeToken(next, false); break; }
-        emit(next);
+      // plain decoding. An end token is not piped through the chain: the next turn's template
+      // writes <|im_end|> itself, so both paths leave the caches holding exactly prompt + answer
+      for (let i = 0; i < maxNew && !ai.abort; i++) {
+        const next = sample(logits);
+        if (eos(next)) break;
+        emit(next, false);
         if (ai.pos >= MAX_SEQ - 1) { capped = true; break; }   // no position left for another token
         logits = await aiPipeToken(next);
+        if (ai.chain.length) pushMap(count / ((performance.now() - t0) / 1000), null, true);
       }
+      if (count >= maxNew) capped = true;
     }
-    const secs = (performance.now() - t0) / 1000;
-    const stats = `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices${capped ? ` · stopped: context full (${MAX_SEQ} tokens)` : ""}`;
-    chatBotEnd(reply, stats);
-    sendChat({ t: "ai-gendone", stats }, askerId);
-    mascot("Done. Anyone in the room can ask the next one.");
-    aiStatus(`ready — prefill ${((t0 - tPre) / 1000).toFixed(1)}s, ${stats}`);
+    tDecode = performance.now() - t0;
+    const secs = tDecode / 1000;
+    stats = `${count} tok · ${(count / Math.max(secs, 1e-3)).toFixed(1)} tok/s · ${ai.chain.length + 1} device${ai.chain.length ? "s" : ""}`
+      + (acc != null ? ` · ${Math.round(acc * 100)}% drafts accepted` : "")
+      + (ai.abort ? " · stopped" : "")
+      + (capped ? (ai.pos >= MAX_SEQ - 2 ? ` · stopped: context full (${MAX_SEQ} tokens)` : ` · stopped at ${count} tokens`) : "")
+      + (dropped ? ` · ${dropped} oldest exchange${dropped > 1 ? "s" : ""} forgotten to fit` : "");
+    if (ai.chain.length && count) pushMap(count / Math.max(secs, 1e-3), acc, false, true);
   } catch (err) {
+    failed = err;
+    ai.fed = null;            // the caches are in an unknown state: the next question starts clean
+    ai.pendingCtl = {};
+    stats = "failed: " + err.message;
     aiStatus("generation failed: " + err.message);
-    chatBotEnd("\u26a0 " + err.message, "");
-    sendChat({ t: "ai-gendone", stats: "failed: " + err.message }, askerId);   // unlock everyone's send box
   }
+  // the answer (even a partial one) joins the history, so the next turn reads what was said
+  if (ai.conv.turns[ai.conv.turns.length - 1]?.role === "user") ai.conv.turns.push({ role: "assistant", ids: answer });
+  const ctx = { used: ai.fed ? ai.pos : 0, max: MAX_SEQ };
+  if (failed) chatBotEnd(reply ? null : "⚠ " + failed.message, stats);
+  else chatBotEnd(null, stats);
+  sendChat({ t: "ai-gendone", stats, ctx, failed: failed ? 1 : 0 }, askerId);   // unlocks every send box
+  ai.transcript.push({ name: asker, text, reply, stats });
+  if (ai.transcript.length > 50) ai.transcript.shift();
+  setCtx(ctx.used, ctx.max);
+  if (!failed) aiStatus(`ready — prefill ${prefilled} tok in ${(tPre / 1000).toFixed(1)}s${reused ? ` (${reused} reused)` : ""}, ${stats}`);
+  mascot("Done. Anyone in the room can ask the next one.");
   ai.busy = false;
-  $("ai-send").disabled = false;
+  ai.abort = false;
+  setBusyUI(false);
+  if (ai.degraded) showRedeal(true);
+  void t0Gen;
 }
 
-// ---- worker + shared message handling ----
+// Start a new conversation: the next question prefills from scratch on every device.
+function aiNewChat() {
+  if (ai.role !== "host" || ai.busy === "gen") return;
+  ai.conv = { turns: [] };
+  ai.fed = null;
+  ai.transcript = [];
+  clearChat();
+  broadcastAll({ t: "ai-reset", by: myName });
+  setCtx(0);
+  toast("new chat: the swarm forgot the conversation");
+}
+function clearChat() {
+  $("ai-output").innerHTML = "";
+  botEl = null;
+  setCtx(0);
+}
+
+// ---- worker ----
+// Frames run strictly one after another in arrival order (the transport delivers them in send
+// order), so several prefill rounds can be queued here while the GPU works. Control that rides
+// on a frame (reset, rollback) applies before it, and goes on down the chain with it.
+async function workerFrame(d) {
+  if (!ai.engine) return;
+  const ctl = {};
+  if (d.reset) { ai.engine.reset?.(); ctl.reset = 1; }
+  else if (d.rb != null) { ai.engine.restoreDN?.(d.rb); ctl.rb = d.rb; }
+  const t0 = performance.now();
+  if (d.t === "ai-hidden-b") {
+    // n hiddens in, my layers (batched), n hiddens on
+    const xs = unpackWire(d);
+    const nTok = d.n || 4;
+    const wdim = ai.engine.dims.dim;
+    const hb = new Float32Array(nTok * wdim);
+    const NC = ai.engine.NC || 4;
+    for (let c = 0; c < nTok; c += NC) {
+      const m = Math.min(NC, nTok - c);
+      hb.set(await ai.engine.runHiddenBatch(xs.subarray(c * wdim, (c + m) * wdim), d.basePos + c, d.spec ? { base: c, total: nTok } : false), c * wdim);
+    }
+    if (badF32(hb)) { aiStatus(`⚠ NaN in batched prefill on this device`); sendTo(ai.hostId, { t: "ai-error", message: "NaN in batched prefill" }); }
+    teleNote(d.spec ? "spec" : "pre", performance.now() - t0);
+    // the verify flag travels with the frame: every device snapshots its recurrent state per
+    // column, or a later rollback on it restores a stale snapshot
+    const bmsg = { basePos: d.basePos, n: nTok, ...(d.spec ? { spec: 1 } : {}), ...packWire(hb) };
+    if (ai.next === "host") sendHidden(ai.hostId, { t: "ai-hiddenret-b", ...bmsg });
+    else sendHidden(ai.next, { t: "ai-hidden-b", ...bmsg, ...ctl });
+  } else {
+    // one token: run my layers, forward along the chain
+    const hin = unpackWire(d);
+    if (badF32(hin)) { aiStatus(`⚠ NaN ARRIVED at this device (pos ${d.pos}) — upstream peer broken`); }
+    const h = await ai.engine.runHidden(hin, d.pos);
+    if (badF32(h)) { aiStatus(`⚠ NaN PRODUCED by this device (pos ${d.pos}, layers ${ai.range[0]}–${ai.range[1] - 1}) — GPU kernel issue here`); sendTo(ai.hostId, { t: "ai-error", message: `NaN produced on worker layers ${ai.range[0]}–${ai.range[1] - 1}` }); }
+    teleNote("one", performance.now() - t0);
+    const msg = { pos: d.pos, ...packWire(h) };
+    if (ai.next === "host") sendHidden(ai.hostId, { t: "ai-hiddenret", ...msg });
+    else sendHidden(ai.next, { t: "ai-hidden", ...msg, ...ctl });
+    if (d.pos % 8 === 0) aiStatus(`serving layers ${ai.range[0]}–${ai.range[1] - 1} — pos ${d.pos}`);
+  }
+}
+
+// the host's tab closed: the room is over for everyone else
+function hostGone() {
+  if (ai.role === "host") return;
+  failWaiters(new Error("the host left"));
+  ai.engine = null;
+  $("ai-row").style.display = "none";
+  $("room-over").hidden = false;
+  $("room-over-why").textContent = "The host's tab closed, and the host holds the conversation and the model's first and last layers, so this room can't answer any more.";
+  aiStatus("the host left; this room is over");
+  mascot("The host left. Start a new room?");
+}
+
+// ---- messages: worker, guest and host ----
 async function aiOnData(from, d) {
   const e = conns.get(from);
   switch (d.t) {
-    case "ai-wait":
-      ai.role = "worker"; ai.hostId = from;
-      aiLoading(true, "Syncing with the room");
-      $("ldg-sub").textContent = "your turn comes after they finish downloading. keep this screen on.";
-      $("ldg-fill").style.width = "0%";
-      aiStatus("syncing with the room\u2026");
+    case "ai-start-req":
+      if (MODELS[d.model]) $("ai-model").value = d.model;   // every screen shows the model that was actually started
+      $("ai-start").disabled = true; $("ai-model").disabled = true;
+      if (d.boss !== peer.id) { aiLoading(true, `starting ${MODELS[d.model]?.label.split("·")[0].trim()}`); $("ldg-sub").textContent = `${d.by} pressed start`; $("ldg-fill").style.width = "0%"; }
+      if (d.boss === peer.id) { toast(`${d.by} started ${MODELS[d.model]?.label.split("·")[0].trim()}`); aiStart(d.model); }
+      else aiStatus(`${d.by} started the model…`);
+      break;
+    case "ai-next": ai.next = d.next; ensureLink(d.next); break;
+    case "ai-layers": ai.layersByName = d.by; loadCardRender(); break;
+    case "ai-reset":   // the host started a new chat
+      clearChat();
+      toast(`${d.by || "the host"} started a new chat`);
+      break;
+    case "ai-redeal":
+      $("ai-panel").classList.remove("online");
+      $("ai-row").style.display = "none";
+      $("room-over").hidden = true;
+      if (MODELS[d.model]) $("ai-model").value = d.model;
+      aiLoading(true, "re-dealing the layers");
+      $("ldg-sub").textContent = `${d.by} is re-dealing the layers over the devices in the room`;
+      aiStatus(`${d.by} is re-dealing the layers…`);
+      break;
+    case "ai-degraded":
+      aiStatus(`${d.why} — waiting for the host to re-deal the layers`);
+      toast(d.why);
       break;
     case "ai-load": {
       if (MODELS[d.model]) $("ai-model").value = d.model;
       ai.role = "worker";
       ai.next = d.next;
       ai.hostId = d.host;
+      ai.q = Promise.resolve();
       ensureLink(d.next);   // open the link to my chain neighbour while the weights download
       try {
         await aiLoadShard(d.model || "smollm-135m", d.range, false, false);
         if (!(await ensureLink(d.next))) throw new Error("could not connect to the next device in the chain");
-        aiStatus(`layers ${d.range[0]}\u2013${d.range[1] - 1} ready \u00b7 syncing with the room\u2026`);
-        aiLoading(true, `layers ${d.range[0]}\u2013${d.range[1] - 1} ready`);
+        aiStatus(`layers ${d.range[0]}–${d.range[1] - 1} ready · syncing with the room…`);
+        aiLoading(true, `layers ${d.range[0]}–${d.range[1] - 1} ready`);
         $("ldg-sub").textContent = "syncing with the rest of the room";
         $("ldg-fill").style.width = "100%";
         sendTo(ai.hostId, { t: "ai-ready" });
@@ -1202,73 +1629,56 @@ async function aiOnData(from, d) {
     case "ai-error":
       aiStatus(`peer ${e?.name || from} failed: ${d.message}`);
       break;
-    case "ai-hidden-b": {
-      // worker: n hiddens in (multiple of 4), my layers (batched), n hiddens on
-      if (!ai.engine) return;
-      const xs = unpackWire(d);
-      const nTok = d.n || 4;
-      const wdim = ai.engine.dims.dim;
-      const hb = new Float32Array(nTok * wdim);
-      const NC = ai.engine.NC || 4;
-      for (let c = 0; c < nTok; c += NC) {
-        const m = Math.min(NC, nTok - c);
-        hb.set(await ai.engine.runHiddenBatch(xs.subarray(c * wdim, (c + m) * wdim), d.basePos + c, d.spec ? { base: c, total: nTok } : false), c * wdim);
-      }
-      if (badF32(hb)) { aiStatus(`\u26a0 NaN in batched prefill on this device`); sendTo(ai.hostId, { t: "ai-error", message: "NaN in batched prefill" }); }
-      const bmsg = { basePos: d.basePos, n: nTok, ...packWire(hb) };
-      if (ai.next === "host") sendHidden(ai.hostId, { t: "ai-hiddenret-b", ...bmsg });
-      else sendHidden(ai.next, { t: "ai-hidden-b", ...bmsg });
+    case "ai-tele": if (ai.role === "host") ai.teleBy.set(from, d.k || {}); break;
+    case "ai-map": renderMap(d.nodes, d.st, d.live); break;
+    case "ai-hidden-b":
+    case "ai-hidden":
+      if (ai.role !== "worker") break;
+      ai.q = ai.q.then(() => workerFrame(d)).catch((err) => {
+        aiStatus("⚠ " + err.message);
+        sendTo(ai.hostId, { t: "ai-error", message: err.message });
+      });
       break;
-    }
-    case "ai-rollback": {
-      // host rejected a speculative suffix: recurrent state back to after column k
-      ai.engine?.restoreDN?.(d.k);
-      break;
-    }
-    case "ai-hiddenret-b": {
-      const w = ai.waiters.get("b" + d.basePos);
-      if (w) { ai.waiters.delete("b" + d.basePos); w(unpackWire(d)); }
-      break;
-    }
-    case "ai-hidden": {
-      // worker: run my layers, forward along the chain
-      if (!ai.engine) return;
-      const hin = unpackWire(d);
-      if (badF32(hin)) { aiStatus(`\u26a0 NaN ARRIVED at this device (pos ${d.pos}) — upstream peer broken`); }
-      const h = await ai.engine.runHidden(hin, d.pos);
-      if (badF32(h)) { aiStatus(`\u26a0 NaN PRODUCED by this device (pos ${d.pos}, layers ${ai.range[0]}\u2013${ai.range[1] - 1}) — GPU kernel issue here`); sendTo(ai.hostId, { t: "ai-error", message: `NaN produced on worker layers ${ai.range[0]}\u2013${ai.range[1] - 1}` }); }
-      const msg = { pos: d.pos, ...packWire(h) };
-      if (ai.next === "host") sendHidden(ai.hostId, { t: "ai-hiddenret", ...msg });
-      else sendHidden(ai.next, { t: "ai-hidden", ...msg });
-      if (d.pos % 8 === 0) aiStatus(`serving layers ${ai.range[0]}–${ai.range[1] - 1} — pos ${d.pos}`);
-      break;
-    }
-    case "ai-hiddenret": {
-      // host: pipeline round-trip complete
-      const w = ai.waiters.get(d.pos);
-      if (w) { ai.waiters.delete(d.pos); w(unpackWire(d)); }
-      break;
-    }
+    case "ai-hiddenret-b": lapDone("b" + d.basePos, unpackWire(d)); break;
+    case "ai-hiddenret": lapDone(d.pos, unpackWire(d)); break;
     case "ai-visibility":
       ai.visibility = d.mode;
       toast(d.mode === "all" ? "the host shows the chat to everyone" : d.mode === "host" ? "the host keeps the chat private" : "the host shows each answer to whoever asked");
       break;
+    case "ai-style":
+      toast(`answers now: ${PERSONAS[d.persona]?.label || d.persona}${d.thinking ? " · thinking first" : ""}`);
+      break;
     case "ai-genstart":
-      ai.remoteReply = "";
       chatUser(d.name, d.hidden ? "asked something (the host keeps the chat private)" : d.text);
       chatBotStart();
-      $("ai-send").disabled = true;
+      setBusyUI(true, d.asker === peer.id);
       mascot(`${d.name} asked something. Thinking…`);
       break;
-    case "ai-token": ai.remoteReply = (ai.remoteReply || "") + d.text; chatBotUpdate(ai.remoteReply); break;
-    case "ai-gendone": chatBotEnd(d.hidden ? "answer hidden by the host" : (ai.remoteReply || ""), d.stats); $("ai-send").disabled = false; mascot("Your turn. Ask anything."); break;
+    case "ai-token": chatBotPiece(d.text, d.d); break;
+    case "ai-gendone":
+      chatBotEnd(d.hidden ? "answer hidden by the host" : null, d.stats);
+      setBusyUI(false);
+      if (d.ctx) setCtx(d.ctx.used, d.ctx.max);
+      mascot("Your turn. Ask anything.");
+      break;
+    case "ai-history":
+      for (const it of d.items || []) {
+        chatUser(it.name, it.text);
+        chatBotStart();
+        botEl.pieces = [{ t: it.reply || "", d: 0 }];
+        chatBotEnd(null, it.stats);
+      }
+      break;
     case "ai-ready-all":
       aiLoading(false);
       $("ai-panel").classList.add("online");
-      if (ai.role !== "host") { ai.role = ai.role || "guest"; ai.hostId = from; }
+      if (ai.role !== "host" && ai.role !== "worker") ai.role = "guest";
+      if (ai.role !== "host") ai.hostId = from;
+      if (MODELS[d.model]) { $("ai-model").value = d.model; ai.model = d.model; }
       $("ai-row").style.display = "flex";
+      $("chat-tools").hidden = false;
       $("ai-empty").textContent = "cluster online. ask anything.";
-      aiStatus(`cluster online · serving layers ${ai.range ? ai.range[0] + "–" + (ai.range[1] - 1) : ""}`);
+      aiStatus(ai.range ? `cluster online · serving layers ${ai.range[0]}–${ai.range[1] - 1}` : "cluster online · this device asks, the others think");
       mascot("Cluster online! Type a question, the whole room answers.");
       break;
     case "ai-ask":
@@ -1276,29 +1686,58 @@ async function aiOnData(from, d) {
       if (ai.busy === "gen") { sendTo(from, { t: "ai-busy" }); break; }
       aiGenerate(d.text, d.name, from);
       break;
-    case "ai-busy": toast("the swarm is still answering, try again in a moment"); break;
+    case "ai-stop":
+      if (ai.role === "host" && ai.busy === "gen" && from === ai.askerId) { ai.abort = true; aiStatus(`${e?.name || "the asker"} pressed stop…`); }
+      break;
+    case "ai-busy": toast(d.why || "the swarm is still answering, try again in a moment"); break;
   }
 }
 
 $("ai-start").addEventListener("click", aiStartAnywhere);
+$("ai-redeal").addEventListener("click", aiRedeal);
 $("ai-visibility").addEventListener("change", (e) => {
   ai.visibility = e.target.value;
   broadcastAll({ t: "ai-visibility", mode: ai.visibility });
   toast(ai.visibility === "all" ? "everyone sees the chat" : ai.visibility === "host" ? "only you see the chat" : "each answer goes to whoever asked");
 });
+// answer style: persona, sampling, thinking. Takes effect on the next question; a new system
+// prompt changes the conversation's first tokens, so that question re-prefills from scratch.
+for (const [k, v] of Object.entries(PERSONAS)) $("ai-persona").add(new Option(v.label, k));
+for (const [k, v] of Object.entries(SAMPLING)) $("ai-sampling").add(new Option(v.label, k));
+function styleChanged() {
+  ai.settings = { persona: $("ai-persona").value, sampling: $("ai-sampling").value, thinking: $("ai-thinking").checked };
+  broadcastAll({ t: "ai-style", ...ai.settings });
+}
+for (const id of ["ai-persona", "ai-sampling", "ai-thinking"]) $(id).addEventListener("change", styleChanged);
 $("cache-clear").addEventListener("click", async (ev) => {
   ev.preventDefault();
   try { await caches.delete("swarmllm-weights-v1"); weightCache = null; toast("cached weights cleared"); } catch { toast("could not clear the cache"); }
 });
+$("new-chat").addEventListener("click", aiNewChat);
+$("draft-view").addEventListener("click", () => setDraftView(!draftView));
+$("export-chat").addEventListener("click", exportChat);
 function aiSubmit() {
+  if ($("ai-send").classList.contains("stop")) { aiStop(); return; }
   const text = $("ai-prompt").value.trim();
-  if (!text) return;
+  if (!text || $("ai-row").classList.contains("busy")) return;
   if (ai.role === "host") { aiGenerate(); return; }
   const hostId = ai.hostId;
   if (!conns.has(hostId)) { toast("not connected to the host"); return; }
-  $("ai-prompt").value = "";
+  $("ai-prompt").value = ""; growPrompt();
   sendTo(hostId, { t: "ai-ask", text, name: myName });
 }
+function aiStop() {
+  if (ai.role === "host") { if (ai.busy === "gen") { ai.abort = true; aiStatus("stopping after this lap…"); } }
+  else if (ai.hostId) sendTo(ai.hostId, { t: "ai-stop" });
+  $("ai-send").disabled = true;
+}
+// the prompt box grows with its text; Enter sends and Shift+Enter is a new line (phones: the
+// keyboard's return key is a new line, the Send button sends)
+function growPrompt() { const p = $("ai-prompt"); p.style.height = "auto"; p.style.height = Math.min(p.scrollHeight, 160) + "px"; }
 $("ai-send").addEventListener("click", aiSubmit);
-$("ai-prompt").addEventListener("keydown", (e) => { if (e.key === "Enter") aiSubmit(); });
+$("ai-prompt").addEventListener("input", growPrompt);
+$("ai-prompt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && !myMeta?.phone) { e.preventDefault(); aiSubmit(); }
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("ai-send").classList.contains("stop")) aiStop(); });
 mascot("Hi! I'm Swarmy. Create a room, or type a friend's code to join one.");

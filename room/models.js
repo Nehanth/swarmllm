@@ -28,4 +28,5 @@ export const MODELS = {
 // 2048); the kernels only use it as a stride. Generation stops before the cache would overflow.
 export const MAX_SEQ = 2048;
 export const MAX_NEW = 400;    // longest answer, tokens
+export const MAX_NEW_THINKING = 1200;   // with thinking on, the think block comes out of the same budget
 export const MIN_ROOM = 32;    // a prompt must leave at least this many tokens for the answer
