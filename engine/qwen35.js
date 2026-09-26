@@ -32,7 +32,7 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false }) {
     this.replay = replayRollback !== false;
     this.device = device;
     this.mvVariant = matvecVariant;
@@ -140,7 +140,7 @@ export class Qwen35Engine {
       dn_l2_mc: ["rw", "u", "u"], dn_delta_mc: ["ro", "ro", "ro", "rw", "rw", "u", "u", "rw"],
       dn_gatenorm_mc: ["ro", "ro", "ro", "rw", "u", "u"], qsplit_mc: ["ro", "rw", "rw", "u", "u"],
       head_norm_mc: ["rw", "ro", "u"], rope_part_mc: ["rw", "u", "u"], sigmoid_mul_mc: ["rw", "ro", "u"],
-      argmax: ["ro", "rw", "u"],
+      argmax: ["ro", "rw", "u"], emb_gather: ["ro", "ro", "ro", "rw", "u"],
     };
     // narrower twins: a verify or tail pass with w live columns pays for w, not batchCols
     for (const W of [8, 4]) if (batchCols > W) Object.assign(G1, {
@@ -372,6 +372,26 @@ export class Qwen35Engine {
       M2.proj = mv(M2.ehProj, M2.ehIn, this.x, dim, 2 * dim);           // eh_proj -> MTP residual (in x)
       M2.bgHeadNorm = bgNorm(this.x, M2.headNorm, this.xn);               // shared_head_norm -> xn
     }
+    // One-submit draft chain (roadmap 26 #2, opt-in: it keeps the embedding table on the GPU too,
+    // ~675 MB for the 27B, or only its first draftVocab rows): the K draft steps of a speculative
+    // step go into one command buffer; each step gathers the previous argmax's embedding on the
+    // GPU and has its own frame uniform, and one readback returns all K drafts. Drafts only.
+    const ce = this.cpuEmbed;
+    if (draftChain && this.mtp && ce && (ce.kind === "q4" || ce.kind === "q8") && ce.qs && ce.scales) {
+      const nb = dim / 32, rows = Math.min(vocab, this.draftVocab || vocab), per = ce.kind === "q4" ? 16 : 32;
+      const qs = this._buf(ce.qs.subarray(0, rows * nb * per), GPUBufferUsage.STORAGE);
+      const sc = this._buf(ce.scales.subarray(0, Math.ceil(rows * nb / 2)), GPUBufferUsage.STORAGE);
+      this.bgEmbGather = this._bg(this.pipes.emb_gather, 1, [qs, sc, this.argBuf, this.mtp.emb,
+        this._buf(new Uint32Array([dim, ce.kind === "q4" ? 0 : 1, rows, 0]), GPUBufferUsage.UNIFORM)]);
+      this.stepFrames = Array.from({ length: 8 }, () => device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
+      this.bgCommonStep = this.stepFrames.map((f) => {
+        const m = {};
+        for (const [k2, p] of Object.entries(this.pipes)) m[k2] = this._bg(p, 0, [this.cfgBuf, f]);
+        return m;
+      });
+      this.stageArgK = device.createBuffer({ size: 8 * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      this.draftChain = true;
+    }
   }
 
   _shape(dOut, dIn) {
@@ -409,7 +429,7 @@ export class Qwen35Engine {
   _d(pass, name, bg, threads, wg = 64) {
     if (this.skip && this.skip.has(name)) return;   // profiling aid (bench_breakdown)
     pass.setPipeline(this.pipes[name]);
-    pass.setBindGroup(0, this.bgCommonFor[name]);
+    pass.setBindGroup(0, (this._common || this.bgCommonFor)[name]);
     pass.setBindGroup(1, bg);
     pass.dispatchWorkgroups(Math.ceil(threads / wg));
   }
@@ -431,7 +451,7 @@ export class Qwen35Engine {
   _rowsFor(W) { return Math.max(1, Math.min(8, Math.round(this.coopRowsB * this.NC / W))); }
   _d3(pass, pipe, bg, wgs) {
     pass.setPipeline(this.pipes[pipe]);
-    pass.setBindGroup(0, this.bgCommonFor[pipe]);
+    pass.setBindGroup(0, (this._common || this.bgCommonFor)[pipe]);
     pass.setBindGroup(1, bg);
     if (wgs > 32768) pass.dispatchWorkgroups(32768, Math.ceil(wgs / 32768)); else pass.dispatchWorkgroups(wgs);   // > 65535 per dimension is silently dropped
   }
@@ -997,11 +1017,44 @@ export class Qwen35Engine {
   // runTrunk(tokens, pos) -> hidden states for all columns (chain mode);
   // onReject(k) tells the other devices to roll their recurrent state back
   // to what it was after column k.
+  // the K drafts of specStep in one submit (see draftChain in _init); same kernels, same inputs
+  async _draftChain(tNext, pos, K) {
+    const M2 = this.mtp, small = !!this.headOpDraft;
+    this.device.queue.writeBuffer(M2.emb, 0, this._embedRowF32(tNext));
+    for (let k = 0; k < K; k++) this.device.queue.writeBuffer(this.stepFrames[k], 0, new Uint32Array([pos + k, pos + k + 1]));
+    const enc = this.device.createCommandEncoder();
+    try {
+      for (let k = 0; k < K; k++) {
+        this._common = this.bgCommonStep[k];
+        const p = enc.beginComputePass();
+        if (k > 0) this._d(p, "emb_gather", this.bgEmbGather, this.dims.dim);
+        this._d(p, "rmsnorm", M2.bgENorm, 256, 256);
+        this._d(p, "rmsnorm", M2.bgHNormX, 256, 256);
+        this._dop(p, M2.proj);
+        p.end();
+        this._encodeLayerR(enc, this.mtpLayer, pos + k);
+        const p2 = enc.beginComputePass();
+        this._d(p2, "rmsnorm", M2.bgHeadNorm, 256, 256);
+        this._dop(p2, small ? this.headOpDraft : this.headOp);
+        this._d(p2, "argmax", small ? this.bgArgmaxDraft : this.bgArgmax, 256, 256);
+        p2.end();
+        enc.copyBufferToBuffer(this.argBuf, 0, this.stageArgK, k * 16, 16);
+      }
+    } finally { this._common = null; }
+    this.device.queue.submit([enc.finish()]);
+    await this.stageArgK.mapAsync(GPUMapMode.READ, 0, K * 16);
+    const a = new Uint32Array(this.stageArgK.getMappedRange(0, K * 16));
+    const drafts = Array.from({ length: K }, (_, k) => a[k * 4]);
+    this.stageArgK.unmap();
+    return drafts;
+  }
+
   async specStep(tNext, sample, K = 3, { runTrunk = null, onReject = null } = {}) {
     const pos = this.pos, M2 = this.mtp, { dim } = this.dims;
     K = Math.max(1, Math.min(7, K));
-    const drafts = [];
-    for (let k = 0; k < K; k++) {
+    let drafts = [];
+    if (this.draftChain && this.chainOn !== false) drafts = await this._draftChain(tNext, pos, K);
+    else for (let k = 0; k < K; k++) {
       // after the first call this.x holds the MTP block's own output hidden,
       // which is what chained drafting feeds back in
       drafts.push(await this.mtpRun(null, k === 0 ? tNext : drafts[k - 1], pos + k, "argmax"));
