@@ -120,7 +120,7 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false, attnGlue = true, dnFuse = true, attnMC = true, attnFlash = true, kvQ8 = false }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false, attnGlue = true, dnFuse = true, attnMC = true, attnFlash = true, kvQ8 = false, attnTile = true }) {
     this.replay = replayRollback !== false;
     // longest draft run one verify can take: with replay rollback the limit is the replay buffers
     // (max(batchCols, 8) columns), so prompt-lookup drafts can run to 15 tokens when code is being copied
@@ -163,6 +163,9 @@ export class Qwen35Engine {
     this.kvQ8 = this.flash && kvQ8 === true && hd % 32 === 0;
     this.ksPipe = this.kvQ8 ? "kv_store_q8" : "kv_store";
     this.faPipe = this.kvQ8 ? "attn_flash_q8" : "attn_flash";
+    // two columns per workgroup in batched passes (attn_flash_t2): K/V read once per pair, same bits
+    this.attnTileOn = this.flash && !this.kvQ8 && attnTile !== false && 2 * (nH / nKV) * hd <= 3072 && nH / nKV <= 8;
+    this.attnTile = this.attnTileOn;
     // fused attention glue (qsplit + q/k head_norm + rope in one dispatch, bit-identical); its
     // staging array holds one 256-wide head. engine.attnGlue = false restores the five dispatches.
     this.attnGlueOn = attnGlue !== false && hd <= 256;
@@ -255,7 +258,7 @@ export class Qwen35Engine {
       attn_glue: ["ro", "rw", "rw", "rw", "ro", "ro", "u", "u"],
       dn_delta_gn: ["ro", "ro", "ro", "rw", "ro", "ro", "rw", "u"],
       kv_store: ["ro", "ro", "rw", "rw", "u"], attn_flash: ["ro", "ro", "ro", "rw", "rw", "u"], attn_combine: ["ro", "ro", "rw", "u"],
-      kv_store_q8: ["ro", "ro", "rw", "rw", "rw", "rw", "u"], attn_flash_q8: ["ro", "ro", "ro", "ro", "ro", "rw", "rw", "u"],
+      kv_store_q8: ["ro", "ro", "rw", "rw", "rw", "rw", "u"], attn_flash_q8: ["ro", "ro", "ro", "ro", "ro", "rw", "rw", "u"], attn_flash_t2: ["ro", "ro", "ro", "rw", "rw", "u"],
       attn_scores_mc: ["ro", "ro", "rw", "u"], attn_softmax_wg_mc: ["rw"], attn_out_mc: ["ro", "ro", "rw", "u"],
       argmax: ["ro", "rw", "u"], emb_gather: ["ro", "ro", "ro", "rw", "u"],
     };
@@ -803,7 +806,7 @@ export class Qwen35Engine {
       "dn_gates", "dn_conv", "dn_l2", "dn_delta", "dn_gatenorm",
       "rmsnorm_mc", "add_res_mc", "dn_gates_mc", "dn_conv_mc", "dn_l2_mc", "dn_pre_mc", "dn_delta_mc", "dn_gatenorm_mc",
       "qsplit_mc", "head_norm_mc", "rope_part_mc", "sigmoid_mul_mc", "attn_glue",
-      "attn_scores_mc", "attn_softmax_wg_mc", "attn_out_mc", "kv_store", "attn_flash", "attn_combine", "kv_store_q8", "attn_flash_q8"];
+      "attn_scores_mc", "attn_softmax_wg_mc", "attn_out_mc", "kv_store", "attn_flash", "attn_combine", "kv_store_q8", "attn_flash_q8", "attn_flash_t2"];
     this.bgCommonB = cix.map((c) => {
       const m = {};
       for (const name of colPipes)
@@ -886,6 +889,7 @@ export class Qwen35Engine {
         flash: this.flash && this._bg2res(this.pipes[this.faPipe], [whole(B.q), { buffer: L.kCache }, { buffer: L.vCache },
           ...(this.kvQ8 ? [{ buffer: L.kScale }, { buffer: L.vScale }] : []), { buffer: this.faO }, { buffer: this.faML },
           { buffer: this.faUB }]),
+        flashT2: this.attnTileOn && this._bg2res(this.pipes.attn_flash_t2, [whole(B.q), { buffer: L.kCache }, { buffer: L.vCache }, { buffer: this.faO }, { buffer: this.faML }, { buffer: this.faUB }]),
         combine: this.flash && this._bg2res(this.pipes.attn_combine, [{ buffer: this.faO }, { buffer: this.faML }, whole(B.attnOut), { buffer: this.faUB }]),
         scoresMC: this.scoresMC && this._bg2res(this.pipes.attn_scores_mc, [whole(B.q), { buffer: L.kCache }, { buffer: this.scoresMC }, mcU(0, st(B.q))]),
         softmaxMC: this.scoresMC && this._bg2res(this.pipes.attn_softmax_wg_mc, [{ buffer: this.scoresMC }]),
@@ -994,7 +998,8 @@ export class Qwen35Engine {
         const p = enc.beginComputePass();
         if (this.flash) {
           this._dMC(p, this.ksPipe, M.kvStore, D.kvDim / (this.kvQ8 ? 32 : 2), 64, nCols);
-          this._dMC(p, this.faPipe, M.flash, Math.ceil((basePos + nCols) / this.faSplit) * 256, 256, nCols, D.nKV);
+          if (this.attnTile && M.flashT2 && nCols > 1) this._dMC(p, "attn_flash_t2", M.flashT2, Math.ceil((basePos + nCols) / this.faSplit) * 256, 256, Math.ceil(nCols / 2), D.nKV);
+          else this._dMC(p, this.faPipe, M.flash, Math.ceil((basePos + nCols) / this.faSplit) * 256, 256, nCols, D.nKV);
           this._dMC(p, "attn_combine", M.combine, D.nH * 256, 256, nCols);
         } else if (this.attnMC && M.scoresMC) {
           this._dMC(p, "attn_scores_mc", M.scoresMC, basePos + nCols, 64, nCols, D.nH);

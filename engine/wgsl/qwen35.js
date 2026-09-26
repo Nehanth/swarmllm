@@ -774,6 +774,101 @@ var<workgroup> fa_a: array<f32, 8>;
 ${flashWGSL(false)}
 ${flashWGSL(true)}
 
+// attn_flash_t2: attn_flash for two columns per workgroup (batched passes): each K and V row is
+// read once for both columns' 2 x G query heads. Per (column, head) the scores, the running max /
+// sum and the output accumulate in exactly attn_flash's order, so the partials are bit-identical
+// to running the columns one by one (decode and verify still agree). Needs 2 * G * headDim <= 3072.
+@group(1) @binding(0) var<storage, read> ft_q: array<f32>;
+@group(1) @binding(1) var<storage, read> ft_k: array<u32>;
+@group(1) @binding(2) var<storage, read> ft_v: array<u32>;
+@group(1) @binding(3) var<storage, read_write> ft_o: array<f32>;
+@group(1) @binding(4) var<storage, read_write> ft_ml: array<f32>;
+@group(1) @binding(5) var<uniform> ft: FA;
+var<workgroup> ft_qs: array<f32, 3072>;
+var<workgroup> ft_sc: array<f32, 768>;
+var<workgroup> ft_m: array<f32, 16>;
+var<workgroup> ft_l: array<f32, 16>;
+var<workgroup> ft_a: array<f32, 16>;
+@compute @workgroup_size(256)
+fn attn_flash_t2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let sp = wg.x; let cb = wg.y * 2u; let g = wg.z; let tid = lid.x;
+  let nc = max(frame.nCols, 1u);
+  let hd = cfg.headDim; let G = cfg.nH / cfg.nKV;
+  let hw = hd / 2u; let kvw = cfg.kvDim / 2u;
+  let rs = sqrt(f32(hd));
+  let t0 = sp * ft.splitLen;
+  // where each of the two columns stops in this split (t0 = nothing to do)
+  let s0 = frame.seqLen + cb; let s1 = s0 + 1u;
+  let e0 = select(t0, min(s0, t0 + ft.splitLen), cb < nc && t0 < s0);
+  let e1 = select(t0, min(s1, t0 + ft.splitLen), cb + 1u < nc && t0 < s1);
+  let t1 = max(e0, e1);
+  if (t1 <= t0) { return; }
+  let GH = 2u * G;
+  for (var w: u32 = tid; w < GH * hd; w += 256u) {
+    let c = w / (G * hd);
+    if (cb + c < nc) { ft_qs[w] = ft_q[(cb + c) * ft.s0 + g * G * hd + w % (G * hd)]; }
+  }
+  if (tid < GH) { ft_m[tid] = -3.0e38; ft_l[tid] = 0.0; }
+  var acc: array<f32, 16>;
+  for (var j: u32 = 0u; j < 16u; j++) { acc[j] = 0.0; }
+  workgroupBarrier();
+  for (var c0: u32 = t0; c0 < t1; c0 += 64u) {
+    let n0 = select(0u, min(64u, e0 - c0), c0 < e0);
+    let n1 = select(0u, min(64u, e1 - c0), c0 < e1);
+    for (var w: u32 = tid; w < GH * 64u; w += 256u) {
+      let j = w / 64u; let t = w % 64u;
+      if (t < select(n0, n1, j >= G)) {
+        let kb = (c0 + t) * kvw + g * hw;
+        let qb = j * hd;
+        var s: f32 = 0.0;
+        for (var p: u32 = 0u; p < hw; p++) {
+          let kk = unpack2x16float(ft_k[kb + p]);
+          s += ft_qs[qb + 2u * p] * kk.x;
+          s += ft_qs[qb + 2u * p + 1u] * kk.y;
+        }
+        ft_sc[w] = s / rs;
+      }
+    }
+    workgroupBarrier();
+    if (tid < GH) {
+      let n = select(n0, n1, tid >= G);
+      if (n > 0u) {
+        let b = tid * 64u;
+        var cm = ft_m[tid];
+        for (var t: u32 = 0u; t < n; t++) { cm = max(cm, ft_sc[b + t]); }
+        let alpha = exp(ft_m[tid] - cm);
+        var l = ft_l[tid] * alpha;
+        for (var t: u32 = 0u; t < n; t++) { let e = exp(ft_sc[b + t] - cm); ft_sc[b + t] = e; l += e; }
+        ft_m[tid] = cm; ft_l[tid] = l; ft_a[tid] = alpha;
+      }
+    }
+    workgroupBarrier();
+    if (tid < hd) {
+      if (n0 > 0u) { for (var h: u32 = 0u; h < G; h++) { acc[h] *= ft_a[h]; } }
+      if (n1 > 0u) { for (var h: u32 = 0u; h < G; h++) { acc[G + h] *= ft_a[G + h]; } }
+      let nm = max(n0, n1);
+      for (var t: u32 = 0u; t < nm; t++) {
+        let v = unpack2x16float(ft_v[(c0 + t) * kvw + g * hw + tid / 2u])[tid & 1u];
+        if (t < n0) { for (var h: u32 = 0u; h < G; h++) { acc[h] += ft_sc[h * 64u + t] * v; } }
+        if (t < n1) { for (var h: u32 = 0u; h < G; h++) { acc[G + h] += ft_sc[(G + h) * 64u + t] * v; } }
+      }
+    }
+    workgroupBarrier();
+  }
+  for (var c: u32 = 0u; c < 2u; c++) {
+    if (select(e0, e1, c == 1u) > t0) {
+      let col = cb + c;
+      if (tid < hd) {
+        for (var h: u32 = 0u; h < G; h++) { ft_o[((col * cfg.nH + g * G + h) * ft.maxSplits + sp) * hd + tid] = acc[c * G + h]; }
+      }
+      if (tid < G) {
+        let b = (col * cfg.nH + g * G + tid) * ft.maxSplits + sp;
+        ft_ml[b * 2u] = ft_m[c * G + tid]; ft_ml[b * 2u + 1u] = ft_l[c * G + tid];
+      }
+    }
+  }
+}
+
 @group(1) @binding(0) var<storage, read> fc_o: array<f32>;
 @group(1) @binding(1) var<storage, read> fc_ml: array<f32>;
 @group(1) @binding(2) var<storage, read_write> fc_out: array<f32>;
