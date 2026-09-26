@@ -207,7 +207,7 @@ export async function ggufEntry(G, bytesOf, name, optional, onBytes = () => {}) 
       const { qs, scales } = q4Repack(info, bytes);
       return { kind: "q4", qs, scales, shape: info.shape };
     }
-    if (info.ggmlType !== GGML_F32 && info.ggmlType !== GGML_F16) {
+    if (info.ggmlType !== GGML_F32 && info.ggmlType !== GGML_F16 && info.ggmlType !== GGML_BF16) {
       const { qs, scales } = requantQ8Streaming(info, bytes);
       return { kind: "q8", qs, scales, shape: info.shape };
     }
@@ -275,7 +275,7 @@ export function ggufShardBytes(G, { lo, hi, hasEmbed, hasHead }) {
 }
 
 // ---------- extended quant formats (Qwen3.8 / Q4_0 file family) ----------
-export const GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_K = 13, GGML_Q6_K = 14;
+export const GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_0 = 6, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_BF16 = 30;
 export const QK_K = 256;
 
 export function ggmlTypeBytes(type, n) {
@@ -284,6 +284,8 @@ export function ggmlTypeBytes(type, n) {
     case GGML_F16: return n * 2;
     case GGML_Q4_0: return (n / 32) * 18;
     case GGML_Q4_1: return (n / 32) * 20;
+    case GGML_Q5_0: return (n / 32) * 22;
+    case GGML_BF16: return n * 2;
     case GGML_Q8_0: return (n / 32) * 34;
     case GGML_Q5_K: return (n / QK_K) * 176;
     case GGML_Q6_K: return (n / QK_K) * 210;
@@ -305,6 +307,24 @@ export function dequantF32(info, bytes) {
   const n = info.nElems, T = info.ggmlType;
   if (T === GGML_F32 || T === GGML_F16 || T === GGML_Q8_0) return ggufToF32(info, bytes);
   const out = new Float32Array(n);
+  if (T === GGML_BF16) {   // bf16 is the top half of an f32: exact
+    const u = new Uint32Array(out.buffer);
+    for (let i = 0; i < n; i++) u[i] = (bytes[2 * i] | (bytes[2 * i + 1] << 8)) << 16;
+    return out;
+  }
+  if (T === GGML_Q5_0) {   // ggml dequantize_row_q5_0: d f16, qh u32 (5th bits), 16 bytes of nibbles
+    const nb = n / 32;
+    for (let b = 0; b < nb; b++) {
+      const base = b * 22, d = f16ToF32(bytes[base] | (bytes[base + 1] << 8));
+      const qh = (bytes[base + 2] | (bytes[base + 3] << 8) | (bytes[base + 4] << 16) | (bytes[base + 5] << 24)) >>> 0;
+      for (let j = 0; j < 16; j++) {
+        const q = bytes[base + 6 + j], h0 = ((qh >>> j) << 4) & 0x10, h1 = (qh >>> (j + 12)) & 0x10;
+        out[b * 32 + j] = d * (((q & 0xF) | h0) - 16);
+        out[b * 32 + j + 16] = d * (((q >> 4) | h1) - 16);
+      }
+    }
+    return out;
+  }
   if (T === GGML_Q4_0) {
     const nb = n / 32;
     for (let b = 0; b < nb; b++) {
