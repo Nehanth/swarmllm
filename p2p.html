@@ -368,6 +368,13 @@
   .sheet .row button[hidden] { display: none; }
   .sheet.wide { width: min(680px, 100%); }
   #card-canvas { width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--border); }
+  #add-virtual { font-family: var(--mono); font-size: 10.5px; padding: 6px 10px; border-radius: 100px; border-style: dashed; color: var(--muted); background: transparent; }
+  #virtual { display: flex; gap: 6px; flex-wrap: wrap; }
+  #virtual[hidden] { display: none; }
+  .vdev { position: relative; width: 132px; height: 92px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: var(--panel); }
+  .vdev iframe { width: 400%; height: 400%; transform: scale(0.25); transform-origin: 0 0; border: 0; pointer-events: none; }
+  .vdev button { position: absolute; top: 3px; right: 3px; padding: 0 6px; font-size: 12px; line-height: 18px; border-radius: 100px; }
+  html.embed header, html.embed #add-virtual, html.embed #virtual { display: none !important; }
   #room-over-why { font-size: 14px; color: var(--muted); }
   #resume-btn { font-family: var(--mono); font-size: 12.5px; border-radius: 100px; border-color: var(--accent); color: var(--accent); }
   #resume-btn[hidden] { display: none; }
@@ -446,6 +453,8 @@
     <div id="side-room"><div class="side-k">ROOM</div><div id="side-code" title="share this room">----</div><div class="side-hint">share this code</div><button id="share-btn" type="button">link / QR</button></div>
     <div class="side-k">DEVICES</div>
     <div id="peers"></div>
+    <button id="add-virtual" type="button" title="add a device that runs in a frame on this computer, to see the swarm work before friends join">+ virtual device (this computer)</button>
+    <div id="virtual" hidden></div>
     <div id="ai-panel">
       <div class="side-k">MODEL</div>
       <div id="ai-head">
