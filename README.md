@@ -17,6 +17,8 @@
   <img alt="runtime" src="https://img.shields.io/badge/runs%20on-WebGPU%20%2B%20WebRTC-16171c">
 </p>
 
+> **This project is being renamed by October 11.** The name overlaps with existing projects, so we're moving to a new name and repo to avoid confusion. Name ideas welcome in [the brainstorm discussion](https://github.com/Nehanth/swarmllm/discussions/62). Other projects that share the name are listed in the [Name](#name) section.
+
 https://github.com/user-attachments/assets/4f349e4b-c699-45da-abe8-e9162689293e
 
 <p align="center"><sub>Demo, recorded September 7, 2026: Qwen 3.8 27B across a MacBook and an iPhone in browser tabs, same Wi‑Fi, 400 tokens at 10.7 tok/s. <a href="https://github.com/Nehanth/swarmllm/releases/download/v0.2.0/swarmllm-demo-2026-09-07.mp4">Download</a>.</sub></p>
@@ -140,7 +142,7 @@ Model weights and the GGUF format come from the [Qwen](https://huggingface.co/Qw
 
 ## Name
 
-"SwarmLLM" is a common name in this space. This project is independent and not affiliated with the [SWARM-LLM paper](https://arxiv.org/abs/2606.14711) (a routing layer for swarms of edge small language models), [enapt/SwarmLLM](https://github.com/enapt/SwarmLLM) (a native Rust app that pools computers over a public network to run large models), or any other project using the name.
+Several unrelated projects use the SwarmLLM name, including [enapt/SwarmLLM](https://github.com/enapt/SwarmLLM), a peer-to-peer inference network in Rust that predates this one, and the [SWARM-LLM paper](https://arxiv.org/abs/2606.14711), a routing layer for swarms of edge small language models. To avoid confusion, this project is being renamed and moved to a new repo by October 11, 2026. The old URLs will redirect. Suggest names in [the brainstorm discussion](https://github.com/Nehanth/swarmllm/discussions/62).
 
 ## License
 
