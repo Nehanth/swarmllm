@@ -28,3 +28,17 @@ Open risks: (1) only layer 32 was measured, not the last hop (after layer 63) no
 | 9 | Subgroup-matrix GEMM (`chromium-experimental-subgroup-matrix` → Metal simdgroup_matrix / Vulkan coopmat); ORT MatMulNBits Phi-3.5 1K prefill 15 s → 5.4 s ([PR #23729](https://github.com/microsoft/onnxruntime/pull/23729)) | new, Chrome-flagged | the route to llama.cpp-class prefill | prefill tolerance |
 
 Lower priority or covered: pipelined laps (PipeInfer, [arXiv 2407.11798](https://arxiv.org/abs/2407.11798), designed in kernel-plan-3 and network-scheduler §3; prefill pipelining is built); frequency-ranked draft vocabulary ([FR-Spec](https://arxiv.org/abs/2502.14856); the prefix version is `?draftvocab=N`; the draft head is ~1.27 GB ≈ 6.9 ms per draft); f16 KV cache (~0.7 ms/token at 2048, changes numerics). Not recommended: EAGLE-2/3 trees (no heads for Qwen 3.8, a DeltaNet state per branch, native MTP already ~85% acceptance), lookahead decoding (recurrent state per branch), streaming partial hidden states mid-layer (refuted, exact-forward-pass-ideas #22/#25), and the already-rejected f16 activation storage, subgroup reductions in the GEMV, int8 on the wire, and llama.cpp Metal's `yl` pre-scale (breaks single/batched bit-identity).
+
+## What landed on the `kernels` branch, and how to measure it
+
+Correctness was checked on SwiftShader with synthetic models (tests/e2e/*_synth.mjs); none of the speed effects below has been measured on a GPU yet. Each has a switch so one build can A/B it:
+
+| Change | Switch (off) | Expected effect | Measure with |
+|---|---|---|---|
+| Q8_0 prefill GEMM | `Qwen35Engine.create({ gemm8: false })`, or `engine.gemm8 = false` at runtime | prefill pass 56.7 → ~72 tok/s on the GB10 (item 1) | `MODEL=q38 deno run --unstable-webgpu --allow-read --allow-env benchmarks/bench.js` (prefill line), `tests/test_gemm.js` for tolerance |
+| Batched draft-cache fill | `engine.mtpBatchFill = false`, room `?mtpbatch=0` | solo prefill 43.7 → ~55–65 tok/s (item 2) | same bench, prefill line; `tests/test_mtp.js` must stay equal |
+| Replay rollback | `replayRollback: false` | ~0.9 GB less GPU memory for a whole-model device; spec tok/s ±small | `tests/test_mtp.js`, `tests/test_mtp_split.js` (spec == plain); GPU memory in the browser task manager |
+| Draft head over the first N vocab rows | `?draftvocab=N` (off by default) | cheaper drafts; acceptance may drop | room stats line "N% drafts accepted" and tok/s with N = 32768 / 65536 vs off |
+| Prompt-lookup drafts | room `?lookup=0` | faster on answers that repeat the context | room tok/s on a summarise/quote prompt, on and off |
+
+The dense-engine fix (batched GEMVs dispatching half their workgroups when autotune picks 8 rows per workgroup) is a correctness fix with no switch: `node tests/e2e/engine_dense_synth.mjs` checks batched vs one-token hiddens for every autotune shape.
