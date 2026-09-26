@@ -638,7 +638,19 @@ export class Qwen35Engine {
     const dn = { buffer: this.dnBuf };
     if (this.hasHead) this.bgFinalNormMC = this._bg2res(this.pipes.rmsnorm_mc,
       [whole(B.x), { buffer: this.finalNorm.buf }, whole(B.xn), mcU(D.dim, st(B.x), st(B.xn))]);
-    this.layerB = this.layers.map((L) => {
+    // batched draft-block pre-pass: per column, eh_proj [enorm(embed(next token)) | hnorm(trunk hidden)]
+    if (this.mtp) {
+      const M2 = this.mtp;
+      B.mEmb = mkB(D.dim); B.ehIn = mkB(2 * D.dim);
+      M2.bgENormMC = this._bg2res(this.pipes.rmsnorm_mc, [whole(B.mEmb), { buffer: M2.enorm.buf },
+        { buffer: B.ehIn.buf, offset: 0, size: B.ehIn.buf.size }, mcU(D.dim, st(B.mEmb), st(B.ehIn))]);
+      M2.bgHNormMC = this._bg2res(this.pipes.rmsnorm_mc, [whole(B.x), { buffer: M2.hnorm.buf },
+        { buffer: B.ehIn.buf, offset: D.dim * 4, size: B.ehIn.buf.size - D.dim * 4 }, mcU(D.dim, st(B.x), st(B.ehIn))]);
+      M2.projB = mvB(M2.ehProj, B.ehIn, B.x, D.dim, 2 * D.dim);
+    }
+    // the draft (MTP) block is a full-attention layer too: it gets batched bind groups at index
+    // this.layers.length, so prefill can fill the draft cache for a whole chunk in one pass
+    this.layerB = (this.mtpLayer ? [...this.layers, this.mtpLayer] : this.layers).map((L) => {
       const bgNormC = (w, c) => this._bg2res(this.pipes.rmsnorm,
         [slice(B.x, c), { buffer: w.buf }, slice(B.xn, c), { buffer: this.uDim }]);
       const mc = {
@@ -725,7 +737,7 @@ export class Qwen35Engine {
   // the recurrent kernels save their state after each non-final column so a
   // rejected speculative suffix can be rolled back.
   _encodeLayerBatch(enc, i, basePos, nCols = this.NC, snapshotDN = false) {
-    const D = this.dims, L = this.layers[i], LB = this.layerB[i], B = this.B, M = LB.mc;
+    const D = this.dims, L = i < this.layers.length ? this.layers[i] : this.mtpLayer, LB = this.layerB[i], B = this.B, M = LB.mc;
     const G = this.gemmOn && this.gemm !== false && nCols === this.NC;   // full-width pass: GEMM needs transposed activations
     if (L.isFull) {
       {
@@ -990,6 +1002,31 @@ export class Qwen35Engine {
     return out;
   }
 
+  // Fill the draft block's cache for the columns of a chunk that just went through the trunk
+  // (their final hiddens are in B.x): column c pairs the trunk hidden at basePos + c with token
+  // ids[i0 + c + 1] and writes the draft cache row at basePos + c + 1. One batched pre-pass and
+  // one batched layer pass for the whole chunk, instead of one submit per column (mtpRun).
+  // Drafts only: the output never depends on it. mtpBatchFill = false restores the per-column path.
+  _mtpFillBatch(ids, i0, basePos, n) {
+    const m = Math.min(n, ids.length - i0 - 1);   // columns whose next token is in this prompt
+    if (m <= 0) return;
+    const D = this.dims, M2 = this.mtp, B = this.B;
+    for (let c = 0; c < m; c++) {
+      this.device.queue.writeBuffer(B.mEmb.buf, c * B.mEmb.stride, this._embedRowF32(ids[i0 + c + 1]));
+      this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c + 1, basePos + c + 2, m, 0]));
+    }
+    const enc = this.device.createCommandEncoder();
+    {
+      const p = enc.beginComputePass();
+      this._dMC(p, "rmsnorm_mc", M2.bgENormMC, 256, 256, m);
+      this._dMC(p, "rmsnorm_mc", M2.bgHNormMC, 256, 256, m);
+      this._dop(p, M2.projB, m);
+      p.end();
+    }
+    this._encodeLayerBatch(enc, this.layers.length, basePos + 1, m);
+    this.device.queue.submit([enc.finish()]);
+  }
+
   async prefillTokens(ids) {
     if (!this.B) this._initBatch();
     let i = 0, sinceSync = 0;
@@ -1004,8 +1041,10 @@ export class Qwen35Engine {
       for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos, NC);
       enc.copyBufferToBuffer(this.B.x.buf, (NC - 1) * this.B.x.stride, this.x, 0, this.dims.dim * 4);
       this.device.queue.submit([enc.finish()]);
-      if (this.mtp && this.mtpFill !== false)
-        for (let c = 0; c < NC; c++) if (i + c + 1 < ids.length) await this.mtpRun(c, ids[i + c + 1], basePos + c + 1, false);
+      if (this.mtp && this.mtpFill !== false) {
+        if (this.mtpBatchFill !== false) this._mtpFillBatch(ids, i, basePos, NC);
+        else for (let c = 0; c < NC; c++) if (i + c + 1 < ids.length) await this.mtpRun(c, ids[i + c + 1], basePos + c + 1, false);
+      }
       this.pos += NC;
       i += NC;
       if (++sinceSync >= 4) { await this.device.queue.onSubmittedWorkDone(); sinceSync = 0; }
@@ -1024,8 +1063,10 @@ export class Qwen35Engine {
         for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, basePos, W);
         enc.copyBufferToBuffer(this.B.x.buf, (W - 1) * this.B.x.stride, this.x, 0, this.dims.dim * 4);
         this.device.queue.submit([enc.finish()]);
-        if (this.mtp && this.mtpFill !== false)
-          for (let c = 0; c < W; c++) if (i + c + 1 < ids.length) await this.mtpRun(c, ids[i + c + 1], basePos + c + 1, false);
+        if (this.mtp && this.mtpFill !== false) {
+          if (this.mtpBatchFill !== false) this._mtpFillBatch(ids, i, basePos, W);
+          else for (let c = 0; c < W; c++) if (i + c + 1 < ids.length) await this.mtpRun(c, ids[i + c + 1], basePos + c + 1, false);
+        }
         this.pos += W; i += W;
         await this.device.queue.onSubmittedWorkDone();
       }
