@@ -24,7 +24,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { createRequire } from "module";
-import { writeSynth } from "./synth.mjs";
+import { writeSynth, SYNTH_MOE } from "./synth.mjs";
 
 const argv = process.argv.slice(2);
 const arg = (k, d) => { const i = argv.indexOf("--" + k); return i >= 0 ? argv[i + 1] : d; };
@@ -296,7 +296,7 @@ async function pageMain({ modelUrl, tokens: N, cols, ks, wg, noSplit, kvQ8 }) {
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
   const PORT = +arg("port", 8131);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-synth-"));
-  const model = arg("model") || writeSynth(path.join(tmp, "qwen35-synth.gguf"), { mtp: arg("mtp", "echo"), seed: +arg("seed", 1), eosAt: +arg("eos-at", 90) }).file;
+  const model = arg("model") || writeSynth(path.join(tmp, "qwen35-synth.gguf"), { mtp: arg("mtp", "echo"), seed: +arg("seed", 1), eosAt: +arg("eos-at", 90), ...(flag("moe") ? { moe: SYNTH_MOE } : {}) }).file;   // --moe: the qwen35moe variant
   const srv = serveRepo(PORT, { "/__synth.gguf": path.resolve(model) });
   const { chromium } = await loadPlaywright();
   const browser = await chromium.launch({ executablePath: chromiumPath(), args: GPU_ARGS });

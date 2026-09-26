@@ -174,6 +174,8 @@ export const DEFAULTS = {
 // The 27B's shapes (dim 5120, FFN 17408, 24 q / 4 kv heads of 256, 16 / 48 DeltaNet heads): every
 // matrix hits a pinned prefill-GEMM shape (engine/wgsl/gemm.js GEMM_S), so the GEMM path runs.
 // --shape 27b; fewer layers keep it loadable on SwiftShader (4 layers + draft block ~ 1.1 GB).
+// a small MoE (qwen35moe) variant: 16 experts, top-4, expert and shared FFN of 64
+export const SYNTH_MOE = { nExp: 16, K: 4, inter: 64, shInter: 64 };
 export const SHAPE_27B = { dim: 5120, inter: 17408, nH: 24, nKV: 4, hd: 256, nRot: 64, nKH: 16, nVH: 48, counter: false, layers: 4, q8out: true };
 
 // Residual-stream feature dims reserved for the answer-length counter (see buildSynthGGUF).
@@ -262,11 +264,27 @@ export function buildSynthGGUF(opts = {}) {
     const p = `blk.${i}.`;
     vec(p + "attn_norm.weight", dim, normF);
     vec(p + "post_attention_norm.weight", dim, normF);
-    mat(p + "ffn_gate.weight", inter, dim, 1, { role: "in" });
-    mat(p + "ffn_up.weight", inter, dim, 1, { role: "in" });
     // the real 27B file keeps ffn_down, ssm_out and attn_output in Q8_0 (q8out mirrors that)
     const OT = o.q8out ? GGML.Q8_0 : GGML.Q4_0;
-    mat(p + "ffn_down.weight", dim, inter, ls * 2, { role: "out", type: OT });
+    if (o.moe) {
+      // routed experts stacked [nExp][rows][cols] + router, and a shared expert with a sigmoid gate
+      const { nExp, inter: ei, shInter } = o.moe;
+      const stack = (name, rows, cols, gain, opts) => { mat(name, nExp * rows, cols, gain, opts); tensors[tensors.length - 1].shape = [nExp, rows, cols]; };
+      f32mat(p + "ffn_gate_inp.weight", nExp, dim, () => U(3 / Math.sqrt(dim)));
+      stack(p + "ffn_gate_exps.weight", ei, dim, 1, { role: "in" });
+      stack(p + "ffn_up_exps.weight", ei, dim, 1, { role: "in" });
+      stack(p + "ffn_down_exps.weight", dim, ei, ls * 2, { role: "out", type: OT });
+      if (shInter) {
+        mat(p + "ffn_gate_shexp.weight", shInter, dim, 1, { role: "in" });
+        mat(p + "ffn_up_shexp.weight", shInter, dim, 1, { role: "in" });
+        mat(p + "ffn_down_shexp.weight", dim, shInter, ls * 2, { role: "out", type: OT });
+        vec(p + "ffn_gate_inp_shexp.weight", dim, () => U(2 / Math.sqrt(dim)));
+      }
+    } else {
+      mat(p + "ffn_gate.weight", inter, dim, 1, { role: "in" });
+      mat(p + "ffn_up.weight", inter, dim, 1, { role: "in" });
+      mat(p + "ffn_down.weight", dim, inter, ls * 2, { role: "out", type: OT });
+    }
     if (full) {
       // [q | gate] per head; the counter head (0) has q = 0 and gate = 0 (sigmoid 0.5)
       mat(p + "attn_q.weight", 2 * qDim, dim, 1, { role: "in", edit: counter ? (x) => x.fill(0, 0, 2 * hd * dim) : null });
@@ -313,8 +331,9 @@ export function buildSynthGGUF(opts = {}) {
 
   // ---- serialize ----
   const w = new W();
-  const kv = [
-    ["general.architecture", GT.STR, "qwen35"],
+  const A = o.moe ? "qwen35moe" : "qwen35";   // MoE files carry their own arch name (keys aliased on load)
+  const kv0 = [
+    ["general.architecture", GT.STR, A],
     ["general.name", GT.STR, "SwarmLLM synthetic qwen35 (test only)"],
     ["general.alignment", GT.U32, 32],
     ["general.file_type", GT.U32, 2],
@@ -345,7 +364,10 @@ export function buildSynthGGUF(opts = {}) {
     ["tokenizer.ggml.eos_token_id", GT.U32, id["<|im_end|>"]],
     ["tokenizer.ggml.padding_token_id", GT.U32, id["<|endoftext|>"]],
     ["tokenizer.ggml.add_bos_token", GT.BOOL, false],
+    ...(o.moe ? [["qwen35.expert_count", GT.U32, o.moe.nExp], ["qwen35.expert_used_count", GT.U32, o.moe.K],
+      ["qwen35.expert_feed_forward_length", GT.U32, o.moe.inter], ["qwen35.expert_shared_feed_forward_length", GT.U32, o.moe.shInter || 0]] : []),
   ];
+  const kv = kv0.map(([k, t, v]) => [k.startsWith("qwen35.") ? A + k.slice(6) : k, t, v]);
   w.u32(0x46554747); w.u32(3); w.u64(tensors.length); w.u64(kv.length);
   for (const [k, t, v] of kv) writeKV(w, k, t, v);
   let off = 0;
@@ -378,6 +400,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   const out = argv[0] && !argv[0].startsWith("--") ? argv[0] : DEFAULT_OUT;
   const shape = arg("shape") === "27b" ? SHAPE_27B : {};
   const r = writeSynth(out, {
+    ...(argv.includes("--moe") ? { moe: SYNTH_MOE } : {}),
     ...shape,
     ...(arg("layers") ? { layers: +arg("layers") } : {}),
     ...(arg("dim") ? { dim: +arg("dim") } : {}),

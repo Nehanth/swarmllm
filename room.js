@@ -3,7 +3,7 @@
 import { autotuneCoop, makeTokenizer, DenseEngine, argmax, fetchModelShard, shardTensorNames, gpuSelfTest, kernelMicroTests }
   from "./engine/engine.js";
 import { f32ToF16, f16ToF32, parseGGUFHeader, ggufWeights, ggufShardBytes, GGML_EMBED, GGML_OUTPUT, GGML_FINAL_NORM,
-  ggmlLayerNames, qwen35Weights, qwen35ShardBytes, qwen35MtpBytes, qwen35LayerNames, tokenizerFromGGUF, gpuUploadEntry, streamEntryToGPU }
+  ggmlLayerNames, qwen35Weights, qwen35ShardBytes, qwen35MtpBytes, qwen35LayerNames, qwen35NamesFor, tokenizerFromGGUF, gpuUploadEntry, streamEntryToGPU }
   from "./engine/gguf.js";
 import { Qwen35Engine } from "./engine/qwen35.js";
 import { WIRE_F16, badF32, f32ToB64, packF16, unpackF16, asU16, packWire, unpackWire, asF32, b64ToF32, wireStats } from "./room/wire.js";
@@ -1152,12 +1152,12 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
     const opts = { lo: range[0], hi: range[1], hasEmbed, hasHead, mtp: hasHead };
     const total = qwen35ShardBytes(G, opts);
     const names = [];
-    for (let l = range[0]; l < range[1]; l++) names.push(...Object.values(qwen35LayerNames(l)).filter((v) => typeof v === "string"));
+    for (let l = range[0]; l < range[1]; l++) names.push(...Object.values(qwen35NamesFor(G, l)).filter((v) => typeof v === "string"));
     if (hasEmbed || hasHead) names.push(GGML_EMBED);
     if (hasHead) {
       names.push(GGML_FINAL_NORM, GGML_OUTPUT);
       const N = G.meta["qwen35.block_count"] - 1;
-      names.push(...Object.values(qwen35LayerNames(N, true)).filter((v) => typeof v === "string"), ...["eh_proj", "enorm", "hnorm", "shared_head_norm"].map((x) => `blk.${N}.nextn.${x}.weight`));
+      names.push(...Object.values(qwen35NamesFor(G, N, true)).filter((v) => typeof v === "string"), ...["eh_proj", "enorm", "hnorm", "shared_head_norm"].map((x) => `blk.${N}.nextn.${x}.weight`));
     }
     planPrefetch(M.gguf, shardInfos(G, names));
     G.streamEntry = streamWithRetry(M.gguf, streamOpts);
