@@ -126,6 +126,12 @@ Unit tests: `tests/unit/tools_test.js`, `constrain_test.js`, `prefix_test.js`.
   conversation each step but prefills only what the engine does not hold yet, keeps the model's
   own turns as their sampled ids, speculative decoding by default.
 
+- `engineModel(engine, tok, { tools })` applies the tool-name constraint while sampling, on
+  every position a speculative step checks too, so a call can only name declared tools and
+  parameters.
+- `Agent({ budget, count })`: past the token budget the oldest tool outputs are cut to a stub
+  (oldest first, never the latest, down to 75% so it does not cut every step).
+
 Tests: `tests/unit/agent_test.js` (tools and loop with a scripted model),
 `tests/e2e/agent_synth.mjs` (follow-up turns reuse the prefix and match a fresh engine; spec ==
 plain; the loop on a real engine).

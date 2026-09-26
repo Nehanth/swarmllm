@@ -95,3 +95,20 @@ Deno.test("agent stops at maxSteps", async () => {
   const A = new Agent({ generate: scripted(Array(10).fill(loop), []), tools: codingTools(ws), maxSteps: 3 });
   eq((await A.run("go")).steps, 3);
 });
+
+Deno.test("agent trims old tool outputs past its budget, oldest first, keeping the latest", async () => {
+  const big = "x".repeat(3000);
+  const ws = new MemoryWorkspace({ "a.txt": big, "b.txt": big, "c.txt": big });
+  const call = (f) => `<tool_call>\n<function=read_file>\n<parameter=path>\n${f}\n</parameter>\n</function>\n</tool_call>`;
+  const seen = [];
+  const A = new Agent({ generate: scripted([call("a.txt"), call("b.txt"), call("c.txt"), "done"], seen), tools: codingTools(ws), budget: 2500 });
+  const r = await A.run("read them");
+  eq(r.text, "done");
+  const last = seen[seen.length - 1].turns;
+  const res = last.filter((t) => t.text.startsWith("<tool_response>"));
+  eq(res.length, 3);
+  ok(res[0].text.includes("[output removed"), "oldest trimmed");
+  ok(res[2].text.includes("xxxx"), "latest kept");
+  const size = (seen[seen.length - 1].system.length + last.reduce((n, t) => n + t.text.length, 0)) / 3.5;
+  ok(size < 2500 * 1.2, `size after trimming ~${Math.round(size)} tokens`);
+});
