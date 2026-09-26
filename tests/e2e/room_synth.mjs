@@ -134,12 +134,14 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
     if (nDev > 1) await tabs.host.waitForTimeout(2000);   // stripe connections
     if (GREEDY) {   // the host's sampling preset "exact" = argmax (room/sampling.js)
       const has = await tabs.host.evaluate(() => [...(document.getElementById("ai-sampling")?.options || [])].some((o) => o.value === "exact"));
+      await tabs.host.evaluate(() => { const d = document.getElementById("host-controls"); if (d) d.open = true; });
       if (has) await tabs.host.selectOption("#ai-sampling", "exact");
       else if (!flag("greedy-hack")) throw new Error("no #ai-sampling 'exact' preset in this room build: rerun with --greedy-hack");
     }
     await tabs.host.selectOption("#ai-model", MODEL_KEY);
     await tabs.host.waitForFunction(() => !document.getElementById("ai-start").disabled, null, { timeout: 20000 });
     const tLoad = Date.now();
+    await tabs.host.evaluate(() => { const d = document.getElementById("host-controls"); if (d) d.open = true; });
     if (arg("split")) await tabs.host.selectOption("#ai-split", arg("split"));
     await tabs.host.click("#ai-start");
     log(`[${label}] start pressed`);
@@ -232,6 +234,13 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
       log(`[${label}] social: reaction count reached the host; host sees "${hostSees}"`);
       await g.fill("#ai-prompt", "");
     }
+    // --screenshot PREFIX: the host's and the first guest's whole page after the last round
+    if (arg("screenshot")) {
+      await tabs.host.setViewportSize({ width: 1280, height: 800 });
+      await tabs.host.screenshot({ path: arg("screenshot") + "-host.png" });
+      if (names[1]) { await tabs[names[1]].setViewportSize({ width: 390, height: 844 }); await tabs[names[1]].screenshot({ path: arg("screenshot") + "-guest.png" }); }
+      log(`[${label}] screenshots: ${arg("screenshot")}-host.png, -guest.png`);
+    }
     // --card PATH: open the swarm card and save a screenshot of it
     if (arg("card")) {
       await tabs.host.click("#card-btn");
@@ -242,10 +251,10 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
     // --regen: press Regenerate after the last round; with greedy sampling the answer must repeat
     if (flag("regen")) {
       const k = await tabs.host.evaluate(() => document.querySelectorAll(".m.bot .stats").length);
+      const prev = await tabs.host.evaluate(() => { const b = [...document.querySelectorAll(".m.bot")].pop(); return b.querySelector(".bubble").textContent; });
       await tabs.host.click("#regen-btn");
       await tabs.host.waitForFunction((k) => document.querySelectorAll(".m.bot .stats").length > k, k, { timeout: TIMEOUT });
       const again = await tabs.host.evaluate(() => { const b = [...document.querySelectorAll(".m.bot")].pop(); return b.querySelector(".bubble").textContent; });
-      const prev = out.rounds[out.rounds.length - 1].per.host.answer;
       out.regenSame = again === prev;
       log(`[${label}] regenerate: ${out.regenSame ? "same answer (greedy)" : "DIFFERENT answer"} \u00b7 ${await tabs.host.textContent("#ai-status")}`);
       if (GREEDY && !out.regenSame) throw new Error("regenerate under greedy sampling gave a different answer");
