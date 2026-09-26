@@ -249,6 +249,79 @@ fn attn_out(@builtin(global_invocation_id) gid: vec3<u32>) {
   ao_out[idx] = acc;
 }
 
+// --- batched attention: every column of a verify / prefill pass in one dispatch per stage ---
+// Column c (gid.y / wg.y) attends to positions [0, frame.seqLen + c) (frame is column 0's, the
+// K/V of all columns are in the cache already) and has its own score rows at c * nH * maxSeq.
+// Per (column, head, position) the arithmetic is attn_scores / attn_softmax_wg / attn_out's, so
+// the result is bit-identical to running the columns one after another.
+struct AMC { n: u32, s0: u32, s1: u32, s2: u32 };
+@group(1) @binding(0) var<storage, read> asm_q: array<f32>;
+@group(1) @binding(1) var<storage, read> asm_kc: array<f32>;
+@group(1) @binding(2) var<storage, read_write> asm_scores: array<f32>;
+@group(1) @binding(3) var<uniform> asm_mc: AMC;          // s0 = q column stride
+@compute @workgroup_size(64)
+fn attn_scores_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let col = gid.y; let h = gid.z; let t = gid.x;   // x: position, y: column, z: head
+  let seqLen = frame.seqLen + col;
+  if (t >= seqLen || h >= cfg.nH) { return; }
+  let kvH = h / (cfg.nH / cfg.nKV);
+  let qOff = col * asm_mc.s0 + h * cfg.headDim;
+  let kOff = t * cfg.kvDim + kvH * cfg.headDim;
+  var acc: f32 = 0.0;
+  for (var i: u32 = 0u; i < cfg.headDim; i++) {
+    acc += asm_q[qOff + i] * asm_kc[kOff + i];
+  }
+  asm_scores[(col * cfg.nH + h) * cfg.maxSeq + t] = acc / sqrt(f32(cfg.headDim));
+}
+
+@group(1) @binding(0) var<storage, read_write> smm2_scores: array<f32>;
+@compute @workgroup_size(256)
+fn attn_softmax_wg_mc(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wg.x; let t0 = lid.x; let n = frame.seqLen + wg.y;
+  if (h >= cfg.nH) { return; }
+  let off = (wg.y * cfg.nH + h) * cfg.maxSeq;
+  var m: f32 = -3.0e38;
+  for (var t: u32 = t0; t < n; t += 256u) { m = max(m, smm2_scores[off + t]); }
+  smw_r[t0] = m;
+  workgroupBarrier();
+  for (var s: u32 = 128u; s > 0u; s >>= 1u) {
+    if (t0 < s) { smw_r[t0] = max(smw_r[t0], smw_r[t0 + s]); }
+    workgroupBarrier();
+  }
+  let mx = smw_r[0];
+  for (var t: u32 = t0; t < n; t += 256u) { smw_e[t] = exp(smm2_scores[off + t] - mx); }
+  workgroupBarrier();
+  if (t0 == 0u) {
+    var sum: f32 = 0.0;
+    for (var t: u32 = 0u; t < n; t++) { sum += smw_e[t]; }
+    smw_r[0] = sum;
+  }
+  workgroupBarrier();
+  let sum = smw_r[0];
+  for (var t: u32 = t0; t < n; t += 256u) { smm2_scores[off + t] = smw_e[t] / sum; }
+}
+
+@group(1) @binding(0) var<storage, read> aom_scores: array<f32>;
+@group(1) @binding(1) var<storage, read> aom_vc: array<f32>;
+@group(1) @binding(2) var<storage, read_write> aom_out: array<f32>;
+@group(1) @binding(3) var<uniform> aom_mc: AMC;          // s0 = out column stride
+@compute @workgroup_size(64)
+fn attn_out_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= cfg.qDim) { return; }
+  let col = gid.y;
+  let seqLen = frame.seqLen + col;
+  let h = idx / cfg.headDim;
+  let i = idx % cfg.headDim;
+  let kvH = h / (cfg.nH / cfg.nKV);
+  let so = (col * cfg.nH + h) * cfg.maxSeq;
+  var acc: f32 = 0.0;
+  for (var t: u32 = 0u; t < seqLen; t++) {
+    acc += aom_scores[so + t] * aom_vc[t * cfg.kvDim + kvH * cfg.headDim + i];
+  }
+  aom_out[col * aom_mc.s0 + idx] = acc;
+}
+
 // --- silu-gate: g = silu(g) * u ---
 @group(1) @binding(0) var<storage, read_write> sg_g: array<f32>;
 @group(1) @binding(1) var<storage, read> sg_u: array<f32>;

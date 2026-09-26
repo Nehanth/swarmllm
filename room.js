@@ -1171,6 +1171,9 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
       // ?draftchain=1: the K drafts of a speculative step in one submit (keeps the embedding table,
       // or its first draftvocab rows, on the GPU); off by default until measured
       draftChain: new URLSearchParams(location.search).get("draftchain") === "1",
+      // ?fuse=0: the unfused kernels (attention glue, DeltaNet delta + gated norm, batched
+      // attention) for A/B timing; both give the same bits, so devices may differ
+      ...(new URLSearchParams(location.search).get("fuse") === "0" ? { attnGlue: false, dnFuse: false, attnMC: false } : {}),
     });
   } else if (M.kind === "gguf") {
     aiStatus("reading model index\u2026");
