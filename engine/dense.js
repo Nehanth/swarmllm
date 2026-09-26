@@ -36,7 +36,8 @@ export class DenseEngine {
 
     const W = weights || weightsFromSafetensors(tensors, { lo, hi, hasEmbed, hasHead });
 
-    const mod = device.createShaderModule({ code: WGSL + coopWGSL(coopWG, coopRows, 64, 4, 4, await probeUnpack(device)) });
+    this.rowsB = 4;   // rows per workgroup of the 4-column batched kernels (ROWSB below), NOT coopRows
+    const mod = device.createShaderModule({ code: WGSL + coopWGSL(coopWG, coopRows, 64, 4, this.rowsB, await probeUnpack(device)) });
     const C = GPUShaderStage.COMPUTE;
     const layout0 = device.createBindGroupLayout({
       entries: [
@@ -155,7 +156,7 @@ export class DenseEngine {
       const pipe = xB ? base + "_b" : base;
       const shp = xB ? this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4) : this._shapeB(dOut, dIn, 0, 0);
       const bufs = wg2.kind === "f32" ? [wg2.buf, wu2.buf, x, y, shp] : [wg2.qs, wg2.sc, wu2.qs, wu2.sc, x, y, shp];
-      return { pipe, wgs: Math.ceil(dOut / this.coopRows), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      return { pipe, wgs: Math.ceil(dOut / (xB ? this.rowsB : this.coopRows)), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
     this._guOp = guOp;
     const bgNorm = (x, w, y) => this._bg(this.pipes.rmsnorm, 1, [x, w.buf, y, this.nBufDim]);
@@ -386,7 +387,7 @@ export class DenseEngine {
       const pipe = base + "_coop_b";
       const shp = this._shapeB(dOut, dIn, xB.stride / 16, yB.stride / 4);
       const bufs = w.kind === "f32" ? [w.buf, xB.buf, yB.buf, shp] : [w.qs, w.sc, xB.buf, yB.buf, shp];
-      return { pipe, wgs: Math.ceil(dOut / this.coopRows), bg: this._bg(this.pipes[pipe], 1, bufs) };
+      return { pipe, wgs: Math.ceil(dOut / this.rowsB), bg: this._bg(this.pipes[pipe], 1, bufs) };
     };
     // per-layer batched resources
     this.layerB = this.layers.map((L) => {
