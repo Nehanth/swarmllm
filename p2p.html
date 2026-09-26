@@ -276,6 +276,76 @@
   .m { max-width: 72%; }
   #ai-row { padding: 12px max(16px, 3vw); padding-bottom: max(12px, env(safe-area-inset-bottom)); border-top: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 85%, transparent); }
   #ai-prompt { padding: 13px 20px; font-size: 15px; }
+
+  /* ---- model ladder ---- */
+  #ai-ladder { display: flex; flex-wrap: wrap; gap: 5px; }
+  #ai-ladder:empty { display: none; }
+  .rung { font-family: var(--mono); font-size: 10.5px; padding: 3px 9px; border-radius: 100px; color: var(--muted); background: transparent; }
+  .rung b { font-weight: 500; color: var(--faint); }
+  .rung.ok { color: var(--text); }
+  .rung.ok b { color: var(--accent); }
+  .rung.sel { border-color: var(--accent); color: var(--accent); }
+  #ai-panel.loading #ai-ladder, #ai-panel.online #ai-ladder { display: none; }
+  #ai-redeal { width: 100%; font-family: var(--mono); font-size: 12px; border-radius: 100px; border-color: var(--warn); color: var(--warn); }
+  #ai-redeal[hidden], #redeal-why[hidden] { display: none; }
+  #redeal-why { font-family: var(--mono); font-size: 10.5px; color: var(--warn); }
+  .host-row { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .host-row input { width: auto; padding: 0; }
+
+  /* ---- the prompt box, stop, tools ---- */
+  #ai-prompt { flex: 1; resize: none; min-height: 46px; max-height: 160px; line-height: 1.4; font-family: var(--sans); background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 23px; overflow-y: auto; }
+  #ai-prompt:focus { outline: none; border-color: var(--accent); }
+  #ai-row { align-items: flex-end; }
+  #ai-send.stop { background: var(--err); border-color: var(--err); }
+  #ai-send.stop::before { content: ""; display: inline-block; width: 8px; height: 8px; background: currentColor; border-radius: 1px; margin-right: 8px; vertical-align: 0; }
+  #chat-tools { display: flex; align-items: center; gap: 6px; padding: 6px max(16px, 3vw) 0; flex-wrap: wrap; }
+  #chat-tools[hidden] { display: none; }
+  #chat-tools button { font-family: var(--mono); font-size: 10.5px; padding: 4px 11px; border-radius: 100px; background: transparent; color: var(--muted); }
+  #chat-tools button:hover { color: var(--text); }
+  #chat-tools button.on { color: var(--accent); border-color: var(--accent); }
+  #chat-tools button[hidden] { display: none; }
+  #ctx-meter { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+  #ctx-meter.warn { color: var(--warn); }
+  .bubble.drafts { white-space: pre-wrap; font-family: var(--mono); font-size: 12.5px; }
+  .bubble .dr { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); border-radius: 3px; }
+  details.think { margin: 2px 0 8px; padding: 6px 10px; border-left: 2px solid var(--faint); color: var(--muted); font-size: 13px; }
+  details.think summary { cursor: pointer; font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; }
+
+  /* ---- the swarm map: the chain, what each device holds, a pulse per lap ---- */
+  #swarm-map { padding: 10px max(16px, 3vw) 8px; border-bottom: 1px solid var(--border); --lap: 600ms; }
+  #swarm-map[hidden] { display: none; }
+  .sm-track { display: flex; align-items: center; gap: 0; overflow-x: auto; scrollbar-width: none; }
+  .sm-track::-webkit-scrollbar { display: none; }
+  .sm-node { flex: none; display: grid; grid-template-columns: auto auto; column-gap: 6px; align-items: center; padding: 5px 10px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); font-family: var(--mono); font-size: 11px; }
+  .sm-node.host { border-color: var(--text); }
+  .sm-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); grid-row: span 3; }
+  .sm-name { color: var(--text); max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sm-sub, .sm-ms { color: var(--muted); font-size: 9.5px; }
+  .sm-ms { color: var(--accent); }
+  .sm-link { flex: 1 0 22px; height: 2px; background: var(--border); position: relative; overflow: hidden; margin: 0 2px; }
+  .sm-link.back { flex: 0 0 22px; border-radius: 0 6px 6px 0; }
+  .sm-link i { position: absolute; top: 0; left: -30%; width: 30%; height: 100%; background: var(--accent); opacity: 0; }
+  #swarm-map.live .sm-dot { animation: smflash var(--lap) infinite; animation-delay: calc(var(--lap) * var(--i) / var(--n)); }
+  #swarm-map.live .sm-link i { animation: smrun var(--lap) infinite linear; }
+  @keyframes smflash { 0%, 100% { background: var(--faint); box-shadow: none; } 8% { background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 25%, transparent); } 30% { background: var(--accent); box-shadow: none; } }
+  @keyframes smrun { 0% { left: -30%; opacity: 1; } 100% { left: 100%; opacity: 1; } }
+  .sm-meta { font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin-top: 6px; }
+  @media (prefers-reduced-motion: reduce) { #swarm-map.live .sm-dot, #swarm-map.live .sm-link i { animation: none; } }
+
+  /* ---- share sheet and the room-over card ---- */
+  #share-btn { font-family: var(--mono); font-size: 10.5px; padding: 3px 10px; border-radius: 100px; margin-left: auto; }
+  .overlay { position: fixed; inset: 0; z-index: 70; display: flex; align-items: center; justify-content: center; background: color-mix(in srgb, var(--text) 35%, transparent); backdrop-filter: blur(4px); padding: 16px; }
+  .overlay[hidden] { display: none; }
+  .sheet { background: var(--panel); border: 1px solid var(--border); border-radius: 22px; padding: 22px 24px; width: min(360px, 100%); display: flex; flex-direction: column; align-items: center; gap: 12px; box-shadow: 0 20px 60px rgba(20,21,26,0.25); text-align: center; }
+  .sheet .k { font-family: var(--mono); font-size: 10px; letter-spacing: 0.2em; color: var(--muted); }
+  #share-code { font-family: var(--mono); font-size: 30px; letter-spacing: 8px; color: var(--accent); }
+  #share-qr svg { display: block; border-radius: 10px; }
+  #share-url { font-family: var(--mono); font-size: 11px; color: var(--muted); word-break: break-all; }
+  .sheet .row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  .sheet .row button { font-family: var(--mono); font-size: 12px; border-radius: 100px; padding: 8px 16px; }
+  .sheet .row button[hidden] { display: none; }
+  #room-over-why { font-size: 14px; color: var(--muted); }
+  #join-status.warn { color: var(--warn); max-width: 420px; text-align: center; }
   @media (max-width: 820px) {
     header { padding: 10px 14px; }
     .tagline, #room-badge { display: none !important; }
@@ -346,7 +416,7 @@
 
 <div id="room-screen">
   <aside id="side">
-    <div id="side-room"><div class="side-k">ROOM</div><div id="side-code" title="click to copy">----</div><div class="side-hint">share this code</div></div>
+    <div id="side-room"><div class="side-k">ROOM</div><div id="side-code" title="share this room">----</div><div class="side-hint">share this code</div><button id="share-btn" type="button">link / QR</button></div>
     <div class="side-k">DEVICES</div>
     <div id="peers"></div>
     <div id="ai-panel">
@@ -364,8 +434,11 @@
         <div id="need-bar"><div id="need-fill"></div></div>
         <div id="need-text">needs ~0.8 GB · room gives 0 GB</div>
       </div>
+      <div id="ai-ladder" aria-label="what this room can run"></div>
       <span id="ai-status">split across every device in the room</span>
       <button id="ai-start" class="primary">start</button>
+      <div id="redeal-why" hidden></div>
+      <button id="ai-redeal" type="button" hidden>re-deal the layers</button>
     </div>
     <div id="host-controls" class="host-section" hidden>
       <label for="ai-visibility">who sees the chat</label>
@@ -375,6 +448,11 @@
         <option value="asker">only whoever asked</option>
       </select>
       <div class="side-hint">every device still computes the answer; this only decides who sees the text</div>
+      <label for="ai-persona">answer style</label>
+      <select id="ai-persona" class="host-select"></select>
+      <label for="ai-sampling">sampling</label>
+      <select id="ai-sampling" class="host-select"></select>
+      <label class="host-row"><input type="checkbox" id="ai-thinking"> think before answering (Qwen)</label>
     </div>
       <div id="ai-loading" style="display:none">
         <div id="ldg-title"></div>
@@ -394,12 +472,35 @@
       <div id="lc-rows"></div>
       <div class="lc-note">each device fetches only its own layers, in step with the room</div>
     </div>
+    <div id="swarm-map" hidden><div class="sm-track"></div><div class="sm-meta"></div></div>
     <div id="ai-output"></div>
-    <div id="ai-row"><input id="ai-prompt" placeholder="ask the swarm…"><button id="ai-send" class="primary">Send</button></div>
+    <div id="chat-tools" hidden>
+      <button id="new-chat" type="button" hidden title="forget the conversation">new chat</button>
+      <button id="draft-view" type="button" title="mark the words the draft head guessed right">show drafts</button>
+      <button id="export-chat" type="button" title="save the chat as markdown">save</button>
+      <span id="ctx-meter"></span>
+    </div>
+    <div id="ai-row"><textarea id="ai-prompt" rows="1" placeholder="ask the swarm…" enterkeyhint="send"></textarea><button id="ai-send" class="primary">Send</button></div>
   </main>
 </div>
 
+<div id="share" class="overlay" hidden>
+  <div class="sheet" role="dialog" aria-label="share this room">
+    <div class="k">SCAN TO JOIN</div>
+    <div id="share-qr"></div>
+    <div id="share-code"></div>
+    <div id="share-url"></div>
+    <div class="row"><button id="share-copy" type="button">copy link</button><button id="share-native" type="button" hidden>share…</button><button id="share-close" type="button">close</button></div>
+  </div>
+</div>
+<div id="room-over" class="overlay" hidden>
+  <div class="sheet" role="alertdialog" aria-label="the room is over">
+    <div class="k">ROOM OVER</div>
+    <div id="room-over-why"></div>
+    <div class="row"><button id="room-over-new" type="button" class="primary">start a new room</button></div>
+  </div>
+</div>
 <div id="toasts"></div>
-<script type="module" src="./room.js"></script>
+<script type="module" src="/room.js"></script>
 </body>
 </html>

@@ -1,0 +1,6 @@
+{
+  "rewrites": [
+    { "source": "/room", "destination": "/p2p.html" },
+    { "source": "/r/:code", "destination": "/p2p.html" }
+  ]
+}

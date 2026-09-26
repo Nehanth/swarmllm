@@ -33,7 +33,9 @@ SwarmLLM runs large language models across the devices in a room, in their brows
 
 ## Quick start
 
-**Use it:** open [swarmllm.ai/room](https://swarmllm.ai/room), create a room, share the code, pick a model, start. Every device downloads only its layers (cached for next time).
+**Use it:** open [swarmllm.ai/room](https://swarmllm.ai/room), create a room, share the link or QR code (`swarmllm.ai/r/ABCD` joins with no typing), and start the model the ladder says your room can run. Every device downloads only its layers (cached for next time).
+
+**In the room:** it's a multi-turn chat that remembers the conversation (each follow-up prefills only what's new), with Stop, a context meter and "new chat". The swarm map shows the chain live: which device holds which layers, how a lap splits into GPU and wire time, and draft acceptance. **Show drafts** tints the words the draft head guessed and the whole swarm confirmed in one lap. The host picks an answer style (concise, ELI5, pirate, haiku, "the swarm speaks"), a sampling preset (greedy for reproducible answers) and thinking mode. If a device leaves, the room says so within a lap and **re-deal** splits the model over whoever is still there. Devices without WebGPU join as ask-only guests.
 
 **Run it locally:**
 
@@ -50,6 +52,8 @@ npm run test:gpu      # golden tests on Qwen3 0.6B
 npm run test:q38      # 27B suites incl. speculative-vs-plain equality
 npm run bench:q38     # decode / prefill tok/s
 ```
+
+**No GPU?** Headless Chromium runs WebGPU on SwiftShader, so the real engine and the real multi-tab room run on any machine with a tiny synthetic model (see `tests/e2e/synth.mjs`, `engine_synth.mjs`, `room_synth.mjs`): slow, but enough to check behaviour and bit-exactness end to end.
 
 ## How it works
 
