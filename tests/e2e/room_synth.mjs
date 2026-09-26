@@ -120,7 +120,7 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
   for (const n of names) tabs[n] = await (shared || await makeCtx()).newPage();
   const errs = Object.fromEntries(names.map((n) => [n, []]));
   for (const [n, p] of Object.entries(tabs)) {
-    p.on("console", (m) => { if (m.type() === "error" || m.type() === "warning") errs[n].push(`${m.type()}: ${m.text().slice(0, 240)}`); });
+    p.on("console", (m) => { if ((m.type() === "error" || m.type() === "warning") && !/Could not connect to peer/.test(m.text())) errs[n].push(`${m.type()}: ${m.text().slice(0, 240)}`); });
     p.on("pageerror", (e) => errs[n].push("pageerror: " + String(e).slice(0, 240)));
   }
   const status = (p) => p.evaluate(() => [document.getElementById("ai-status")?.textContent, document.getElementById("ldg-sub")?.textContent].join(" | "));
@@ -227,6 +227,18 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
         const split = await tabs.host.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => /layer split/.test(t)).pop());
         log(`[${label}] re-dealt after round ${r}: ${split} \u00b7 ${(stats.requests || 0) - req0} range requests to the model host during the re-deal`);
         for (const [n, p] of Object.entries(tabs)) { const w = await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => /came from devices/.test(t)).pop()); if (w) log(`[${label}] ${n}: ${w}`); }
+      }
+      // --reload-after R: reload the host's tab after round R and resume the room from the join
+      // screen; the guests wait for it, it deals the layers again, the conversation continues
+      if (arg("reload-after") !== undefined && +arg("reload-after") === r && r + 1 < ROUNDS) {
+        const t0 = Date.now();
+        await tabs.host.reload();
+        await tabs.host.waitForSelector("#resume-btn:not([hidden])", { timeout: 30000 });
+        await tabs.host.click("#resume-btn");
+        await tabs.host.waitForFunction(() => /cluster online/.test(document.getElementById("ai-status").textContent), null, { timeout: TIMEOUT });
+        await tabs.host.evaluate(() => { const d = document.getElementById("host-controls"); if (d) d.open = true; });
+        for (const p of Object.values(tabs).slice(1)) await p.waitForFunction(() => document.getElementById("ai-row").style.display === "flex", null, { timeout: 60000 });
+        log(`[${label}] host reloaded and resumed after round ${r} in ${((Date.now() - t0) / 1000).toFixed(1)}s: ${await tabs.host.textContent("#ai-status")}`);
       }
       if (flag("new-chat") && r + 1 < ROUNDS) {
         await tabs.host.click("#new-chat").catch((e) => log(`[${label}] new chat: ${String(e).slice(0, 100)}`));

@@ -44,6 +44,7 @@ function toast(text) {
 }
 function mascot() {}
 const PREFIX = "swarmllm-room-";
+const HOST_KEY = "swarm-host";   // localStorage: what a host needs to resume its room after a reload
 const rand = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n)))
   .map(b => "ABCDEFGHJKMNPQRSTVWXYZ23456789"[b % 30]).join("");
 
@@ -327,7 +328,7 @@ function onData(from, d) {
         aiRejoin(from, d.name);
         if (d.died?.during && d.died.ago > 2) log("swarm", `${d.name} came back: its tab was killed ${d.died.ago} s ago while ${d.died.during}. Phones kill background tabs; keep the screen on.`);
         if (ai.visibility !== "all") sendTo(from, { t: "ai-visibility", mode: ai.visibility });
-        aiWelcome(from);
+        if (!d.back) aiWelcome(from); else offerRedealForNewcomers();
       }
       break;
     case "leaving":   // the tab is closing: treat the link as gone now instead of waiting for ICE to time out
@@ -423,9 +424,9 @@ const stepGB = (d) => { const i = $("join-gb"); const lo = parseFloat(i.min) || 
 $("gb-minus").addEventListener("click", () => stepGB(-1));
 $("gb-plus").addEventListener("click", () => stepGB(1));
 // --- join / create ---
-async function start(create) {
-  myName = $("name-input").value.trim() || (create ? "host" : "peer") + "-" + rand(2);
-  const code = create ? rand(4) : $("code-input").value.trim().toUpperCase();
+async function start(create, resume = null) {
+  myName = resume?.name || $("name-input").value.trim() || (create ? "host" : "peer") + "-" + rand(2);
+  const code = resume?.code || (create ? rand(4) : $("code-input").value.trim().toUpperCase());
   if (!code) { $("join-status").textContent = "enter a room code"; return; }
   $("create-btn").disabled = $("join-btn").disabled = true;
   $("join-status").textContent = "connecting to signaling…";
@@ -450,7 +451,7 @@ async function start(create) {
   peer.on("open", () => {
     isHost = create;
     roomCode = code;
-    if (create) { enterRoom(); return; }
+    if (create) { enterRoom(); if (resume) resumeHost(resume); return; }
     // joiner: connect to host
     $("join-status").textContent = "joining room " + code + "…";
     const conn = peer.connect(PREFIX + code, { reliable: true });
@@ -485,6 +486,14 @@ async function start(create) {
   });
 
   peer.on("error", (err) => {
+    // resuming: the old tab's id is still registered until the signaling server notices it left
+    if (resume && err.type === "unavailable-id" && (resume.tries = (resume.tries || 0) + 1) < 30) {
+      $("join-status").textContent = `waiting for room ${code} to be free again (the old tab is still registered)…`;
+      try { peer.destroy(); } catch {}
+      peer = null;
+      setTimeout(() => start(true, resume), 3000);
+      return;
+    }
     if (err.type === "unavailable-id")
       $("join-status").textContent = "that code is already hosting — pick Join instead";
     else if (err.type === "peer-unavailable")
@@ -553,6 +562,16 @@ $("share").addEventListener("click", (e) => { if (e.target === $("share")) $("sh
 $("share-copy").addEventListener("click", copyRoomLink);
 $("share-native").addEventListener("click", () => navigator.share?.({ title: "Join my SwarmLLM room", text: `Room ${roomCode}: lend this device's GPU to a model we run together`, url: roomLink() }).catch(() => {}));
 $("room-over-new").addEventListener("click", () => { location.href = location.pathname.startsWith("/r/") ? "/room" : location.pathname.replace(/\?.*$/, ""); });
+// a host whose tab reloaded (or closed by accident) can pick its room back up for 15 minutes
+{
+  const r = savedHost();
+  if (r && !codeFromLocation(location.pathname, location.search, location.hash)) {
+    const mins = Math.max(1, Math.round((Date.now() - r.t) / 60000));
+    $("resume-btn").hidden = false;
+    $("resume-btn").textContent = `resume room ${r.code} (you were its host ${mins} min ago)`;
+    $("resume-btn").addEventListener("click", () => { keepAwake(); $("resume-btn").disabled = true; start(true, r); });
+  }
+}
 // a link with a room code fills it in and joins once the GPU probe is done
 const linkCode = codeFromLocation(location.pathname, location.search, location.hash);
 if (linkCode) {
@@ -1351,6 +1370,7 @@ function aiMaybeReady() {
   pushMap(0, null, false, true);
   offerRedealForNewcomers();
   setTimeout(nextQueued, 0);
+  saveHost();
   mascot("Cluster online! Ask anything. Everyone in the room can.");
 }
 
@@ -1803,6 +1823,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
   else ai.transcript.push({ name: asker, text, reply, stats, mid });
   if (ai.transcript.length > 50) ai.transcript.shift();
   setCtx(ctx.used, ctx.max);
+  saveHost();
   if (!failed) aiStatus(`ready — prefill ${prefilled} tok in ${(tPre / 1000).toFixed(1)}s${ai.chain.length ? ` / ${preFrames} frame${preFrames === 1 ? "" : "s"}` : ""}${reused ? ` (${reused} reused)` : ""}, ${stats}`);
   mascot("Done. Anyone in the room can ask the next one.");
   ai.busy = false;
@@ -1856,6 +1877,7 @@ function aiNewChat() {
   broadcastAll({ t: "ai-reset", by: myName });
   setCtx(0);
   toast("new chat: the swarm forgot the conversation");
+  saveHost();
 }
 function clearChat() {
   $("ai-output").innerHTML = "";
@@ -1906,15 +1928,77 @@ async function workerFrame(d) {
 }
 
 // the host's tab closed: the room is over for everyone else
+// A host tab that reloads can resume the room (it keeps the conversation in localStorage), so the
+// others wait a minute and keep knocking before calling the room over.
+const HOST_WAIT_MS = 60000;
 function hostGone() {
   if (ai.role === "host") return;
   failWaiters(new Error("the host left"));
-  ai.engine = null;
   $("ai-row").style.display = "none";
   $("room-over").hidden = false;
-  $("room-over-why").textContent = "The host's tab closed, and the host holds the conversation and the model's first and last layers, so this room can't answer any more.";
-  aiStatus("the host left; this room is over");
-  mascot("The host left. Start a new room?");
+  $("room-over-why").textContent = "The host's tab closed. Waiting a minute in case it comes back (a reloaded host resumes the room)…";
+  aiStatus("the host left; waiting for it to come back…");
+  const t0 = Date.now();
+  clearInterval(hostGone.timer);
+  hostGone.timer = setInterval(() => {
+    if (conns.has(PREFIX + roomCode)) { clearInterval(hostGone.timer); return; }
+    if (Date.now() - t0 > HOST_WAIT_MS) {
+      clearInterval(hostGone.timer);
+      ai.engine = null;
+      $("room-over-why").textContent = "The host didn't come back. The host holds the conversation and the model's first and last layers, so this room can't answer any more.";
+      aiStatus("the host left; this room is over");
+      mascot("The host left. Start a new room?");
+      return;
+    }
+    const conn = peer.connect(PREFIX + roomCode, { reliable: true });
+    conn.on("open", () => {
+      if (conns.has(PREFIX + roomCode)) { try { conn.close(); } catch {} return; }
+      clearInterval(hostGone.timer);
+      wire(conn, "host", undefined, true);
+      conn.send({ t: "hello", name: myName, meta: myMeta, v: PROTOCOL, back: 1 });
+      ai.hostId = PREFIX + roomCode;
+      $("room-over").hidden = true;
+      aiStatus("the host is back; waiting for it to deal the layers…");
+      toast("the host is back");
+    });
+    conn.on("error", () => {});
+  }, 3000);
+}
+
+// ---- the host's side of resuming: what it keeps, and picking the room back up after a reload ----
+function saveHost() {
+  if (ai.role !== "host" || !roomCode) return;
+  try {
+    localStorage.setItem(HOST_KEY, JSON.stringify({ code: roomCode, name: myName, model: ai.model || null, turns: ai.conv.turns,
+      transcript: ai.transcript.slice(-20), settings: ai.settings, peers: ai.chainNames || [], split: $("ai-split").value, t: Date.now() }));
+  } catch {}
+}
+function savedHost() {
+  try { const r = JSON.parse(localStorage.getItem(HOST_KEY) || "null"); return r && Date.now() - r.t < 15 * 60 * 1000 ? r : null; } catch { return null; }
+}
+function resumeHost(r) {
+  ai.conv = { turns: Array.isArray(r.turns) ? r.turns : [] };
+  ai.transcript = Array.isArray(r.transcript) ? r.transcript : [];
+  if (r.settings) {
+    ai.settings = { ...ai.settings, ...r.settings };
+    for (const [id, k] of [["ai-persona", "persona"], ["ai-sampling", "sampling"], ["ai-length", "length"]]) if (ai.settings[k]) $(id).value = ai.settings[k];
+    $("ai-thinking").checked = !!ai.settings.thinking;
+  }
+  if (r.split) $("ai-split").value = r.split;
+  for (const it of ai.transcript) { chatUser(it.name, it.text); chatBotStart(it.mid); botEl.pieces = [{ t: it.reply || "", d: 0 }]; chatBotEnd(null, it.stats); }
+  if (!r.model || !MODELS[r.model]) return;
+  $("ai-model").value = r.model; modelTouched = true;
+  // start the model again once the devices that held layers are back, or after 25 s regardless
+  const want = new Set(r.peers || []), t0 = Date.now();
+  aiStatus(want.size ? `resumed: waiting for ${[...want].join(", ")} to come back…` : "resumed: loading the model again…");
+  const tick = setInterval(() => {
+    const back = [...conns.values()].filter((c) => want.has(c.name)).length;
+    if (back >= want.size || Date.now() - t0 > 25000) {
+      clearInterval(tick);
+      log("swarm", `resumed room ${roomCode}: ${back} of ${want.size} devices back, dealing the layers again; the conversation continues`);
+      aiStart(r.model);
+    }
+  }, 500);
 }
 
 // ---- messages: worker, guest and host ----
@@ -2116,6 +2200,7 @@ for (const [k, v] of Object.entries(SAMPLING)) $("ai-sampling").add(new Option(v
 function styleChanged() {
   ai.settings = { persona: $("ai-persona").value, sampling: $("ai-sampling").value, thinking: $("ai-thinking").checked, length: $("ai-length").value };
   broadcastAll({ t: "ai-style", ...ai.settings });
+  saveHost();
 }
 for (const id of ["ai-persona", "ai-sampling", "ai-thinking", "ai-length"]) $(id).addEventListener("change", styleChanged);
 $("cache-clear").addEventListener("click", async (ev) => {

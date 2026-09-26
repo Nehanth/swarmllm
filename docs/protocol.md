@@ -57,7 +57,12 @@ The host owns the conversation: `{system, turns}` rendered to ChatML ids by `roo
 | Message | Direction | Meaning |
 |---|---|---|
 | `hello {name, meta, v, died?}` | both ways on every link | `v` is the protocol version; a mismatch gets `bye {reason}` and the newcomer is told to reload. `died` is a joiner's crumb from a tab that was killed (surfaced on the host) |
+| `hello {…, back: 1}` | returning guest → host | a device reconnecting to a host that resumed the room (it keeps its transcript, so no `ai-history`) |
 | `leaving` | all → all | sent on `pagehide`; the receiver closes the link at once instead of waiting for ICE to notice (tens of seconds), so a departure mid-answer fails within a lap |
+
+## Resuming a room
+
+The host keeps `{code, name, model, turns, transcript, settings, peers}` in `localStorage` after every answer. A reloaded host page offers "resume room ABCD" for 15 minutes: it claims the same PeerJS id (retrying while the old registration expires), restores the conversation, waits up to 25 s for the devices that held layers and deals again; the next question re-prefills the history. When the host link closes, the other devices keep knocking on the host id every 3 s for a minute before calling the room over.
 
 ## Versioning
 
