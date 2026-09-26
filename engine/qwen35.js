@@ -415,6 +415,9 @@ export class Qwen35Engine {
         const { nExp, K, inter: ei, norm } = this.moe, MB = this.moeB;
         R.moe = true;
         R.router = up(L.router); R.expGate = up(L.expGate); R.expUp = up(L.expUp); R.expDown = up(L.expDown);
+        const lim = device.limits.maxStorageBufferBindingSize;
+        for (const [w, n] of [[R.expGate, "ffn_gate_exps"], [R.expUp, "ffn_up_exps"], [R.expDown, "ffn_down_exps"]])
+          if (w.qs.size > lim) throw new Error(`${n} is ${(w.qs.size / 2 ** 20).toFixed(0)} MB, over this device's ${(lim / 2 ** 20).toFixed(0)} MB storage-binding limit (a Q4_0 file needs less)`);
         const gk = moeKind(R.expGate, "gate/up");
         if (moeKind(R.expUp, "gate/up") !== gk) throw new Error("MoE gate and up experts must share a format");
         R.guPipe = "moe_gu_" + gk; R.dnPipe = "moe_dn_" + moeKind(R.expDown, "down");

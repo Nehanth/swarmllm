@@ -136,6 +136,36 @@ Tests: `tests/unit/agent_test.js` (tools and loop with a scripted model),
 `tests/e2e/agent_synth.mjs` (follow-up turns reuse the prefix and match a fresh engine; spec ==
 plain; the loop on a real engine).
 
+## Mixture of experts (Qwen3.5 / 3.6 MoE, `qwen35moe`)
+
+The engine runs the MoE variant of the same hybrid architecture: every layer's FFN is 256 routed
+experts (top-8) plus one shared expert, the rest (DeltaNet, gated attention, MTP) unchanged.
+Target: Qwen3.6-35B-A3B (hidden 2048, 40 layers, expert and shared FFN 512, 16 q / 2 kv heads);
+the same code reads Qwen3.5-122B-A10B. Architecture notes: `docs/research/moe-2026-09.md`.
+
+- `engine/wgsl/moe.js`: `moe_router` (softmax over all experts, top-k, renormalised; ties to the
+  lower index), `moe_gu_{q4,q8}` (the chosen expert's gate and up rows, SiLU, fused),
+  `moe_dn_{q4,q8}`, `moe_combine` (fixed-order weighted sum + sigmoid-gated shared expert into
+  the residual). Experts keep the ordinary Q4_0 / Q8_0 layout with nExp * dOut rows; the expert
+  id is read on the GPU, so routing needs no readback.
+- Every (token, slot) pair runs the same arithmetic in one-token and batched passes, so
+  speculative decoding and batched prefill stay exact.
+- Loader: `qwen35moe.*` keys are aliased to `qwen35.*`; 3-D expert tensors load as matrices.
+- Files: the public Q8_0 GGUFs (~37 GB) or bartowski's "Q4_0" (~21 GB; a few tensors are Q4_1 /
+  Q6_K and get re-quantised to Q8_0 on load). For two 24 GB Macs, the Q4_0 file.
+- A stacked expert tensor is 134 MB (Q4_0) / 268 MB (Q8_0): the device must allow storage
+  bindings that large (Macs do; phones are capped at 256 MB, fine for Q4_0). The engine says so
+  when it does not; windowed bindings would lift it.
+
+Tests: `tests/e2e/moe_kernels.mjs` (kernels vs a float64 reference, batched == single),
+`tests/e2e/moe_synth.mjs` (each layer's MoE FFN in the engine vs a float64 reference from the
+file's weights, ~4e-7; spec == plain; 7-token draft runs; batched prefill bit-identical to one
+token at a time), `engine_synth.mjs --moe` (the whole suite, split == solo, on a MoE model).
+
+Not done yet: expert-parallel splitting across devices (today a room splits MoE models by layers
+like the dense ones), SSD spill of cold experts, grouping a batch's tokens by expert (prefill reads
+each chosen expert once per token today), timing on real hardware.
+
 ## Also in this branch
 
 - The kernels branch work: fused attention glue, fused DeltaNet delta + gated norm, batched
