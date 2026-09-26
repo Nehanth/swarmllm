@@ -10,7 +10,9 @@ import { WIRE_F16, badF32, f32ToB64, packF16, unpackF16, asU16, packWire, unpack
 import { esc, md, mdChat } from "./room/markdown.js";
 import { pickSampler, SAMPLING } from "./room/sampling.js";
 import { chatRecipients } from "./room/visibility.js";
-import { MODELS, NEED_GB, MAX_SEQ, MAX_NEW, MAX_NEW_THINKING, MIN_ROOM } from "./room/models.js";
+import { MODELS, NEED_GB, MAX_SEQ, MAX_SEQ_LONG, MAX_NEW, MAX_NEW_THINKING, MIN_ROOM } from "./room/models.js";
+// the context window of the loaded engine (8192 for the 27B family, 2048 otherwise)
+const ctxMax = () => ai.engine?.maxSeq || MAX_SEQ;
 import { makeLink, attachWire, wireReady, sendFrame, PROTOCOL } from "./room/transport.js";
 import { PERSONAS, specials, fitContext, reusablePrefix } from "./room/conversation.js";
 import { planSplit, planForSpeed, ladder, bestFit, codeFromLocation } from "./room/plan.js";
@@ -1159,7 +1161,7 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
     aiStatus("building GPU pipelines (compiling shaders)\u2026");
     ai.engine = await Qwen35Engine.create({
       device: ai.device, meta: G.meta, weights, vocab: G.tensors[GGML_EMBED]?.shape?.[0],
-      layerRange: range, hasEmbed, hasHead, maxSeq: MAX_SEQ,
+      layerRange: range, hasEmbed, hasHead, maxSeq: MAX_SEQ_LONG,
       coopWG: ai.tune?.wg, coopRows: ai.tune?.rows,
       // 16 batch columns: prefill passes go through the row-stationary GEMM
       // (docs/research/prefill-gemm-v2.md). Speculative verifies are <= 8
@@ -1731,7 +1733,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
   let tDecode = 0, tPre = 0, prefilled = 0, reused = 0, preFrames = 0, first = null, copied = 0;
   try {
     // the conversation with this question, trimmed to fit, and how much the caches already hold
-    const fit = fitContext(ai.tok, { system: persona.system, turns: cont ? [...ai.conv.turns.slice(0, -1), { ...lastTurn, open: true }] : [...ai.conv.turns, { role: "user", text, name: asker }], thinking }, MAX_SEQ, MIN_ROOM);
+    const fit = fitContext(ai.tok, { system: persona.system, turns: cont ? [...ai.conv.turns.slice(0, -1), { ...lastTurn, open: true }] : [...ai.conv.turns, { role: "user", text, name: asker }], thinking }, ctxMax(), MIN_ROOM);
     dropped = fit.dropped;
     ai.conv.turns = fit.turns;
     reused = reusablePrefix(ai.fed, fit.ids);
@@ -1749,7 +1751,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
     ai.xAt = null;
     prefilled = ids.length;
     const cap = thinking ? MAX_NEW_THINKING : (ANSWER_LEN[ai.settings.length] ?? MAX_NEW);
-    const maxNew = Math.min(MAXNEW_PARAM || cap, MAX_SEQ - fit.ids.length);
+    const maxNew = Math.min(MAXNEW_PARAM || cap, ctxMax() - fit.ids.length);
     aiStatus(reused ? `prefill: ${ids.length} new tokens (${reused} already in the room's caches)…` : `prefill: ${ids.length} tokens…`);
     const t0Pre = performance.now();
     ai.frames = 0;
@@ -1822,7 +1824,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
         // a speculative step touches positions pos .. pos+K (K drafts verified in one pass) and
         // drafts one more; shrink K near the end of the context and stop before it overflows
         let K = pickK();
-        const roomLeft = MAX_SEQ - ai.engine.pos - 2;
+        const roomLeft = ctxMax() - ai.engine.pos - 2;
         if (roomLeft < 1) { capped = true; break; }
         // never draft past the answer cap: every token a step writes into the caches is then an
         // emitted one, so a capped answer is still a prefix of the next turn and nothing re-prefills
@@ -1866,13 +1868,13 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
         const next = i === 0 && first != null ? first : sample(logits);
         if (eos(next)) break;
         emit(next, false);
-        if (ai.pos >= MAX_SEQ - 1) { capped = true; break; }   // no position left for another token
+        if (ai.pos >= ctxMax() - 1) { capped = true; break; }   // no position left for another token
         logits = await aiPipeToken(next);
         if (ai.chain.length) pushMap(count / ((performance.now() - t0) / 1000), null, true);
       }
       if (count >= maxNew) {
         capped = true;
-        if (logits && !ai.abort && ai.pos < MAX_SEQ - 1) ai.pending = { next: sample(logits), at: ai.pos };   // for Continue
+        if (logits && !ai.abort && ai.pos < ctxMax() - 1) ai.pending = { next: sample(logits), at: ai.pos };   // for Continue
       }
     }
     tDecode = performance.now() - t0;
@@ -1881,7 +1883,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
       + (acc != null ? ` · ${Math.round(acc * 100)}% drafts accepted` : "")
       + (copied ? ` · ${copied} tok by lookup` : "")
       + (ai.abort ? " · stopped" : "")
-      + (capped ? (ai.pos >= MAX_SEQ - 2 ? ` · stopped: context full (${MAX_SEQ} tokens)` : ` · stopped at ${count} tokens`) : "")
+      + (capped ? (ai.pos >= ctxMax() - 2 ? ` · stopped: context full (${ctxMax()} tokens)` : ` · stopped at ${count} tokens`) : "")
       + (dropped ? ` · ${dropped} oldest exchange${dropped > 1 ? "s" : ""} forgotten to fit` : "");
     if (ai.chain.length && count) { pushMap(count / Math.max(secs, 1e-3), acc, false, true); noteSpeeds(); }
     else if (count > 8) lastSoloTps = Math.max(lastSoloTps, count / Math.max(secs, 1e-3));
@@ -1896,7 +1898,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
   const tail = ai.conv.turns[ai.conv.turns.length - 1];
   if (tail?.role === "user") ai.conv.turns.push({ role: "assistant", ids: answer });
   else if (tail?.open) { tail.ids = [...tail.ids, ...answer]; delete tail.open; }
-  const ctx = { used: ai.fed ? ai.pos : 0, max: MAX_SEQ };
+  const ctx = { used: ai.fed ? ai.pos : 0, max: ctxMax() };
   if (failed) chatBotEnd(reply ? null : "⚠ " + failed.message, stats);
   else chatBotEnd(null, stats);
   const canContinue = capped && !failed && !ai.abort;

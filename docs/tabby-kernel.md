@@ -1,0 +1,104 @@
+# Tabby kernel: the engine side of a P2P coding harness
+
+`tabby-kernel` turns the SwarmLLM engine (Qwen 3.8 27B across browser tabs) into something a
+coding agent can sit on: long context, sessions that resume without re-prefilling, a disk cache,
+and tool calls. Research behind the choices: [research/tabby-2026-09.md](research/tabby-2026-09.md);
+earlier kernel work: [research/kernels-2026-09.md](research/kernels-2026-09.md).
+
+Nothing here has been timed on a real GPU yet (the development machine only has SwiftShader).
+Every change is either bit-identical to what it replaces or checked against it by a test, and
+each has a switch for A/B timing on real hardware.
+
+## Long context: f16 KV cache + split-K flash attention
+
+| | before | now |
+|---|---|---|
+| KV cache | f32, 131 KB per token (whole 27B) | f16, 65.5 KB per token |
+| attention | scores → softmax → out, whole row per head; the fast softmax stops at 2048 | `attn_flash` + `attn_combine`: splits of 256 positions, the 6 query heads that share a KV head read each K/V row once, online softmax, fixed-order merge |
+| room context (27B) | 2048 tokens | 8192 tokens (0.54 GB of KV for the whole model, split over the devices) |
+
+- `kv_store` writes the new K/V rows as packed f16 pairs in one dispatch (it replaces two
+  buffer copies per column).
+- The same kernels serve decode (1 column) and verify / prefill (many columns), and all their
+  orders are fixed by absolute position, so speculative decoding stays exactly plain decoding and
+  a split room stays exactly one device (engine_synth, room_synth).
+- f16 K/V is not bit-identical to the old f32 path: `tests/e2e/flash_synth.mjs` compares the two
+  (same greedy tokens; logit differences at 1e-6 of the logit range, also on a 2300-token prompt
+  past the old 2048 limit, and at the 27B's shapes).
+- Switch: `Qwen35Engine.create({ attnFlash: false })` restores the f32 path.
+- Any `maxSeq` works; the split length grows past 32K so a head never has more than 128 splits.
+  Memory at 32K: 2.1 GB of KV for the whole model; q8 KV would halve it again (research §3,
+  not built; q4 KV is not recommended, it hurts long documents and tool calls).
+
+## Sessions: save, restore, rewind, share a prefix
+
+`engine/qwen35.js`:
+
+- `exportState()` → `{ sig, pos, parts }`: this device's KV rows `[0, pos)`, DeltaNet states and
+  conv windows, the draft block's KV, and the trunk hidden the next draft starts from. Read back
+  one part at a time, so a long context never needs one huge mapping.
+- `importState(state)`: refuses a state for other layers, another model or KV format
+  (`stateSignature()`).
+- `saveSlot(name)` / `loadSlot(name)` / `dropSlot(name)`: the same, as GPU-to-GPU copies, for
+  switching sessions or rewinding an agent to an earlier turn.
+
+A hybrid model cannot be cut back to an arbitrary position (the DeltaNet state is a running sum),
+so reuse works at checkpoints: after the system prompt + tools, and after every finished turn.
+`harness/prefix.js` (`PrefixIndex`) picks the longest checkpoint that is a prefix of the new
+prompt; only the rest is prefilled. Coding agents resend ~96% of their input every turn
+(research §3), which is what this saves.
+
+`tests/e2e/state_synth.mjs`: restore after a reset and a different prompt, GPU slots, speculative
+decoding after a restore, and an OPFS round trip all resume with bit-identical logits.
+
+Size of a state on the 27B: ~150 MiB of DeltaNet state (fixed) + 65.5 KB per token of KV, for the
+whole model; each device only holds its own layers' share.
+
+## Disk cache (OPFS)
+
+`harness/statecache.js` (`StateCache`, `tokenKey`): states on the browser's origin-private file
+system, keyed by SHA-256 of (model, this device's layer range and KV format, token ids). Temp file
++ rename, so a crash never leaves a half state under a real key; least recently used entries go
+past a byte budget (8 GB default). In a room every device stores its own part under the same key;
+the host asks everyone to load it and prefills instead if anyone is missing theirs.
+
+Not done: SSD weight streaming. The research looked at Edge0 (the @SamuelZengML post: MoE experts
+streamed from flash with a learned prefetcher) and SSD expert streaming on a Mac mini (the
+@thefp4brain thread): both rely on MoE sparsity. A dense 27B touches every weight every token, so
+streaming would pin decode to disk bandwidth; splitting the layers over peers is the answer here.
+
+## Tool calls
+
+`harness/tools.js`:
+- `detectStyle(chatTemplate)`: "xml" (Qwen3-Coder / 3.5 / 3.8: `<function=…><parameter=…>`) or
+  "json" (Qwen3 Hermes-style), read from the GGUF's own template.
+- `toolsSystemPrompt(tools, { style, system })`, `toolResponses(results)` (one user turn of
+  `<tool_response>` blocks), `renderCalls(calls, style)`.
+- `ToolCallParser`: streaming; shows text as it comes but never half a tag, returns calls as they
+  complete, accepts both formats, tolerates a missing `</parameter>` or `</tool_call>` at the end,
+  converts XML parameter text to the schema's types.
+
+`harness/constrain.js` (`ToolCallConstraint`): inside a tool call, masks the logits so the
+function name and parameter names can only be declared ones; free text everywhere else. One
+vocabulary scan per state, cached.
+
+Unit tests: `tests/unit/tools_test.js`, `constrain_test.js`, `prefix_test.js`.
+
+## Also in this branch
+
+- The kernels branch work: fused attention glue, fused DeltaNet delta + gated norm, batched
+  attention for verify / prefill (all bit-identical), register-resident DeltaNet, Q8 prefill GEMM,
+  replay rollback, batched draft-cache fill, the multi-device gibberish fixes.
+- Prompt-lookup drafts search the whole context (16K window, was 4K): code edits copy from
+  anywhere in the files the agent has read.
+
+## Next
+
+1. Time it on two Macs and a GB10: decode tok/s at 1K / 8K context, prefill tok/s, `?fuse=0`.
+2. Room protocol for states: host sends save / load / drop by key to every device in the chain
+   (engine calls above), so prefix reuse works across a split.
+3. Stable prompt rendering for agents: never drop old turns (it breaks reuse); compact instead.
+4. Several sessions at once: per-session KV / state slots batched through one pass.
+5. Pipelined speculative windows across devices (Mesh-LLM keeps several verifies in flight).
+6. Suffix / n-gram drafting chained after the MTP drafts (Mesh-LLM: +156% on code-copy loads).
+7. q8 KV for 32K-64K; a tiled prefill attention kernel for long prompts.

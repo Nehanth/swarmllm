@@ -6,7 +6,7 @@
 // ctx: token ids so far (conversation + answer, ending with the token about to be verified).
 // Returns up to k tokens that followed the most recent earlier occurrence of ctx's last n tokens
 // (n from maxN down to minN), or [] when nothing matches.
-export function lookupDrafts(ctx, k, { maxN = 4, minN = 2, window = 4096 } = {}) {
+export function lookupDrafts(ctx, k, { maxN = 4, minN = 2, window = 16384 } = {}) {   // the whole context: code edits copy from anywhere in it
   const L = ctx.length;
   const lo = Math.max(0, L - window);
   for (let n = Math.min(maxN, L - 1); n >= minN; n--) {

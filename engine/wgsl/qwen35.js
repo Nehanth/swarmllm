@@ -600,6 +600,127 @@ fn sigmoid_mul_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
   smm_a[ai] = smm_a[ai] * (1.0 / (1.0 + exp(-g)));
 }
 
+// ================= long-context attention: f16 KV cache + split-K flash decoding =================
+// kv_store writes each column's k and v rows into the caches as packed f16 pairs (half the
+// memory and bandwidth of f32; 64 KB per token per full-attention layer set on the 27B).
+@group(1) @binding(0) var<storage, read> ks_k: array<f32>;
+@group(1) @binding(1) var<storage, read> ks_v: array<f32>;
+@group(1) @binding(2) var<storage, read_write> ks_kc: array<u32>;
+@group(1) @binding(3) var<storage, read_write> ks_vc: array<u32>;
+@group(1) @binding(4) var<uniform> ks_mc: MC;           // s0 k column stride, s1 v column stride (floats)
+@compute @workgroup_size(64)
+fn kv_store(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let w = gid.x; let col = gid.y;
+  let kvw = cfg.kvDim / 2u;
+  if (w >= kvw) { return; }
+  let row = (frame.pos + col) * kvw + w;
+  let ko = col * ks_mc.s0 + 2u * w; let vo = col * ks_mc.s1 + 2u * w;
+  ks_kc[row] = pack2x16float(vec2<f32>(ks_k[ko], ks_k[ko + 1u]));
+  ks_vc[row] = pack2x16float(vec2<f32>(ks_v[vo], ks_v[vo + 1u]));
+}
+
+// attn_flash: one 256-thread workgroup per (split of splitLen positions, column, kv head). The
+// G = nH/nKV query heads sharing a kv head are done together, so each K/V row is read once for
+// all of them. Inside a split, chunks of 64 positions: scores to workgroup memory, a running
+// max / sum per head (online softmax), and thread i accumulates output dim i for every head.
+// Writes per-split partials (max, sum, unnormalised output); attn_combine merges the splits.
+// Every order is fixed by absolute position, so the decode (1 column) and batched (verify /
+// prefill) passes give the same bits for a given position, and so do solo and split devices.
+struct FA { s0: u32, s1: u32, splitLen: u32, maxSplits: u32 };   // q col stride, out col stride
+@group(1) @binding(0) var<storage, read> fa_q: array<f32>;
+@group(1) @binding(1) var<storage, read> fa_k: array<u32>;
+@group(1) @binding(2) var<storage, read> fa_v: array<u32>;
+@group(1) @binding(3) var<storage, read_write> fa_o: array<f32>;
+@group(1) @binding(4) var<storage, read_write> fa_ml: array<f32>;
+@group(1) @binding(5) var<uniform> fa: FA;
+var<workgroup> fa_qs: array<f32, 2048>;   // G * headDim <= 2048
+var<workgroup> fa_sc: array<f32, 512>;    // G * 64 scores, then weights
+var<workgroup> fa_m: array<f32, 8>;
+var<workgroup> fa_l: array<f32, 8>;
+var<workgroup> fa_a: array<f32, 8>;
+@compute @workgroup_size(256)
+fn attn_flash(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let sp = wg.x; let col = wg.y; let g = wg.z; let tid = lid.x;
+  let seqLen = frame.seqLen + col;
+  let t0 = sp * fa.splitLen;
+  if (t0 >= seqLen) { return; }
+  let t1 = min(seqLen, t0 + fa.splitLen);
+  let hd = cfg.headDim; let G = cfg.nH / cfg.nKV;
+  let hw = hd / 2u; let kvw = cfg.kvDim / 2u;
+  let rs = sqrt(f32(hd));
+  for (var w: u32 = tid; w < G * hd; w += 256u) { fa_qs[w] = fa_q[col * fa.s0 + g * G * hd + w]; }
+  if (tid < G) { fa_m[tid] = -3.0e38; fa_l[tid] = 0.0; }
+  var acc: array<f32, 8>;
+  for (var h: u32 = 0u; h < 8u; h++) { acc[h] = 0.0; }
+  workgroupBarrier();
+  for (var c0: u32 = t0; c0 < t1; c0 += 64u) {
+    let n = min(64u, t1 - c0);
+    for (var w: u32 = tid; w < G * 64u; w += 256u) {
+      let h = w / 64u; let t = w % 64u;
+      if (t < n) {
+        let kb = (c0 + t) * kvw + g * hw;
+        let qb = h * hd;
+        var s: f32 = 0.0;
+        for (var p: u32 = 0u; p < hw; p++) {
+          let kk = unpack2x16float(fa_k[kb + p]);
+          s += fa_qs[qb + 2u * p] * kk.x;
+          s += fa_qs[qb + 2u * p + 1u] * kk.y;
+        }
+        fa_sc[w] = s / rs;
+      }
+    }
+    workgroupBarrier();
+    if (tid < G) {
+      let b = tid * 64u;
+      var cm = fa_m[tid];
+      for (var t: u32 = 0u; t < n; t++) { cm = max(cm, fa_sc[b + t]); }
+      let alpha = exp(fa_m[tid] - cm);
+      var l = fa_l[tid] * alpha;
+      for (var t: u32 = 0u; t < n; t++) { let e = exp(fa_sc[b + t] - cm); fa_sc[b + t] = e; l += e; }
+      fa_m[tid] = cm; fa_l[tid] = l; fa_a[tid] = alpha;
+    }
+    workgroupBarrier();
+    if (tid < hd) {
+      for (var h: u32 = 0u; h < G; h++) { acc[h] *= fa_a[h]; }
+      for (var t: u32 = 0u; t < n; t++) {
+        let v = unpack2x16float(fa_v[(c0 + t) * kvw + g * hw + tid / 2u])[tid & 1u];
+        for (var h: u32 = 0u; h < G; h++) { acc[h] += fa_sc[h * 64u + t] * v; }
+      }
+    }
+    workgroupBarrier();
+  }
+  if (tid < hd) {
+    for (var h: u32 = 0u; h < G; h++) { fa_o[((col * cfg.nH + g * G + h) * fa.maxSplits + sp) * hd + tid] = acc[h]; }
+  }
+  if (tid < G) {
+    let b = (col * cfg.nH + g * G + tid) * fa.maxSplits + sp;
+    fa_ml[b * 2u] = fa_m[tid]; fa_ml[b * 2u + 1u] = fa_l[tid];
+  }
+}
+
+@group(1) @binding(0) var<storage, read> fc_o: array<f32>;
+@group(1) @binding(1) var<storage, read> fc_ml: array<f32>;
+@group(1) @binding(2) var<storage, read_write> fc_out: array<f32>;
+@group(1) @binding(3) var<uniform> fc: FA;
+@compute @workgroup_size(256)
+fn attn_combine(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let qh = wg.x; let col = wg.y; let i = lid.x;
+  let hd = cfg.headDim;
+  if (qh >= cfg.nH || i >= hd) { return; }
+  let seqLen = frame.seqLen + col;
+  let ns = (seqLen + fc.splitLen - 1u) / fc.splitLen;
+  let b0 = (col * cfg.nH + qh) * fc.maxSplits;
+  var M: f32 = -3.0e38;
+  for (var s: u32 = 0u; s < ns; s++) { M = max(M, fc_ml[(b0 + s) * 2u]); }
+  var L: f32 = 0.0; var O: f32 = 0.0;
+  for (var s: u32 = 0u; s < ns; s++) {
+    let w = exp(fc_ml[(b0 + s) * 2u] - M);
+    L += fc_ml[(b0 + s) * 2u + 1u] * w;
+    O += fc_o[(b0 + s) * hd + i] * w;
+  }
+  fc_out[col * fc.s1 + qh * hd + i] = O / L;
+}
+
 // --- fused attention glue: qsplit + q/k head_norm + partial rope in one dispatch ---
 // One workgroup per (head, column); heads [0, nH) are q heads (split out of q_full, gate
 // written to g), heads [nH, nH+nKV) are k heads (in place). Same arithmetic in the same order

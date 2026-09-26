@@ -27,6 +27,12 @@ export const MODELS = {
 // for this many positions (4 KB per position each for the 27B, so 16 MiB per attention layer at
 // 2048); the kernels only use it as a stride. Generation stops before the cache would overflow.
 export const MAX_SEQ = 2048;
+// The 27B family keeps its KV cache in f16 with split-K flash attention (engine attnFlash), so its
+// rooms get 8192 positions for the price of 4096 in f32: 32 MiB per attention layer, ~0.5 GB for
+// the whole model, spread over the devices that hold the layers. The host reads the engine's
+// maxSeq, so prompts, answer budgets and "context full" all follow it.
+export const MAX_SEQ_LONG = 8192;
+export const maxSeqFor = (model) => (MODELS[model]?.kind === "qwen35" ? MAX_SEQ_LONG : MAX_SEQ);
 export const MAX_NEW = 400;    // longest answer, tokens
 export const MAX_NEW_THINKING = 1200;   // with thinking on, the think block comes out of the same budget
 export const MIN_ROOM = 32;    // a prompt must leave at least this many tokens for the answer
