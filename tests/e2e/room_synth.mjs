@@ -161,14 +161,25 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
       const tr = Date.now();
       await tabs.host.fill("#ai-prompt", prompt);
       await tabs.host.click("#ai-send");
+      // --queue: a worker asks too while the host's question is being answered; it waits in the
+      // host's queue and is answered next, so this round has two answers
+      let expect = 1;
+      const asker2 = tabs[names[1]];
+      if (flag("queue") && asker2) {
+        await tabs.host.waitForFunction(() => /generating|prefill/.test(document.getElementById("ai-status").textContent), null, { timeout: TIMEOUT });
+        await asker2.fill("#ai-prompt", "And a second question from the worker?");
+        await asker2.click("#ai-send");
+        expect = 2;
+        log(`[${label}] round ${r}: worker1 queued a question`);
+      }
       if (STOP_ROUNDS.has(r)) {   // Send turns into Stop while an answer streams
         const after = +arg("stop-after", 5);
         await tabs.host.waitForFunction((k) => { const m = /generating… (\d+) tok/.exec(document.getElementById("ai-status").textContent); return m && +m[1] >= k; }, after, { timeout: TIMEOUT });
         await tabs.host.click(arg("stop-selector", "#ai-send"));
         log(`[${label}] round ${r}: pressed stop after >= ${after} tokens`);
       }
-      await tabs.host.waitForFunction((k) => document.querySelectorAll(".m.bot .stats").length > k
-        || /^generation failed/.test(document.getElementById("ai-status").textContent), nStats, { timeout: TIMEOUT });
+      await tabs.host.waitForFunction(([k, e]) => document.querySelectorAll(".m.bot .stats").length >= k + e
+        || /^generation failed/.test(document.getElementById("ai-status").textContent), [nStats, expect], { timeout: TIMEOUT });
       // --continue: while the answer stopped at the length cap, press Continue (the round's answer is
       // then every bot bubble since the question, joined)
       for (let c = 0; flag("continue") && c < 20 && await tabs.host.isVisible("#continue-btn"); c++) {
