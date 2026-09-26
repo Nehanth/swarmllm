@@ -32,7 +32,7 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false, attnGlue = true }) {
     this.replay = replayRollback !== false;
     this.device = device;
     this.mvVariant = matvecVariant;
@@ -61,6 +61,10 @@ export class Qwen35Engine {
     this.maxSeq = maxSeq;
     // workgroup softmax (bit-identical, see engine/wgsl/base.js); its staging array holds 2048 positions
     this.softmaxWG = softmaxWG !== false && maxSeq <= 2048;
+    // fused attention glue (qsplit + q/k head_norm + rope in one dispatch, bit-identical); its
+    // staging array holds one 256-wide head. engine.attnGlue = false restores the five dispatches.
+    this.attnGlueOn = attnGlue !== false && hd <= 256;
+    this.attnGlue = this.attnGlueOn;
     const [lo, hi] = layerRange;
     this.lo = lo; this.hi = hi;
     this.hasEmbed = hasEmbed; this.hasHead = hasHead;
@@ -140,6 +144,7 @@ export class Qwen35Engine {
       dn_l2_mc: ["rw", "u", "u"], dn_delta_mc: ["ro", "ro", "ro", "rw", "rw", "u", "u", "rw"],
       dn_gatenorm_mc: ["ro", "ro", "ro", "rw", "u", "u"], qsplit_mc: ["ro", "rw", "rw", "u", "u"],
       head_norm_mc: ["rw", "ro", "u"], rope_part_mc: ["rw", "u", "u"], sigmoid_mul_mc: ["rw", "ro", "u"],
+      attn_glue: ["ro", "rw", "rw", "rw", "ro", "ro", "u", "u"],
       argmax: ["ro", "rw", "u"], emb_gather: ["ro", "ro", "ro", "rw", "u"],
     };
     // narrower twins: a verify or tail pass with w live columns pays for w, not batchCols
@@ -280,6 +285,8 @@ export class Qwen35Engine {
         R.bgKNorm = this._bg(this.pipes.head_norm, 1, [this.k, R.kNorm.buf, this.uNKV]);
         R.bgRopeQ = this._bg(this.pipes.rope_part, 1, [this.q, this.uNH, this.dnBuf]);
         R.bgRopeK = this._bg(this.pipes.rope_part, 1, [this.k, this.uNKV, this.dnBuf]);
+        this._uZero4 = this._uZero4 || this._buf(new Uint32Array(4), GPUBufferUsage.UNIFORM);
+        R.bgGlue = this._bg(this.pipes.attn_glue, 1, [this.qFull, this.q, this.gAttn, this.k, R.qNorm.buf, R.kNorm.buf, this._uZero4, this.dnBuf]);
         R.bgScores = this._bg(this.pipes.attn_scores, 1, [this.q, R.kCache, this.scores]);
         R.bgSoftmax = this._bg(this.pipes.attn_softmax, 1, [this.scores]);
         R.bgAttnOut = this._bg(this.pipes.attn_out, 1, [this.scores, R.vCache, this.attnOut]);
@@ -470,11 +477,14 @@ export class Qwen35Engine {
         this._dop(p, L.mvQ);
         this._dop(p, L.mvK);
         this._dop(p, L.mvV);
-        this._d(p, "qsplit", L.bgQsplit, D.nH * D.hd);
-        this._d(p, "head_norm", L.bgQNorm, D.nH, 32);
-        this._d(p, "head_norm", L.bgKNorm, D.nKV, 32);
-        this._d(p, "rope_part", L.bgRopeQ, D.nH * D.nRot / 2);
-        this._d(p, "rope_part", L.bgRopeK, D.nKV * D.nRot / 2);
+        if (this.attnGlue) this._d(p, "attn_glue", L.bgGlue, (D.nH + D.nKV) * 64);
+        else {
+          this._d(p, "qsplit", L.bgQsplit, D.nH * D.hd);
+          this._d(p, "head_norm", L.bgQNorm, D.nH, 32);
+          this._d(p, "head_norm", L.bgKNorm, D.nKV, 32);
+          this._d(p, "rope_part", L.bgRopeQ, D.nH * D.nRot / 2);
+          this._d(p, "rope_part", L.bgRopeK, D.nKV * D.nRot / 2);
+        }
         p.end();
       }
       enc.copyBufferToBuffer(this.k, 0, L.kCache, pos * D.kvDim * 4, D.kvDim * 4);
@@ -643,7 +653,7 @@ export class Qwen35Engine {
       "silu_mul", "add_res", "rope_part", "qsplit", "sigmoid_mul",
       "dn_gates", "dn_conv", "dn_l2", "dn_delta", "dn_gatenorm",
       "rmsnorm_mc", "add_res_mc", "dn_gates_mc", "dn_conv_mc", "dn_l2_mc", "dn_pre_mc", "dn_delta_mc", "dn_gatenorm_mc",
-      "qsplit_mc", "head_norm_mc", "rope_part_mc", "sigmoid_mul_mc"];
+      "qsplit_mc", "head_norm_mc", "rope_part_mc", "sigmoid_mul_mc", "attn_glue"];
     this.bgCommonB = cix.map((c) => {
       const m = {};
       for (const name of colPipes)
@@ -718,6 +728,8 @@ export class Qwen35Engine {
         kNorm: this._bg2res(this.pipes.head_norm_mc, [whole(B.k), { buffer: L.kNorm.buf }, mcU(D.nKV, st(B.k))]),
         ropeQ: this._bg2res(this.pipes.rope_part_mc, [whole(B.q), mcU(D.nH, st(B.q)), dn]),
         ropeK: this._bg2res(this.pipes.rope_part_mc, [whole(B.k), mcU(D.nKV, st(B.k)), dn]),
+        glue: this._bg2res(this.pipes.attn_glue, [whole(B.qFull), whole(B.q), whole(B.gAttn), whole(B.k),
+          { buffer: L.qNorm.buf }, { buffer: L.kNorm.buf }, mcU(st(B.k), st(B.qFull), st(B.q), st(B.gAttn)), dn]),
         sigMul: this._bg2res(this.pipes.sigmoid_mul_mc, [whole(B.attnOut), whole(B.gAttn), mcU(D.qDim, st(B.attnOut), st(B.gAttn))]),
       });
       else Object.assign(mc, {
@@ -802,11 +814,14 @@ export class Qwen35Engine {
         this._dMC(p, "rmsnorm_mc", M.norm1, 256, 256, nCols);
         if (G) this._dop(p, this.xposeXn);
         for (const op of LB.qkvOps) this._dop(p, op, nCols);
-        this._dMC(p, "qsplit_mc", M.qsplit, D.nH * D.hd, 64, nCols);
-        this._dMC(p, "head_norm_mc", M.qNorm, D.nH, 32, nCols);
-        this._dMC(p, "head_norm_mc", M.kNorm, D.nKV, 32, nCols);
-        this._dMC(p, "rope_part_mc", M.ropeQ, D.nH * D.nRot / 2, 64, nCols);
-        this._dMC(p, "rope_part_mc", M.ropeK, D.nKV * D.nRot / 2, 64, nCols);
+        if (this.attnGlue) this._dMC(p, "attn_glue", M.glue, (D.nH + D.nKV) * 64, 64, nCols);
+        else {
+          this._dMC(p, "qsplit_mc", M.qsplit, D.nH * D.hd, 64, nCols);
+          this._dMC(p, "head_norm_mc", M.qNorm, D.nH, 32, nCols);
+          this._dMC(p, "head_norm_mc", M.kNorm, D.nKV, 32, nCols);
+          this._dMC(p, "rope_part_mc", M.ropeQ, D.nH * D.nRot / 2, 64, nCols);
+          this._dMC(p, "rope_part_mc", M.ropeK, D.nKV * D.nRot / 2, 64, nCols);
+        }
         p.end();
       }
       for (let c = 0; c < nCols; c++) {

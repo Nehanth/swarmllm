@@ -545,4 +545,60 @@ fn sigmoid_mul_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ai = gid.y * smm_mc.s0 + i;
   smm_a[ai] = smm_a[ai] * (1.0 / (1.0 + exp(-g)));
 }
+
+// --- fused attention glue: qsplit + q/k head_norm + partial rope in one dispatch ---
+// One workgroup per (head, column); heads [0, nH) are q heads (split out of q_full, gate
+// written to g), heads [nH, nH+nKV) are k heads (in place). Same arithmetic in the same order
+// as the five separate kernels: the sum of squares runs serially on thread 0, so the result
+// is bit-identical to qsplit -> head_norm -> rope_part. Needs headDim <= 256.
+@group(1) @binding(0) var<storage, read> ag_full: array<f32>;
+@group(1) @binding(1) var<storage, read_write> ag_q: array<f32>;
+@group(1) @binding(2) var<storage, read_write> ag_g: array<f32>;
+@group(1) @binding(3) var<storage, read_write> ag_k: array<f32>;
+@group(1) @binding(4) var<storage, read> ag_qw: array<f32>;
+@group(1) @binding(5) var<storage, read> ag_kw: array<f32>;
+@group(1) @binding(6) var<uniform> ag_mc: MC;          // n = k stride, s0 full stride, s1 q stride, s2 g stride
+@group(1) @binding(7) var<uniform> ag_dn: DN;
+var<workgroup> ag_v: array<f32, 256>;
+var<workgroup> ag_inv: f32;
+@compute @workgroup_size(64)
+fn attn_glue(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let hd = ag_dn.hd;
+  let isQ = wg.x < cfg.nH;
+  let h = select(wg.x - cfg.nH, wg.x, isQ);
+  let col = wg.y;
+  let fo = col * ag_mc.s0 + h * 2u * hd;
+  let qo = col * ag_mc.s1 + h * hd;
+  let go = col * ag_mc.s2 + h * hd;
+  let ko = col * ag_mc.n + h * hd;
+  for (var i: u32 = lid.x; i < hd; i += 64u) {
+    if (isQ) { ag_v[i] = ag_full[fo + i]; ag_g[go + i] = ag_full[fo + hd + i]; }
+    else { ag_v[i] = ag_k[ko + i]; }
+  }
+  workgroupBarrier();
+  if (lid.x == 0u) {
+    var ss: f32 = 0.0;
+    for (var i: u32 = 0u; i < cfg.headDim; i++) { let v = ag_v[i]; ss += v * v; }
+    ag_inv = inverseSqrt(ss / f32(cfg.headDim) + cfg.eps);
+  }
+  workgroupBarrier();
+  let inv = ag_inv;
+  for (var i: u32 = lid.x; i < hd; i += 64u) {
+    let w = select(ag_kw[i], ag_qw[i], isQ);
+    ag_v[i] = ag_v[i] * (inv * w);
+  }
+  workgroupBarrier();
+  let half = ag_dn.nRot / 2u;
+  for (var i: u32 = lid.x; i < half; i += 64u) {
+    let ang = f32(frame.pos + col) * pow(ag_dn.ropeTheta, -f32(2u * i) / f32(ag_dn.nRot));
+    let c = cos(ang); let s = sin(ang);
+    let a = ag_v[i]; let b = ag_v[i + half];
+    ag_v[i] = a * c - b * s;
+    ag_v[i + half] = b * c + a * s;
+  }
+  workgroupBarrier();
+  for (var i: u32 = lid.x; i < hd; i += 64u) {
+    if (isQ) { ag_q[qo + i] = ag_v[i]; } else { ag_k[ko + i] = ag_v[i]; }
+  }
+}
 `;
