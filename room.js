@@ -10,10 +10,15 @@ import { WIRE_F16, badF32, f32ToB64, packF16, unpackF16, asU16, packWire, unpack
 import { esc, md, mdChat } from "./room/markdown.js";
 import { pickSampler, SAMPLING } from "./room/sampling.js";
 import { chatRecipients } from "./room/visibility.js";
+import { PrefixIndex } from "./harness/prefix.js";
 import { MODELS, NEED_GB, MAX_SEQ, MAX_SEQ_LONG, MAX_NEW, MAX_NEW_THINKING, MIN_ROOM } from "./room/models.js";
 // the context window of the loaded engine (8192 for the 27B family, 2048 otherwise)
 const ctxMax = () => ai.engine?.maxSeq || MAX_SEQ;
-import { makeLink, attachWire, wireReady, sendFrame, PROTOCOL } from "./room/transport.js";
+// ?ckpt=N: keep the room's state after the last N answers on every device (GPU copies), so a
+// regenerate, an edited question or a branch resumes from the longest saved turn instead of
+// prefilling the whole conversation again. 0 turns it off.
+const CKPT_MAX = Math.max(0, parseInt(new URLSearchParams(location.search).get("ckpt") ?? "2", 10) || 0);
+import { makeLink, attachWire, wireReady, sendFrame, PROTOCOL, DROP_ALL } from "./room/transport.js";
 import { PERSONAS, specials, fitContext, reusablePrefix } from "./room/conversation.js";
 import { planSplit, planForSpeed, ladder, bestFit, codeFromLocation } from "./room/plan.js";
 import { qrSVG } from "./room/qr.js";
@@ -1330,6 +1335,7 @@ async function aiStart(modelArg) {
       : `layers ${ranges[0][0]}–${ranges[0][1] - 1} ready · syncing with ${ai.chain.length} device${ai.chain.length > 1 ? "s" : ""}…`);
     ai.fed = [];                              // fresh engines everywhere: nothing cached yet
     ai.pendingCtl = {};
+    ckptClear();
     aiMaybeReady();
   } catch (err) {
     clearInterval(ai.progTimer);
@@ -1352,6 +1358,7 @@ async function aiRedeal() {
   $("chat-tools").hidden = true;
   const model = ai.model || $("ai-model").value;
   failWaiters(new Error("re-dealing the layers"));
+  ckptClear();
   ai.engine = null; ai.busy = false; ai.fed = null;
   $("ai-panel").classList.remove("online");
   $("ai-row").style.display = "none";
@@ -1383,7 +1390,7 @@ function aiPeerLeft(id, name) {
   const why = `${name || "a device"} left${layers ? ` (layers ${layers})` : ""}`;
   ai.degraded = true;
   ai.readyPeers.delete(id);
-  ai.fed = null;
+  ai.fed = null; ckptClear();
   failWaiters(new Error(why));
   $("ai-row").style.display = ai.engine ? "flex" : "none";
   aiStatus(`${why} — re-deal the layers to keep going`);
@@ -1411,7 +1418,7 @@ function aiRejoin(newId, name) {
   const fresh = { ...msg, next: i + 1 < ai.chain.length ? ai.chain[i + 1] : "host", host: peer.id };
   if (i > 0) sendTo(ai.chain[i - 1], { t: "ai-next", next: newId });
   sendTo(newId, fresh);
-  ai.fed = null;                            // its fresh engine holds nothing: re-prefill next time
+  ai.fed = null; ckptClear(true);           // its fresh engine holds nothing: re-prefill next time
   log("swarm", `${name} came back — reloading its layers`);
   aiStatus(`${name} reconnected, reloading its layers…`);
   $("ai-row").style.display = ai.readyPeers.size >= ai.chain.length ? "flex" : "none";
@@ -1467,7 +1474,38 @@ function resetState() {
   try { ai.engine.reset?.(); } catch {}
   ai.pos = 0;
   ai.fed = [];
-  ai.pendingCtl = ai.chain.length ? { reset: 1 } : {};
+  const { sv, dp } = ai.pendingCtl || {};
+  ai.pendingCtl = ai.chain.length ? { ...(sv != null ? { sv } : {}), ...(dp != null ? { dp } : {}), reset: 1 } : {};
+}
+// ---- checkpoints (?ckpt): the room's state after an answer, saved on every device ----
+function ckptClear(tellChain = false) {   // engines rebuilt or in an unknown state: nothing saved is usable
+  const keys = ai.ckpt ? ai.ckpt.items.map((x) => x.key) : [];
+  for (const k of keys) { try { ai.engine?.dropSlot?.(k); } catch {} }
+  if (tellChain && keys.length && ai.chain.length) ai.pendingCtl = { ...ai.pendingCtl, dp: [DROP_ALL] };
+  ai.ckpt = new PrefixIndex(1 << 30); ai.ckptN = ai.ckptN || 0;
+}
+function ckptSave() {
+  if (!CKPT_MAX || !ai.fed?.length || !ai.engine?.saveSlot) return;
+  if (!ai.ckpt) ckptClear();
+  const drop = [];
+  while (ai.ckpt.items.length >= CKPT_MAX) {
+    const old = ai.ckpt.items.reduce((a, b) => (a.t < b.t ? a : b));
+    ai.ckpt.remove(old.key); ai.engine.dropSlot(old.key); drop.push(old.key);
+  }
+  const key = ai.ckptN = (ai.ckptN || 0) % 65534 + 1;   // slot numbers ride the frame header (u16)
+  ai.engine.saveSlot(key);
+  ai.ckpt.add(ai.fed.slice(), key);
+  if (ai.chain.length) ai.pendingCtl = { ...ai.pendingCtl, sv: key, ...(drop.length ? { dp: drop } : {}) };
+}
+// resume from the longest checkpoint that is a prefix of ids, if it beats what the caches hold
+function ckptResume(ids, reused) {
+  if (!CKPT_MAX || !ai.ckpt) return reused;
+  const b = ai.ckpt.best(ids);
+  if (!b || b.n <= reused) return reused;
+  ai.engine.loadSlot(b.key);
+  ai.pos = b.n; ai.fed = ids.slice(0, b.n);
+  if (ai.chain.length) { const { reset, ...rest } = ai.pendingCtl || {}; ai.pendingCtl = { ...rest, ld: b.key }; }
+  return b.n;
 }
 
 // Speculative drafting reads the draft block's own KV cache, which prefill fills with the trunk's
@@ -1736,7 +1774,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
     const fit = fitContext(ai.tok, { system: persona.system, turns: cont ? [...ai.conv.turns.slice(0, -1), { ...lastTurn, open: true }] : [...ai.conv.turns, { role: "user", text, name: asker }], thinking }, ctxMax(), MIN_ROOM);
     dropped = fit.dropped;
     ai.conv.turns = fit.turns;
-    reused = reusablePrefix(ai.fed, fit.ids);
+    reused = ckptResume(fit.ids, reusablePrefix(ai.fed, fit.ids));
     // Continue after a cap that landed on a written token: the caches hold the whole open answer,
     // so there is nothing to prefill, and the next token was already sampled when it stopped
     const pend = ai.pending; ai.pending = null;
@@ -1891,6 +1929,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
     failed = err;
     ai.fed = null;            // the caches are in an unknown state: the next question starts clean
     ai.pendingCtl = {};
+    ckptClear(true);
     stats = "failed: " + err.message;
     aiStatus("generation failed: " + err.message);
   }
@@ -1898,6 +1937,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
   const tail = ai.conv.turns[ai.conv.turns.length - 1];
   if (tail?.role === "user") ai.conv.turns.push({ role: "assistant", ids: answer });
   else if (tail?.open) { tail.ids = [...tail.ids, ...answer]; delete tail.open; }
+  if (!failed) ckptSave();   // this answer's end state, on every device, for a later regenerate or branch
   const ctx = { used: ai.fed ? ai.pos : 0, max: ctxMax() };
   if (failed) chatBotEnd(reply ? null : "⚠ " + failed.message, stats);
   else chatBotEnd(null, stats);
@@ -1977,8 +2017,13 @@ function clearChat() {
 async function workerFrame(d) {
   if (!ai.engine) return;
   const ctl = {};
+  // order matters: a pending rollback belongs to the answer that just ended, the save records
+  // that answer's final state, and only then may the state be reset or replaced by a checkpoint
+  if (d.rb != null && !d.reset) { ai.engine.restoreDN?.(d.rb); ctl.rb = d.rb; }
+  if (d.sv != null) { ai.engine.saveSlot?.(d.sv); ctl.sv = d.sv; }
+  if (d.dp != null) { for (const k of [].concat(d.dp)) k === DROP_ALL ? ai.engine.dropAllSlots?.() : ai.engine.dropSlot?.(k); ctl.dp = d.dp; }
   if (d.reset) { ai.engine.reset?.(); ctl.reset = 1; }
-  else if (d.rb != null) { ai.engine.restoreDN?.(d.rb); ctl.rb = d.rb; }
+  if (d.ld != null) { ai.engine.loadSlot?.(d.ld); ctl.ld = d.ld; }
   const t0 = performance.now();
   if (d.t === "ai-hidden-b") {
     // n hiddens in, my layers (batched), n hiddens on

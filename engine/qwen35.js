@@ -96,6 +96,7 @@ export class Qwen35Engine {
     const sl = this.slots?.get(name);
     if (sl) { for (const b of sl.bufs) b.destroy(); this.slots.delete(name); }
   }
+  dropAllSlots() { for (const k of [...(this.slots?.keys() || [])]) this.dropSlot(k); }
 
   // Fresh context: forget the conversation so far. Recurrent (DeltaNet) states and
   // conv windows are zeroed; the KV caches are simply overwritten from position 0.

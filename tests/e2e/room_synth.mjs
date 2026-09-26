@@ -292,6 +292,8 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
       out.regenSame = again === prev;
       log(`[${label}] regenerate: ${out.regenSame ? "same answer (greedy)" : "DIFFERENT answer"} \u00b7 ${await tabs.host.textContent("#ai-status")}`);
       if (GREEDY && !out.regenSame) throw new Error("regenerate under greedy sampling gave a different answer");
+      // --expect-reuse: the regenerate must resume from a saved checkpoint (room ?ckpt), not re-prefill
+      if (flag("expect-reuse") && !/\(\d+ reused\)/.test(await tabs.host.textContent("#ai-status"))) throw new Error("regenerate did not reuse a checkpoint");
     }
     out.roomLog = {};
     for (const [n, p] of Object.entries(tabs)) out.roomLog[n] = await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => t.includes("⚠")).map((t) => t.slice(0, 240)));

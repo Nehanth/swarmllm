@@ -18,19 +18,37 @@
 
 export const WIRE_ID = 77;                 // negotiated channel id, same on both ends
 export const SLICE_BYTES = 4600;           // ~4 packets of 1150 B payload
-const HDR = 24;
+const HDR = 32;   // 24 bytes of frame + 8 of checkpoint control (protocol 4)
 const MAGIC = 0x5357;                      // "SW"
 const KINDS = ["ai-hidden", "ai-hidden-b", "ai-hiddenret", "ai-hiddenret-b"];
 const GAP_MS = 5000;                       // a frame that never completes stops holding back later ones after this
 
 // Room protocol version: peers with a different one are refused at hello (docs/protocol.md).
-export const PROTOCOL = 3;
+export const PROTOCOL = 4;
 
 // Header flags byte: bit 0 speculative verify, bit 1 reset before this frame, bits 2..7 roll the
 // recurrent state back to after column k before this frame (stored as k + 1; 0 = none).
 export function packFlags({ spec, reset, rb } = {}) {
   if (rb != null && (rb < 0 || rb > 62)) throw new Error("rollback column out of range: " + rb);
   return (spec ? 1 : 0) | (reset ? 2 : 0) | (rb != null ? (rb + 1) << 2 : 0);
+}
+// Checkpoint control (header bytes 24..31, u16 each, 0 = none): sv = save this device's state
+// under a slot number before the frame, ld = load a slot, dp = up to two slots to drop, or
+// DROP_ALL. Slot numbers are 1..65534.
+export const DROP_ALL = 0xffff;
+export function packCkpt(dv, { sv, ld, dp } = {}) {
+  const drops = dp == null ? [] : [].concat(dp);
+  if (drops.length > 2 && !drops.includes(DROP_ALL)) throw new Error("at most two checkpoint drops per frame");
+  for (const v of [sv, ld, ...drops]) if (v != null && !(v >= 1 && v <= 0xffff)) throw new Error("checkpoint slot out of range: " + v);
+  const d = drops.includes(DROP_ALL) ? [DROP_ALL] : drops;
+  dv.setUint16(24, sv || 0); dv.setUint16(26, ld || 0); dv.setUint16(28, d[0] || 0); dv.setUint16(30, d[1] || 0);
+}
+export function unpackCkpt(dv) {
+  const out = {}, sv = dv.getUint16(24), ld = dv.getUint16(26), d0 = dv.getUint16(28), d1 = dv.getUint16(30);
+  if (sv) out.sv = sv;
+  if (ld) out.ld = ld;
+  if (d0) out.dp = d1 ? [d0, d1] : [d0];
+  return out;
 }
 export function unpackFlags(f) {
   const out = { spec: f & 1 };
@@ -78,6 +96,7 @@ export function sendFrame(link, msg) {
     dv.setUint16(0, MAGIC); dv.setUint8(2, kind); dv.setUint8(3, flags);
     dv.setUint32(4, id); dv.setUint32(8, pos >>> 0); dv.setUint16(12, msg.n || 1);
     dv.setUint16(14, k); dv.setUint16(16, nSlices); dv.setUint32(20, bytes.length);
+    packCkpt(dv, msg);
     new Uint8Array(buf, HDR).set(bytes.subarray(off, off + len));
     off += len;
     // round-robin over associations so a block never waits on one congestion window
@@ -92,9 +111,10 @@ function receive(link, buf, onFrame) {
   const dv = new DataView(buf);
   if (dv.getUint16(0) !== MAGIC) return;
   const kind = dv.getUint8(2), flags = dv.getUint8(3), id = dv.getUint32(4), pos = dv.getUint32(8), n = dv.getUint16(12);
+  const ck = unpackCkpt(dv);   // every slice carries the same control
   const k = dv.getUint16(14), nSlices = dv.getUint16(16), total = dv.getUint32(20);
   let r = link.rx.get(id);
-  if (!r) { r = { parts: new Array(nSlices), got: 0, n: nSlices, buf: new Uint8Array(total), t: performance.now() }; link.rx.set(id, r); }
+  if (!r) { r = { parts: new Array(nSlices), got: 0, n: nSlices, buf: new Uint8Array(total), t: performance.now(), ck }; link.rx.set(id, r); }
   if (r.parts[k]) return;   // duplicate
   r.parts[k] = true; r.got++;
   const per = SLICE_BYTES - HDR;
@@ -104,7 +124,7 @@ function receive(link, buf, onFrame) {
   link.recv++;
   const data = new Uint16Array(r.buf.buffer, 0, total >> 1);
   const t = KINDS[kind];
-  const msg = { t, enc: "f16", data, n, ...unpackFlags(flags) };
+  const msg = { t, enc: "f16", data, n, ...unpackFlags(flags), ...r.ck };
   if (t === "ai-hidden" || t === "ai-hiddenret") msg.pos = pos; else msg.basePos = pos;
   deliverInOrder(link, id, msg, onFrame);
   // drop half-received frames older than 30 s so a lost slice cannot leak memory

@@ -54,6 +54,17 @@ decoding after a restore, and an OPFS round trip all resume with bit-identical l
 Size of a state on the 27B: ~150 MiB of DeltaNet state (fixed) + 65.5 KB per token of KV, for the
 whole model; each device only holds its own layers' share.
 
+### Across a split room (`?ckpt=N`, default 2)
+
+After every answer the host saves the room's state on every device: a `sv` key rides on the next
+frame down the chain, like reset and rollback do, so each device saves its own layers at exactly
+the same point. A regenerate, an edited question or a branch then resumes from the longest saved
+answer (`ld` key on the first frame) and prefills only what is new; the status line says
+"(N reused)". Old checkpoints are dropped (`dp`) past N; a device rejoining with a fresh engine,
+a re-deal or a failed answer clears them. Order on a device: rollback, save, drop, reset, load.
+`tests/e2e/room_synth.mjs --regen --expect-reuse` checks that a regenerate over 3 devices resumes
+from a checkpoint and repeats the greedy answer. `?ckpt=0` turns it off.
+
 ## Disk cache (OPFS)
 
 `harness/statecache.js` (`StateCache`, `tokenKey`): states on the browser's origin-private file
@@ -95,8 +106,8 @@ Unit tests: `tests/unit/tools_test.js`, `constrain_test.js`, `prefix_test.js`.
 ## Next
 
 1. Time it on two Macs and a GB10: decode tok/s at 1K / 8K context, prefill tok/s, `?fuse=0`.
-2. Room protocol for states: host sends save / load / drop by key to every device in the chain
-   (engine calls above), so prefix reuse works across a split.
+2. Persist room checkpoints to OPFS on every device (the engine and store are there; the room
+   keeps them on the GPU today), so a session survives a reload.
 3. Stable prompt rendering for agents: never drop old turns (it breaks reuse); compact instead.
 4. Several sessions at once: per-session KV / state slots batched through one pass.
 5. Pipelined speculative windows across devices (Mesh-LLM keeps several verifies in flight).
