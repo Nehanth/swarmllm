@@ -1186,6 +1186,9 @@ async function aiPrefill(ids) {
     await ai.engine.prefillTokens(ids.slice(0, -1));
     ai.pos = ai.engine.pos;
     ai.fed.push(...ids.slice(0, -1));
+    // prefillTokens drafts every row but the last prompt token's (it never sees that token);
+    // this.x holds the hidden state just before it, which is what that row needs
+    if (FILL_DRAFTS && ai.engine.mtp) ai.engine.mtpRun(null, ids[ids.length - 1], ai.pos, false);
     return aiPipeToken(ids[ids.length - 1]);
   }
   let i = 0;
@@ -1344,6 +1347,10 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
     reused = reusablePrefix(ai.fed, fit.ids);
     if (!reused) resetState();
     const ids = fit.ids.slice(reused);
+    // a follow-up's first token needs a draft-cache row too: the trunk hidden at the position
+    // before it is still in the engine when the last answer ended on a speculative step
+    if (reused && FILL_DRAFTS && ai.engine.mtp && ai.xAt === ai.pos) ai.engine.mtpRun(null, ids[0], ai.pos, false);
+    ai.xAt = null;
     prefilled = ids.length;
     const cap = thinking ? MAX_NEW_THINKING : (ANSWER_LEN[ai.settings.length] ?? MAX_NEW);
     const maxNew = Math.min(MAXNEW_PARAM || cap, MAX_SEQ - fit.ids.length);
@@ -1442,6 +1449,7 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
       }
       if (!done && count >= maxNew) capped = true;
       ai.pos = ai.engine.pos;
+      ai.xAt = ai.pos;   // specStep left the trunk hidden at ai.pos - 1 in the engine
       const st = ai.engine.mtp.stats;
       if (st.drafts) crumb(`spec: ${st.accepted}/${st.drafts} drafts accepted${ai.lapStat ? ` · lap ${Math.round(ai.lapStat.lap)}ms` : ""}`
         + (ai.chain.length ? ` · K tok/s ${kc.cand.map((k) => `${k}:${kc.ema[k] ? kc.ema[k].toFixed(1) : "-"}`).join(" ")} · tokens by K ${JSON.stringify(kc.used)}` : ""));
