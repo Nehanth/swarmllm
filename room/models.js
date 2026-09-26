@@ -1,6 +1,6 @@
 // Model catalogue for the room: URLs, layer counts, memory needs, context length.
 
-export const NEED_GB = { "qwen3-0.6b": 0.8, "qwen3-1.7b": 2.0, "qwen3-4b": 4.6, "qwen3.8-27b": 16.5, "smollm-135m": 0.6 };
+export const NEED_GB = { "qwen3-0.6b": 0.8, "qwen3-1.7b": 2.0, "qwen3-4b": 4.6, "qwen3.8-27b": 16.5, "qwen3.6-35b-moe": 22.5, "smollm-135m": 0.6 };
 
 export const MODELS = {
   "qwen3-0.6b": { label: "Qwen3 0.6B · Q8", kind: "gguf",
@@ -17,6 +17,9 @@ export const MODELS = {
     tok: "https://huggingface.co/Qwen/Qwen3-4B/resolve/main/tokenizer.json" },
   "qwen3.8-27b": { label: "Qwen 3.8 27B \u00b7 Q4", kind: "qwen35",
     gguf: "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q4_0.gguf" },
+  // mixture of experts: 256 experts, 8 active per token (~3B of 35B), so decode reads far less than the 27B
+  "qwen3.6-35b-moe": { label: "Qwen 3.6 35B MoE \u00b7 Q4", kind: "qwen35",
+    gguf: "https://huggingface.co/bartowski/Qwen_Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen_Qwen3.6-35B-A3B-Q4_0.gguf" },
   "smollm-135m": { label: "SmolLM 135M · bf16", kind: "safetensors",
     st: "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/model.safetensors",
     cfg: "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/config.json",

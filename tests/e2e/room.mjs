@@ -31,7 +31,7 @@ const SIGNAL_PORT = +arg("signal-port", 9000);
 const CLOUD = arg("signal", "local") === "cloud";
 // pledges in GB: host,worker,phone. The 27B needs 16.5 GB in the room.
 // host pledge: whatever the joiners (1 GB desktop, 0.5 GB phone) leave of the model's need, at least 2 GB
-const NEED = { "qwen3.8-27b": 16.5, "qwen3-4b": 4.6, "qwen3-1.7b": 2.0, "qwen3-0.6b": 0.8 }[MODEL] || 2;
+const NEED = { "qwen3.8-27b": 16.5, "qwen3.6-35b-moe": 22.5, "qwen3-4b": 4.6, "qwen3-1.7b": 2.0, "qwen3-0.6b": 0.8 }[MODEL] || 2;
 const HOST_GB = arg("host-gb", String(Math.max(2, Math.ceil(NEED + 0.5 - (DEVICES - 1 - PHONES) * 1 - PHONES * 0.5))));
 // GGUF files already on this machine stand in for Hugging Face (Range requests served from disk)
 const LOCAL = { "Qwen3.8-27B-Q4_0.gguf": "models/q38/model.gguf", "Qwen3-0.6B-Q8_0.gguf": "models/qwen/model.gguf", "Qwen3-1.7B-Q8_0.gguf": "models/qwen17/model.gguf" };
