@@ -139,6 +139,13 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
     for (const n of names.slice(1)) { await tabs[n].fill("#code-input", code); await tabs[n].click("#join-btn"); await tabs[n].waitForTimeout(200); }
     for (const p of Object.values(tabs)) await p.waitForFunction((k) => document.querySelectorAll(".peer-card").length >= k, nDev, { timeout: 60000 });
     log(`[${label}] ${nDev} device(s) in the room`);
+    // --virtual N: the host adds N virtual devices (iframes of the room on the same machine)
+    if (+arg("virtual", 0)) {
+      for (let i = 0; i < +arg("virtual", 0); i++) await tabs.host.click("#add-virtual");
+      await tabs.host.waitForFunction((k) => document.querySelectorAll(".peer-card").length >= k, nDev + +arg("virtual", 0), { timeout: 90000 });
+      await tabs.host.waitForTimeout(2000);
+      log(`[${label}] ${arg("virtual")} virtual device(s) joined: ${await tabs.host.$$eval(".peer-card .pname", (e) => e.map((x) => x.textContent).join(", "))}`);
+    }
     if (nDev > 1) await tabs.host.waitForTimeout(2000);   // stripe connections
     if (GREEDY) {   // the host's sampling preset "exact" = argmax (room/sampling.js)
       const has = await tabs.host.evaluate(() => [...(document.getElementById("ai-sampling")?.options || [])].some((o) => o.value === "exact"));

@@ -468,7 +468,7 @@ async function start(create, resume = null) {
       clearTimeout(timeout);
       wire(conn, "host", undefined, true);
       let died = null;
-      try { const c = JSON.parse(localStorage.getItem("swarm-crumb") || "null"); if (c && Date.now() - c.t < 10 * 60 * 1000) died = { during: c.s, ago: Math.round((Date.now() - c.t) / 1000) }; } catch {}
+      if (!VQ.get("embed")) try { const c = JSON.parse(localStorage.getItem("swarm-crumb") || "null"); if (c && Date.now() - c.t < 10 * 60 * 1000) died = { during: c.s, ago: Math.round((Date.now() - c.t) / 1000) }; } catch {}
       conn.send({ t: "hello", name: myName, meta: myMeta, died, v: PROTOCOL });
       enterRoom();
     });
@@ -535,6 +535,26 @@ $("create-btn").addEventListener("click", () => { keepAwake(); start(true); });
 // (auto-rejoin removed: the user prefers to see what happened)
 $("join-btn").addEventListener("click", () => { keepAwake(); start(false); });
 $("code-input").addEventListener("keydown", (e) => { if (e.key === "Enter") start(false); });
+// Virtual devices: the host can add devices that are iframes of this page on this same computer.
+// Each joins the room like any other device (its own WebGPU device, its own WebRTC link, its own
+// layers), which shows what a swarm does before friends arrive; the GPU is shared, so it is a
+// demo, not a speed-up. Removing one closes it like a tab (fail fast, re-deal).
+let virtualN = 0;
+function addVirtual() {
+  if (!roomCode) return;
+  const q = new URLSearchParams(location.search);
+  q.set("code", roomCode); q.set("vname", `virtual-${++virtualN}`); q.set("vgb", "2"); q.set("embed", "1");
+  const path = location.pathname.startsWith("/r/") ? "/room" : location.pathname;
+  const box = document.createElement("div");
+  box.className = "vdev";
+  box.innerHTML = `<iframe title="virtual device ${virtualN}" src="${esc(path + "?" + q)}" allow="clipboard-write"></iframe><button type="button" title="close this virtual device">\u00d7</button>`;
+  box.querySelector("button").addEventListener("click", () => box.remove());
+  $("virtual").appendChild(box);
+  $("virtual").hidden = false;
+  toast(`virtual-${virtualN} is joining from this computer`);
+}
+$("add-virtual").addEventListener("click", addVirtual);
+
 // Join links: swarmllm.ai/r/ABCD opens this page and joins the room with no typing. Served
 // elsewhere (a local static server, the emulator), the link keeps this page's path and query
 // (signal=, wire=) and adds ?code=.
@@ -575,6 +595,11 @@ $("room-over-new").addEventListener("click", () => { location.href = location.pa
 }
 // a link with a room code fills it in and joins once the GPU probe is done
 const linkCode = codeFromLocation(location.pathname, location.search, location.hash);
+// a virtual device (an iframe the host added, see addVirtual): its name, pledge and a compact page
+const VQ = new URLSearchParams(location.search);
+if (VQ.get("embed") === "1") document.documentElement.classList.add("embed");
+if (VQ.get("vname")) $("name-input").value = VQ.get("vname").slice(0, 20);
+if (+VQ.get("vgb") > 0) $("join-gb").value = +VQ.get("vgb");
 if (linkCode) {
   $("code-input").value = linkCode;
   $("join-status").textContent = `joining room ${linkCode}\u2026`;
