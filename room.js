@@ -584,6 +584,19 @@ async function rangeFetch(url, lo, hi, noCache = false) {
       }
     } catch {}
   }
+  // another device in the room has this range cached: take it over WebRTC (same Wi-Fi is
+  // usually far faster than the model host), falling back to the network on any failure
+  const src = !noCache && ai.wsrc?.url === url ? ai.wsrc.map.get(lo + "-" + hi) : null;
+  if (src) {
+    try {
+      const buf = await peerGet(src, url, lo, hi);
+      ai.peerBytes = (ai.peerBytes || 0) + buf.byteLength;
+      const resp = new Response(buf, { status: 200, headers: { "content-type": "application/octet-stream", "x-swarm-len": String(buf.byteLength) } });
+      if (c && !myMeta?.phone) c.put(key, resp.clone()).catch(() => {});
+      return resp;
+    } catch (err) { crumb(`peer weights from ${conns.get(src)?.name || src} failed (${err.message}); using the network`); ai.wsrc.map.delete(lo + "-" + hi); }
+  }
+  ai.netBytes = (ai.netBytes || 0) + (hi - lo + 1);
   const r = await fetch(url, { headers: { Range: `bytes=${lo}-${hi}` } });
   if (r.status !== 206) throw new Error("model host refused range requests");
   if (c && !myMeta?.phone) {   // phones skip the store (no spare RAM for the copy); Cache API refuses 206s, so store as a plain 200
@@ -597,6 +610,74 @@ async function rangeFetch(url, lo, hi, noCache = false) {
   }
   return r;
 }
+// ---- weights from the room: devices share the ranges they have cached ----
+// Inventory: the "lo-hi" byte ranges of `url` this device has cached (phones cache nothing).
+const PEER_WEIGHTS = new URLSearchParams(location.search).get("peerweights") !== "0";
+async function cachedRanges(url) {
+  const c = await getWeightCache(); if (!c) return [];
+  const prefix = "https://weights.swarmllm.ai/" + encodeURIComponent(url) + "/";
+  try { return (await c.keys()).map((r) => r.url).filter((u) => u.startsWith(prefix)).map((u) => u.slice(prefix.length)).filter((x) => /^\d+-\d+$/.test(x)); }
+  catch { return []; }
+}
+// host: ask every device what it has, wait briefly; -> { peerId: ["lo-hi", ...] }
+async function gatherInventory(url, ms = 1500) {
+  if (!PEER_WEIGHTS) return {};
+  const inv = {};
+  ai.invWait = { url, inv };
+  broadcastAll({ t: "ai-inv-req", url });
+  await new Promise((r) => setTimeout(r, conns.size ? ms : 0));
+  ai.invWait = null;
+  return inv;
+}
+// who to ask for each range: the first device (other than me) that has it
+function weightSources(url, inv) {
+  const map = new Map();
+  for (const [id, have] of Object.entries(inv || {})) if (id !== peer.id) for (const k of have || []) if (!map.has(k)) map.set(k, id);
+  return { url, map };
+}
+const wGets = new Map();   // request id -> { buf, got, res, rej, timer }
+let wSeq = 0;
+async function peerGet(src, url, lo, hi) {
+  if (!(await ensureLink(src, 10000))) throw new Error("no link");
+  const len = hi - lo + 1, id = `${peer.id}:${++wSeq}`;
+  return new Promise((res, rej) => {
+    const w = { buf: new Uint8Array(len), got: 0, res, rej, timer: null };
+    const idle = () => { clearTimeout(w.timer); w.timer = setTimeout(() => { wGets.delete(id); rej(new Error("stalled")); }, 15000); };
+    w.idle = idle; idle();
+    wGets.set(id, w);
+    sendTo(src, { t: "ai-wget", id, url, lo, hi });
+  });
+}
+function onWeightPart(d) {
+  const w = wGets.get(d.id); if (!w) return;
+  if (d.miss) { clearTimeout(w.timer); wGets.delete(d.id); w.rej(new Error("not cached there")); return; }
+  if (d.data) {
+    const part = d.data instanceof Uint8Array ? d.data : new Uint8Array(d.data);
+    if (d.off >= 0 && d.off + part.length <= w.buf.length) { w.buf.set(part, d.off); w.got += part.length; }
+    w.idle();
+  }
+  if (d.done) {
+    clearTimeout(w.timer); wGets.delete(d.id);
+    if (w.got === w.buf.length) w.res(w.buf.buffer); else w.rej(new Error(`short: ${w.got}/${w.buf.length}`));
+  }
+}
+// serve a cached range to a device in the room, 64 KB at a time, minding the channel's buffer
+async function serveWeight(from, d) {
+  const e = conns.get(from); if (!e) return;
+  const c = await getWeightCache();
+  const hit = c && Number.isInteger(d.lo) && Number.isInteger(d.hi) ? await c.match(cacheKey(d.url, d.lo, d.hi)).catch(() => null) : null;
+  if (!hit || hit.headers.get("x-swarm-len") !== String(d.hi - d.lo + 1)) { sendTo(from, { t: "ai-wpart", id: d.id, miss: 1 }); return; }
+  const buf = new Uint8Array(await hit.arrayBuffer());
+  const CH = 64 * 1024;
+  for (let off = 0; off < buf.length; off += CH) {
+    if (!conns.has(from)) return;
+    e.conn.send({ t: "ai-wpart", id: d.id, off, data: buf.subarray(off, Math.min(buf.length, off + CH)) });
+    while (e.conn.dataChannel && e.conn.dataChannel.bufferedAmount > 4 * 2 ** 20) await new Promise((r) => setTimeout(r, 10));
+  }
+  sendTo(from, { t: "ai-wpart", id: d.id, done: 1 });
+  ai.servedBytes = (ai.servedBytes || 0) + buf.length;
+}
+
 async function fetchGGUFHeader(url, needTokenizer = true) {
   let size = 12 * 2 ** 20;
   for (;;) {
@@ -904,6 +985,7 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
   // second load doubles GPU memory and every buffer after the limit comes back invalid
   if (ai.device) { try { ai.device.destroy(); } catch {} ai.device = null; ai.engine = null; }
   ai.firstGpuError = null;
+  ai.peerBytes = 0; ai.netBytes = 0;
   const adapter = await navigator.gpu?.requestAdapter();
   if (!adapter) throw new Error("no WebGPU on this device");
   ai.device = await adapter.requestDevice({
@@ -1042,6 +1124,7 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
     });
   }
   prefetcher.pending.clear(); prefetcher.url = null;
+  if (ai.peerBytes) log("swarm", `${myName}: ${(ai.peerBytes / 2 ** 20).toFixed(1)} MB of weights came from devices in the room, ${((ai.netBytes || 0) / 2 ** 20).toFixed(1)} MB from the network`);
   ai.range = range;
   ai.model = modelKey;
   aiLoading(false);
@@ -1136,11 +1219,16 @@ async function aiStart(modelArg) {
       log("swarm", `⚠ this model needs ~${needGB.toFixed(1)} GB but the room pledged ~${haveGB.toFixed(1)} GB — it may not fit`);
 
     ai.deferred = [];
+    // what every device already has cached, so each one can take its missing ranges from the room
+    const inv = M.gguf && conns.size ? await gatherInventory(M.gguf) : {};
+    const mine = M.gguf ? await cachedRanges(M.gguf) : [];
+    ai.wsrc = M.gguf ? weightSources(M.gguf, inv) : null;
     ai.chain.forEach((id, i) => {
       const msg = {
         t: "ai-load", model: modelKey, range: ranges[i + 1],
         next: i + 1 < ai.chain.length ? ai.chain[i + 1] : "host",
         host: peer.id,
+        inv: { ...inv, [peer.id]: mine },
       };
       ai.plan.set(conns.get(id)?.name || id, { msg, small: false });
       sendTo(id, msg);
@@ -1886,6 +1974,7 @@ async function aiOnData(from, d) {
       ai.next = d.next;
       ai.hostId = d.host;
       ai.q = Promise.resolve();
+      ai.wsrc = MODELS[d.model]?.gguf && d.inv ? weightSources(MODELS[d.model].gguf, d.inv) : null;
       ensureLink(d.next);   // open the link to my chain neighbour while the weights download
       try {
         await aiLoadShard(d.model || "smollm-135m", d.range, false, false);
@@ -1925,6 +2014,10 @@ async function aiOnData(from, d) {
       aiStatus(`peer ${e?.name || from} failed: ${d.message}`);
       break;
     case "ai-tele": if (ai.role === "host") ai.teleBy.set(from, d.k || {}); break;
+    case "ai-inv-req": cachedRanges(d.url).then((have) => sendTo(from, { t: "ai-inv", url: d.url, have })); break;
+    case "ai-inv": if (ai.invWait && ai.invWait.url === d.url && Array.isArray(d.have)) ai.invWait.inv[from] = d.have.slice(0, 20000); break;
+    case "ai-wget": if (PEER_WEIGHTS) serveWeight(from, d); else sendTo(from, { t: "ai-wpart", id: d.id, miss: 1 }); break;
+    case "ai-wpart": onWeightPart(d); break;
     case "ai-map": renderMap(d.nodes, d.st, d.live); break;
     case "ai-hidden-b":
     case "ai-hidden":
