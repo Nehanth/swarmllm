@@ -138,6 +138,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [GOVERNANCE.md](GOVERNANCE.md). Bench
 
 Model weights and the GGUF format come from the [Qwen](https://huggingface.co/Qwen) team and [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp), whose speculative-decoding graph for Qwen 3.5/3.8 was the reference for ours. Prior work that shaped this: [Petals](https://github.com/bigscience-workshop/petals), [exo](https://github.com/exo-explore/exo), [WebLLM](https://github.com/mlc-ai/web-llm), [LlamaWeb](https://arxiv.org/abs/2605.20706), and the Gated DeltaNet and PipeInfer papers.
 
+## Name
+
+"SwarmLLM" is a common name in this space. This project is independent and not affiliated with [enapt/SwarmLLM](https://github.com/enapt/SwarmLLM), the [SWARM-LLM paper](https://arxiv.org/abs/2606.14711), or any other project using the name.
+
 ## License
 
 [MIT](LICENSE).
