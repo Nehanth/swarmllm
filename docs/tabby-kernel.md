@@ -150,7 +150,9 @@ plain; the loop on a real engine).
 2. Persist room checkpoints to OPFS on every device (the engine and store are there; the room
    keeps them on the GPU today), so a session survives a reload.
 3. Stable prompt rendering for agents: never drop old turns (it breaks reuse); compact instead.
-4. Several sessions at once: per-session KV / state slots batched through one pass.
-5. Pipelined speculative windows across devices (Mesh-LLM keeps several verifies in flight).
+4. Several sessions at once: per-session KV / state slots batched through one pass (design:
+   research/tabby-next-2026-09.md §2).
+5. Pipelined speculative windows across devices (Mesh-LLM keeps several verifies in flight;
+   design: research/tabby-next-2026-09.md §1).
 6. Suffix / n-gram drafting chained after the MTP drafts (Mesh-LLM: +156% on code-copy loads).
 7. q8 KV for 32K-64K; a tiled prefill attention kernel for long prompts.
