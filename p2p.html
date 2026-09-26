@@ -364,6 +364,8 @@
   .sheet.wide { width: min(680px, 100%); }
   #card-canvas { width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--border); }
   #room-over-why { font-size: 14px; color: var(--muted); }
+  #resume-btn { font-family: var(--mono); font-size: 12.5px; border-radius: 100px; border-color: var(--accent); color: var(--accent); }
+  #resume-btn[hidden] { display: none; }
   #join-status.warn { color: var(--warn); max-width: 420px; text-align: center; }
   @media (max-width: 820px) {
     header { padding: 10px 14px; }
@@ -430,6 +432,7 @@
     <button id="join-btn">Join room</button>
   </div>
   <div id="join-pledge">give <button class="step" id="gb-minus" type="button">−</button><input id="join-gb" type="number" min="1" max="64" step="1" value="1" inputmode="numeric"><button class="step" id="gb-plus" type="button">+</button> GB of memory</div>
+  <button id="resume-btn" type="button" hidden></button>
   <div id="join-status"></div>
 </div>
 
