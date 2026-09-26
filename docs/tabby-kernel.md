@@ -105,6 +105,26 @@ vocabulary scan per state, cached.
 
 Unit tests: `tests/unit/tools_test.js`, `constrain_test.js`, `prefix_test.js`.
 
+## The agent
+
+- `harness/workspace.js`: the project the agent works on. `DirWorkspace` wraps a folder the user
+  picks (File System Access API: the real files, nothing uploaded); `MemoryWorkspace` for tests.
+  Paths cannot leave the root; `.git`, `node_modules` and build folders are skipped by search.
+- `harness/codetools.js`: `list_dir`, `read_file` (numbered, paged at 400 lines), `search`
+  (regex), `edit_file` (one exact match, with errors that say how to recover), `write_file`. The
+  last two are marked `mutates`, so the agent asks before changing files.
+- `harness/agent.js` (`Agent`): prompt with the tools, stream the answer through the tool-call
+  parser, run the calls (approval hook for edits), send back `<tool_response>`s, repeat until an
+  answer without calls or `maxSteps`. Knows nothing about GPUs: the model is any
+  `generate({ system, turns })` stream.
+- `harness/engine-model.js` (`engineModel`): that stream over a Qwen35Engine: renders the whole
+  conversation each step but prefills only what the engine does not hold yet, keeps the model's
+  own turns as their sampled ids, speculative decoding by default.
+
+Tests: `tests/unit/agent_test.js` (tools and loop with a scripted model),
+`tests/e2e/agent_synth.mjs` (follow-up turns reuse the prefix and match a fresh engine; spec ==
+plain; the loop on a real engine).
+
 ## Also in this branch
 
 - The kernels branch work: fused attention glue, fused DeltaNet delta + gated norm, batched
