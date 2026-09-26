@@ -169,8 +169,12 @@ function writeKV(w, key, type, val) {
 export const DEFAULTS = {
   seed: 1, layers: 8, dim: 256, inter: 512, nH: 4, nKV: 2, hd: 64, nRot: 32,
   dState: 128, nKH: 2, nVH: 2, merges: 123, mtp: "echo", layerScale: 0.04, headGain: 4,
-  ropeTheta: 1e7, eps: 1e-6, ctx: 4096, eosAt: 90,
+  ropeTheta: 1e7, eps: 1e-6, ctx: 4096, eosAt: 90, counter: true,
 };
+// The 27B's shapes (dim 5120, FFN 17408, 24 q / 4 kv heads of 256, 16 / 48 DeltaNet heads): every
+// matrix hits a pinned prefill-GEMM shape (engine/wgsl/gemm.js GEMM_S), so the GEMM path runs.
+// --shape 27b; fewer layers keep it loadable on SwiftShader (4 layers + draft block ~ 1.1 GB).
+export const SHAPE_27B = { dim: 5120, inter: 17408, nH: 24, nKV: 4, hd: 256, nRot: 64, nKH: 16, nVH: 48, counter: false, layers: 4 };
 
 // Residual-stream feature dims reserved for the answer-length counter (see buildSynthGGUF).
 const F_MARK = 0, F_COUNT = 1, F_BIAS = 2, NF = 3;
@@ -195,7 +199,7 @@ export function buildSynthGGUF(opts = {}) {
   if (dState !== 128) throw new Error("dState must be 128 (dn_gatenorm / dn_delta workgroups are 128 wide)");
   if (2 * nKH + nVH > 128 || nVH > 64) throw new Error("too many DeltaNet heads for dn_pre");
   for (const d of [dim, inter, qDim, dInner]) if (d % 32) throw new Error("dims must be multiples of 32");
-  if (nH / nKV !== 2) throw new Error("the counter head assumes 2 query heads per kv head");
+  if (o.counter && nH / nKV !== 2) throw new Error("the counter head assumes 2 query heads per kv head (or pass counter: false)");
   const L = o.layers, N = L;                              // trunk layers 0..L-1, nextn block = blk.L
   const { byteTokens, merges } = trainMerges(o.merges);
   const tokens = [...byteTokens, ...merges.map((m) => m.replace(" ", "")), ...SPECIALS];
@@ -252,7 +256,7 @@ export function buildSynthGGUF(opts = {}) {
   const silent = new Set([...eos, imStart, id["<think>"], id["</think>"], ...tokens.map((t, i) => (i < byteTokens.length + merges.length && !printable(t) ? i : -1)).filter((i) => i >= 0)]);
   mat("output.weight", vocab, dim, o.headGain, { role: "in", fill: (x, a) => {
     for (let r = 0; r < vocab; r++) for (let c = 0; c < dim; c++) x[r * dim + c] = silent.has(r) ? 0 : U(a);
-  }, edit: (x) => { const r = id["<|im_end|>"]; x[r * dim + F_COUNT] = -GAMMA; x[r * dim + F_BIAS] = BETA; } });
+  }, edit: o.counter ? (x) => { const r = id["<|im_end|>"]; x[r * dim + F_COUNT] = -GAMMA; x[r * dim + F_BIAS] = BETA; } : null });
 
   const layer = (i, full, counter = false) => {
     const p = `blk.${i}.`;
@@ -285,7 +289,7 @@ export function buildSynthGGUF(opts = {}) {
       mat(p + "ssm_out.weight", dim, dInner, ls * 3, { role: "out" });
     }
   };
-  for (let i = 0; i < L; i++) layer(i, i % 4 === 3, i === 3);
+  for (let i = 0; i < L; i++) layer(i, i % 4 === 3, o.counter && i === 3);
   // multi-token-prediction block: a full-attention layer + eh_proj / enorm / hnorm / shared_head_norm
   layer(N, true);
   const p = `blk.${N}.nextn.`;
@@ -370,9 +374,13 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   const argv = process.argv.slice(2);
   const arg = (k, d) => { const i = argv.indexOf("--" + k); return i >= 0 ? argv[i + 1] : d; };
   const out = argv[0] && !argv[0].startsWith("--") ? argv[0] : DEFAULT_OUT;
+  const shape = arg("shape") === "27b" ? SHAPE_27B : {};
   const r = writeSynth(out, {
-    seed: +arg("seed", DEFAULTS.seed), layers: +arg("layers", DEFAULTS.layers), dim: +arg("dim", DEFAULTS.dim),
-    inter: +arg("inter", DEFAULTS.inter), mtp: arg("mtp", DEFAULTS.mtp), layerScale: +arg("layer-scale", DEFAULTS.layerScale),
+    ...shape,
+    ...(arg("layers") ? { layers: +arg("layers") } : {}),
+    ...(arg("dim") ? { dim: +arg("dim") } : {}),
+    seed: +arg("seed", DEFAULTS.seed),
+    inter: +arg("inter", shape.inter || DEFAULTS.inter), mtp: arg("mtp", DEFAULTS.mtp), layerScale: +arg("layer-scale", DEFAULTS.layerScale),
     merges: +arg("vocab-merges", DEFAULTS.merges), eosAt: +arg("eos-at", DEFAULTS.eosAt),
   });
   const { ids, ...rest } = r;
