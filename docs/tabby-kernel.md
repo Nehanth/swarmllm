@@ -65,6 +65,16 @@ a re-deal or a failed answer clears them. Order on a device: rollback, save, dro
 `tests/e2e/room_synth.mjs --regen --expect-reuse` checks that a regenerate over 3 devices resumes
 from a checkpoint and repeats the greedy answer. `?ckpt=0` turns it off.
 
+### Several sessions on one engine
+
+`harness/sessions.js` (`Sessions`): `switchTo(id)` parks the current conversation in a GPU slot
+and brings `id` back from a GPU slot, from disk, or starts it fresh. Past `gpuSlots` parked
+sessions, the least recently used go to OPFS (`exportSlot`, no switch needed); `persist()` saves
+the active one; `close(id)` forgets one. Switching is exact: `tests/e2e/sessions_synth.mjs`
+interleaves three sessions with one spare slot (one goes to disk and back) and compares every
+logit with the same sessions decoded uninterrupted. This is time-sharing: one session computes at
+a time. Batching several sessions through one pass is still on the list.
+
 ## Disk cache (OPFS)
 
 `harness/statecache.js` (`StateCache`, `tokenKey`): states on the browser's origin-private file
