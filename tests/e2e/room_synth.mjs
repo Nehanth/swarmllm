@@ -157,6 +157,7 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
     for (let r = 0; r < ROUNDS; r++) {
       const prompt = PROMPTS[r % PROMPTS.length];
       const nStats = await tabs.host.evaluate(() => document.querySelectorAll(".m.bot .stats").length);
+      const nBots = await tabs.host.evaluate(() => document.querySelectorAll(".m.bot").length);
       const tr = Date.now();
       await tabs.host.fill("#ai-prompt", prompt);
       await tabs.host.click("#ai-send");
@@ -168,14 +169,23 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
       }
       await tabs.host.waitForFunction((k) => document.querySelectorAll(".m.bot .stats").length > k
         || /^generation failed/.test(document.getElementById("ai-status").textContent), nStats, { timeout: TIMEOUT });
+      // --continue: while the answer stopped at the length cap, press Continue (the round's answer is
+      // then every bot bubble since the question, joined)
+      for (let c = 0; flag("continue") && c < 20 && await tabs.host.isVisible("#continue-btn"); c++) {
+        const k = await tabs.host.evaluate(() => document.querySelectorAll(".m.bot .stats").length);
+        await tabs.host.click("#continue-btn");
+        await tabs.host.waitForFunction((k) => document.querySelectorAll(".m.bot .stats").length > k, k, { timeout: TIMEOUT });
+        log(`[${label}] round ${r}: continued (${c + 1})`);
+      }
+      const nStatsEnd = await tabs.host.evaluate(() => document.querySelectorAll(".m.bot .stats").length);
       // workers get their copy of the answer over the host link: give it a moment
-      for (const p of Object.values(tabs).slice(1)) await p.waitForFunction((k) => document.querySelectorAll(".m.bot .stats").length > k, nStats, { timeout: 20000 }).catch(() => {});
+      for (const p of Object.values(tabs).slice(1)) await p.waitForFunction((k) => document.querySelectorAll(".m.bot .stats").length >= k, nStatsEnd, { timeout: 20000 }).catch(() => {});
       const per = {};
-      for (const [n, p] of Object.entries(tabs)) per[n] = await p.evaluate(() => {
-        const bots = document.querySelectorAll(".m.bot");
+      for (const [n, p] of Object.entries(tabs)) per[n] = await p.evaluate((nb) => {
+        const bots = [...document.querySelectorAll(".m.bot")];
         const b = bots[bots.length - 1];
-        return { answer: b?.querySelector(".bubble")?.textContent || "", stats: b?.querySelector(".stats")?.textContent || "", status: document.getElementById("ai-status").textContent };
-      });
+        return { answer: bots.slice(nb).map((x) => x.querySelector(".bubble")?.textContent || "").join(""), stats: b?.querySelector(".stats")?.textContent || "", status: document.getElementById("ai-status").textContent };
+      }, nBots);
       const secs = ((Date.now() - tr) / 1000).toFixed(1);
       out.rounds.push({ prompt, secs: +secs, per });
       log(`[${label}] round ${r} (${secs}s) host status: ${per.host.status}`);
@@ -185,6 +195,17 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
         await tabs.host.click("#new-chat").catch((e) => log(`[${label}] new chat: ${String(e).slice(0, 100)}`));
         await tabs.host.waitForTimeout(500);
       }
+    }
+    // --regen: press Regenerate after the last round; with greedy sampling the answer must repeat
+    if (flag("regen")) {
+      const k = await tabs.host.evaluate(() => document.querySelectorAll(".m.bot .stats").length);
+      await tabs.host.click("#regen-btn");
+      await tabs.host.waitForFunction((k) => document.querySelectorAll(".m.bot .stats").length > k, k, { timeout: TIMEOUT });
+      const again = await tabs.host.evaluate(() => { const b = [...document.querySelectorAll(".m.bot")].pop(); return b.querySelector(".bubble").textContent; });
+      const prev = out.rounds[out.rounds.length - 1].per.host.answer;
+      out.regenSame = again === prev;
+      log(`[${label}] regenerate: ${out.regenSame ? "same answer (greedy)" : "DIFFERENT answer"} \u00b7 ${await tabs.host.textContent("#ai-status")}`);
+      if (GREEDY && !out.regenSame) throw new Error("regenerate under greedy sampling gave a different answer");
     }
     out.roomLog = {};
     for (const [n, p] of Object.entries(tabs)) out.roomLog[n] = await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => t.includes("⚠")).map((t) => t.slice(0, 240)));

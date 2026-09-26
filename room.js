@@ -1310,8 +1310,12 @@ function sendChat(msg, askerId) {
 // answer length the host picks; ?maxnew=N overrides it (tests)
 const ANSWER_LEN = { short: 150, normal: MAX_NEW, long: 1200 };
 const MAXNEW_PARAM = Math.max(0, parseInt(new URLSearchParams(location.search).get("maxnew"), 10) || 0);
-async function aiGenerate(textArg, who, askerId = peer.id) {
-  const text = (textArg ?? $("ai-prompt").value).trim();
+// mode: "ask" a new question, or "continue" the last answer (it stopped at the length cap)
+async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
+  const cont = mode === "continue";
+  const lastTurn = ai.conv.turns[ai.conv.turns.length - 1];
+  if (cont && lastTurn?.role !== "assistant") return;
+  const text = cont ? "(continue)" : (textArg ?? $("ai-prompt").value).trim();
   const asker = who || myName;
   if (!text || ai.busy === "gen" || !ai.engine) return;
   if (ai.degraded) {
@@ -1322,7 +1326,8 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
   ai.busy = "gen";
   ai.abort = false;
   ai.askerId = askerId;
-  if (askerId === peer.id) { $("ai-prompt").value = ""; growPrompt(); }
+  if (askerId === peer.id && !cont) { $("ai-prompt").value = ""; growPrompt(); }
+  ai.lastAsker = askerId;
   setBusyUI(true, true);
   const S = specials(ai.tok);
   const persona = PERSONAS[ai.settings.persona] || PERSONAS.default;
@@ -1330,9 +1335,10 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
   const sample = pickSampler(ai.settings.sampling);
   const eos = (t) => t === S.imEnd || t === S.eot;
 
-  chatUser(asker, text);
+  setAfterAnswer(false, false);
+  if (!cont) chatUser(asker, text);
   chatBotStart();
-  sendChat({ t: "ai-genstart", name: asker, text, asker: askerId }, askerId);
+  sendChat({ t: "ai-genstart", name: asker, text, asker: askerId, cont: cont ? 1 : 0 }, askerId);
   mascot("Thinking… every word is taking a lap through the room.");
 
   const answer = [];          // sampled ids of this answer, verbatim, for the next turn's history
@@ -1341,7 +1347,7 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
   let tDecode = 0, tPre = 0, prefilled = 0, reused = 0;
   try {
     // the conversation with this question, trimmed to fit, and how much the caches already hold
-    const fit = fitContext(ai.tok, { system: persona.system, turns: [...ai.conv.turns, { role: "user", text }], thinking }, MAX_SEQ, MIN_ROOM);
+    const fit = fitContext(ai.tok, { system: persona.system, turns: cont ? [...ai.conv.turns.slice(0, -1), { ...lastTurn, open: true }] : [...ai.conv.turns, { role: "user", text, name: asker }], thinking }, MAX_SEQ, MIN_ROOM);
     dropped = fit.dropped;
     ai.conv.turns = fit.turns;
     reused = reusablePrefix(ai.fed, fit.ids);
@@ -1482,12 +1488,17 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
     aiStatus("generation failed: " + err.message);
   }
   // the answer (even a partial one) joins the history, so the next turn reads what was said
-  if (ai.conv.turns[ai.conv.turns.length - 1]?.role === "user") ai.conv.turns.push({ role: "assistant", ids: answer });
+  const tail = ai.conv.turns[ai.conv.turns.length - 1];
+  if (tail?.role === "user") ai.conv.turns.push({ role: "assistant", ids: answer });
+  else if (tail?.open) { tail.ids = [...tail.ids, ...answer]; delete tail.open; }
   const ctx = { used: ai.fed ? ai.pos : 0, max: MAX_SEQ };
   if (failed) chatBotEnd(reply ? null : "⚠ " + failed.message, stats);
   else chatBotEnd(null, stats);
-  sendChat({ t: "ai-gendone", stats, ctx, failed: failed ? 1 : 0 }, askerId);   // unlocks every send box
-  ai.transcript.push({ name: asker, text, reply, stats });
+  const canContinue = capped && !failed && !ai.abort;
+  sendChat({ t: "ai-gendone", stats, ctx, failed: failed ? 1 : 0, capped: canContinue ? 1 : 0 }, askerId);   // unlocks every send box
+  setAfterAnswer(canContinue, !failed);
+  if (cont && ai.transcript.length) { const t = ai.transcript[ai.transcript.length - 1]; t.reply += reply; t.stats = stats; }
+  else ai.transcript.push({ name: asker, text, reply, stats });
   if (ai.transcript.length > 50) ai.transcript.shift();
   setCtx(ctx.used, ctx.max);
   if (!failed) aiStatus(`ready — prefill ${prefilled} tok in ${(tPre / 1000).toFixed(1)}s${reused ? ` (${reused} reused)` : ""}, ${stats}`);
@@ -1499,6 +1510,33 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
   void t0Gen;
 }
 
+// Continue / Regenerate the last answer: the host, or whoever asked it. Regenerate drops the last
+// exchange from the conversation and asks it again; the caches no longer match, so it
+// re-prefills (with "exact" sampling it gives the same answer, which is the point of exact).
+function setAfterAnswer(canContinue, ok) {
+  $("continue-btn").hidden = !canContinue;
+  $("regen-btn").hidden = !ok;
+}
+function aiCommand(cmd, from) {
+  if (ai.role !== "host" || ai.busy === "gen" || !ai.engine) return;
+  const byAsker = from === ai.lastAsker || from === peer.id;
+  if (!byAsker) { sendTo(from, { t: "ai-busy", why: "only the host or whoever asked can do that" }); return; }
+  const turns = ai.conv.turns;
+  if (cmd === "continue") { aiGenerate(null, from === peer.id ? myName : conns.get(from)?.name, from, "continue"); return; }
+  if (cmd === "regen" && turns.length >= 2 && turns[turns.length - 1].role === "assistant") {
+    const q = turns[turns.length - 2];
+    ai.conv.turns = turns.slice(0, -2);
+    ai.transcript.pop();
+    broadcastAll({ t: "ai-regen" });
+    markReplaced();
+    aiGenerate(q.text, q.name || (from === peer.id ? myName : conns.get(from)?.name), from);
+  }
+}
+function markReplaced() {
+  const ms = [...document.querySelectorAll("#ai-output .m")];
+  for (const m of ms.slice(-2)) m.classList.add("replaced");
+}
+
 // Start a new conversation: the next question prefills from scratch on every device.
 function aiNewChat() {
   if (ai.role !== "host" || ai.busy === "gen") return;
@@ -1506,6 +1544,7 @@ function aiNewChat() {
   ai.fed = null;
   ai.transcript = [];
   clearChat();
+  setAfterAnswer(false, false);
   broadcastAll({ t: "ai-reset", by: myName });
   setCtx(0);
   toast("new chat: the swarm forgot the conversation");
@@ -1662,7 +1701,11 @@ async function aiOnData(from, d) {
     case "ai-style":
       toast(`answers now: ${PERSONAS[d.persona]?.label || d.persona}${d.thinking ? " · thinking first" : ""}`);
       break;
+    case "ai-regen": markReplaced(); break;
+    case "ai-cmd": aiCommand(d.cmd, from); break;
     case "ai-genstart":
+      setAfterAnswer(false, false);
+      if (!d.cont)
       chatUser(d.name, d.hidden ? "asked something (the host keeps the chat private)" : d.text);
       chatBotStart();
       setBusyUI(true, d.asker === peer.id);
@@ -1672,6 +1715,7 @@ async function aiOnData(from, d) {
     case "ai-gendone":
       chatBotEnd(d.hidden ? "answer hidden by the host" : null, d.stats);
       setBusyUI(false);
+      setAfterAnswer(!!d.capped && !d.hidden, !d.failed && !d.hidden);
       if (d.ctx) setCtx(d.ctx.used, d.ctx.max);
       mascot("Your turn. Ask anything.");
       break;
@@ -1730,6 +1774,8 @@ $("cache-clear").addEventListener("click", async (ev) => {
 $("new-chat").addEventListener("click", aiNewChat);
 $("draft-view").addEventListener("click", () => setDraftView(!draftView));
 $("export-chat").addEventListener("click", exportChat);
+for (const [id, cmd] of [["continue-btn", "continue"], ["regen-btn", "regen"]])
+  $(id).addEventListener("click", () => { setAfterAnswer(false, false); if (ai.role === "host") aiCommand(cmd, peer.id); else if (ai.hostId) sendTo(ai.hostId, { t: "ai-cmd", cmd }); });
 function aiSubmit() {
   if ($("ai-send").classList.contains("stop")) { aiStop(); return; }
   const text = $("ai-prompt").value.trim();

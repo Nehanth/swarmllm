@@ -28,8 +28,8 @@ export function specials(tok) {
   return s;
 }
 
-// ChatML ids for a conversation. turns: [{role: "user", text} | {role: "assistant", ids}], ending
-// with a user turn. Assistant turns carry the exact sampled ids (never re-tokenized text, which
+// ChatML ids for a conversation. turns: [{role: "user", text} | {role: "assistant", ids, open?}],
+// ending with a user turn, or with an open assistant turn (Continue). Assistant turns carry the exact sampled ids (never re-tokenized text, which
 // can split differently) so the history matches what the caches hold token for token.
 // thinking=false pre-closes the think block on every assistant turn (Qwen3 family), so answers
 // come straight; the first turn's ids are the same as the single-turn template this replaces.
@@ -42,6 +42,7 @@ export function buildIds(tok, { system = "", turns, thinking = false }) {
   if (system) ids.push(S.imStart, ...tok.encode("system\n" + system), S.imEnd, ...nl);
   for (const t of turns) {
     if (t.role === "user") ids.push(S.imStart, ...tok.encode("user\n" + t.text), S.imEnd, ...nl, S.imStart, ...tok.encode("assistant\n"), ...closeThink);
+    else if (t.open) ids.push(...t.ids);   // an answer being continued: left open, no end token
     else ids.push(...t.ids, S.imEnd, ...nl);
   }
   if (ids.some((t) => !Number.isInteger(t)))
