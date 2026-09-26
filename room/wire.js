@@ -21,9 +21,17 @@ export function packF16(f) {
   return out;
 }
 
+// f16 -> f32 through a 65,536-entry table built from f16ToF32 itself (exact by construction):
+// every hop unpacks every frame, and the per-element math cost ~1.8 ms per 8-column verify
+// frame on a laptop CPU, several times that on a phone. 256 KB, built on first use.
+let F16_LUT = null;
+function f16Table() {
+  if (!F16_LUT) { F16_LUT = new Float32Array(65536); for (let h = 0; h < 65536; h++) F16_LUT[h] = f16ToF32(h); }
+  return F16_LUT;
+}
 export function unpackF16(u) {
-  const out = new Float32Array(u.length);
-  for (let i = 0; i < u.length; i++) out[i] = f16ToF32(u[i]);
+  const T = f16Table(), out = new Float32Array(u.length);
+  for (let i = 0; i < u.length; i++) out[i] = T[u[i]];
   return out;
 }
 

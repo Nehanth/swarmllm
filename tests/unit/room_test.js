@@ -143,3 +143,14 @@ Deno.test("conversation: an open assistant turn (Continue) extends the caches wi
   // what a capped speculative answer leaves in the caches (all but the last emitted token) is a prefix
   eq(reusablePrefix(open.slice(0, -1), open), open.length - 1);
 });
+
+import { unpackF16 } from "../../room/wire.js";
+import { f16ToF32 } from "../../engine/gguf.js";
+Deno.test("wire: the f16 lookup table matches f16ToF32 for all 65,536 values (NaNs stay NaN)", () => {
+  const all = new Uint16Array(65536); for (let i = 0; i < 65536; i++) all[i] = i;
+  const got = unpackF16(all);
+  for (let h = 0; h < 65536; h++) {
+    const want = f16ToF32(h);
+    if (Number.isNaN(want) ? !Number.isNaN(got[h]) : !Object.is(Math.fround(want), got[h])) throw new Error("mismatch at " + h);
+  }
+});
