@@ -61,3 +61,17 @@ Deno.test("transport: frames that complete out of order are delivered in send or
   if (order !== "0,4,8") throw new Error("order " + order);
   if (got[2].rb !== 2 || got[2].reset !== 1 || got[0].rb !== undefined) throw new Error("flags lost");
 });
+Deno.test("transport: a late frame after its gap was skipped is dropped, never delivered out of order", () => {
+  const link = makeLink(), out = []; fakeChannels(link, 1, out);
+  const mk = (pos) => ({ t: "ai-hidden", pos, data: new Uint16Array(8) });
+  sendFrame(link, mk(1)); sendFrame(link, mk(2)); sendFrame(link, mk(3));
+  const got = []; let handler = null;
+  const rl = makeLink();
+  attachWire(rl, { peerConnection: { createDataChannel: () => ({ set onmessage(f) { handler = f; }, set onclose(_) {}, readyState: "open" }) } }, (m) => got.push(m.pos));
+  handler({ data: out[1].buf }); handler({ data: out[2].buf });   // frame 1 missing
+  if (got.length) throw new Error("delivered past a gap");
+  clearTimeout(rl.gapTimer); rl.gapTimer = null;                 // what the 5 s timer does, without waiting
+  rl.expect = 2; for (const id of [2, 3]) { got.push(rl.done.get(id).pos); rl.done.delete(id); } rl.expect = 4;
+  handler({ data: out[0].buf });                                  // frame 1 finally arrives
+  if (got.join(",") !== "2,3") throw new Error("late frame delivered: " + got.join(","));
+});

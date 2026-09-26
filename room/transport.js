@@ -114,7 +114,9 @@ function receive(link, buf, onFrame) {
 // Frames complete out of order when their slices interleave across stripes; hand them over in
 // send order. A gap that never fills (a send that died halfway) is skipped after GAP_MS.
 function deliverInOrder(link, id, msg, onFrame) {
-  if (id < link.expect) { onFrame(msg); return; }   // late arrival after a skipped gap: still deliver
+  // a frame whose gap was already skipped: dropping it is the only safe choice, delivering it now
+  // would run it after frames sent later (the waiter for it times out and says so)
+  if (id < link.expect) return;
   link.done.set(id, msg);
   flush(link, onFrame);
   armGap(link, onFrame);
@@ -127,11 +129,16 @@ function flush(link, onFrame) {
     onFrame(m);
   }
 }
+// Skip a gap only when delivery has made no progress for GAP_MS: the timer remembers the frame it
+// was waiting for, and if that one arrived in the meantime it re-arms for the next gap instead.
+// Channels are reliable, so a real gap means a send died halfway (a closed channel).
 function armGap(link, onFrame) {
   if (!link.done.size || link.gapTimer) return;
+  const waitingFor = link.expect;
   link.gapTimer = setTimeout(() => {
     link.gapTimer = null;
     if (!link.done.size) return;
+    if (link.expect !== waitingFor) { armGap(link, onFrame); return; }
     link.expect = Math.min(...link.done.keys());
     flush(link, onFrame);
     armGap(link, onFrame);
