@@ -283,7 +283,14 @@ function sendTo(id, obj) { conns.get(id)?.conn.send(obj); }
 // debug: per-peer wire state (channels open, frames sent/received) — `swarmDebug()` in the console
 window.swarmDebug = () => [...conns].map(([id, e]) => ({ id, name: e.name, chans: e.link?.chans.filter((c) => c.readyState === "open").length ?? 0, sent: e.link?.sent ?? 0, recv: e.link?.recv ?? 0 }));
 // activations go over the sliced wire channel when it is up, else as a normal message
+// ?netlag=ms delays every activation frame this device sends, to emulate a slow link in tests
+// (equal delays keep send order)
+const NETLAG = Math.max(0, parseInt(new URLSearchParams(location.search).get("netlag"), 10) || 0);
 function sendHidden(id, msg) {
+  if (NETLAG) { setTimeout(() => sendHiddenNow(id, msg), NETLAG); return; }
+  sendHiddenNow(id, msg);
+}
+function sendHiddenNow(id, msg) {
   const e = conns.get(id);
   if (e?.link && wireReady(e.link) && sendFrame(e.link, msg)) return;
   sendTo(id, msg);
@@ -1116,6 +1123,7 @@ function lapDone(key, h) { const w = ai.waiters.get(key); if (w) { ai.waiters.de
 // send a frame to the first device of the chain; a pending reset or rollback rides with it,
 // so it reaches every device strictly before the frame it applies to
 function sendChain(msg) {
+  ai.frames = (ai.frames || 0) + 1;
   const ctl = ai.pendingCtl; ai.pendingCtl = {};
   sendHidden(ai.chain[0], { ...msg, ...ctl });
 }
@@ -1178,7 +1186,8 @@ async function aiPipeToken(id, needLogits = true, fillNext) {
 
 // Prefill `ids` (the part of the conversation the caches do not hold yet) from ai.pos; returns
 // the logits after the last one.
-const PREFILL_WINDOW = 6;   // prefill rounds in flight round the chain at once
+const PREFILL_WINDOW = 6;
+const TAIL_FRAME = new URLSearchParams(location.search).get("tail") !== "0";   // ?tail=0: old per-token tail, for A/B   // prefill rounds in flight round the chain at once
 async function aiPrefill(ids) {
   if (!ai.chain.length && ai.engine.prefillTokens && ids.length > 1) {
     // solo: batched prefill, several prompt tokens per GPU pass
@@ -1192,7 +1201,12 @@ async function aiPrefill(ids) {
     return aiPipeToken(ids[ids.length - 1]);
   }
   let i = 0;
-  if (ai.engine.embedRunBatch && ids.length > 5) {
+  // the hybrid engine takes any column count per frame (speculative verifies already send 2..8),
+  // so the prompt's tail, last token included, goes round the chain as ONE frame instead of one
+  // serial lap per token; short follow-ups become a single lap
+  const flex = TAIL_FRAME && !!(ai.chain.length && ai.engine.specStep && ai.engine.embedRunBatch);
+  let tailLogits = null;
+  if (ai.engine.embedRunBatch && (ids.length > 5 || flex)) {
     // split: up to 16 prompt tokens per round, and several rounds in flight at once. Every device
     // runs frames in send order, so round r+1 can enter the host's layers while round r is on a
     // worker: the chain works like a pipeline instead of one device at a time.
@@ -1223,10 +1237,30 @@ async function aiPrefill(ids) {
         i += n;
         aiStatus(`prefill: ${i}/${ids.length} tokens…`);
       }
+      if (flex && !ai.abort && i < ids.length) {
+        const n = ids.length - i, basePos = ai.pos, i0 = i;   // n <= 4: what the widths above left
+        const hb = await ai.engine.embedRunBatch(ids.slice(i), basePos);
+        if (badF32(hb)) throw new Error(`NaN in batched prefill (pos ${basePos})`);
+        const p = lapWait("b" + basePos, 90000, "prefill tail");
+        p.catch(() => {});
+        sendChain({ t: "ai-hidden-b", basePos, n, ...packWire(hb) });
+        ai.pos = basePos + n;
+        ai.fed.push(...ids.slice(i0));
+        i = ids.length;
+        for (const q of inflight) await q;
+        const h = await p;
+        if (badF32(h)) throw new Error(`NaN in hidden returned by peers (pos ${basePos})`);
+        fillDrafts(h, ids, i0, basePos, n);
+        const dim = ai.engine.dims.dim;
+        ai.lastHidden = h.slice((n - 1) * dim, n * dim);
+        tailLogits = await ai.engine.headFromHidden(ai.lastHidden);
+        if (badF32(tailLogits)) throw new Error(`NaN in logits (pos ${ai.pos}) — head/lm_head kernel issue on host`);
+      }
       for (const p of inflight) await p;
     } catch (err) { failWaiters(err); throw err; }
   }
   if (ai.abort) return null;
+  if (tailLogits) return tailLogits;
   let logits = null;
   for (; i < ids.length; i++) {
     if (ai.abort) return null;
@@ -1344,7 +1378,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
   const answer = [];          // sampled ids of this answer, verbatim, for the next turn's history
   let reply = "", count = 0, capped = false, dropped = 0, failed = null, stats = "";
   const t0Gen = performance.now();
-  let tDecode = 0, tPre = 0, prefilled = 0, reused = 0;
+  let tDecode = 0, tPre = 0, prefilled = 0, reused = 0, preFrames = 0;
   try {
     // the conversation with this question, trimmed to fit, and how much the caches already hold
     const fit = fitContext(ai.tok, { system: persona.system, turns: cont ? [...ai.conv.turns.slice(0, -1), { ...lastTurn, open: true }] : [...ai.conv.turns, { role: "user", text, name: asker }], thinking }, MAX_SEQ, MIN_ROOM);
@@ -1362,8 +1396,10 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
     const maxNew = Math.min(MAXNEW_PARAM || cap, MAX_SEQ - fit.ids.length);
     aiStatus(reused ? `prefill: ${ids.length} new tokens (${reused} already in the room's caches)…` : `prefill: ${ids.length} tokens…`);
     const t0Pre = performance.now();
+    ai.frames = 0;
     let logits = await aiPrefill(ids);
     tPre = performance.now() - t0Pre;
+    preFrames = ai.frames;
 
     const t0 = performance.now();
     const emit = (tok, drafted) => {
@@ -1501,7 +1537,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
   else ai.transcript.push({ name: asker, text, reply, stats });
   if (ai.transcript.length > 50) ai.transcript.shift();
   setCtx(ctx.used, ctx.max);
-  if (!failed) aiStatus(`ready — prefill ${prefilled} tok in ${(tPre / 1000).toFixed(1)}s${reused ? ` (${reused} reused)` : ""}, ${stats}`);
+  if (!failed) aiStatus(`ready — prefill ${prefilled} tok in ${(tPre / 1000).toFixed(1)}s${ai.chain.length ? ` / ${preFrames} frame${preFrames === 1 ? "" : "s"}` : ""}${reused ? ` (${reused} reused)` : ""}, ${stats}`);
   mascot("Done. Anyone in the room can ask the next one.");
   ai.busy = false;
   ai.abort = false;
