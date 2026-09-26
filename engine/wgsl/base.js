@@ -198,6 +198,39 @@ fn attn_softmax(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var t: u32 = 0u; t < frame.seqLen; t++) { sm_scores[off + t] /= sum; }
 }
 
+// --- attention softmax, one 256-thread workgroup per head, bit-identical to attn_softmax ---
+// The max (order-free) and the exponentials run in parallel; the sum is still one thread adding
+// the same values in the same order, but from workgroup memory instead of three serial passes
+// over global memory, which is what made the old kernel grow with the context. Needs seqLen <=
+// 2048 (the staging array); the engine falls back to attn_softmax above that.
+var<workgroup> smw_e: array<f32, 2048>;
+var<workgroup> smw_r: array<f32, 256>;
+@compute @workgroup_size(256)
+fn attn_softmax_wg(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wg.x; let t0 = lid.x; let n = frame.seqLen;
+  if (h >= cfg.nH) { return; }
+  let off = h * cfg.maxSeq;
+  var m: f32 = -3.0e38;
+  for (var t: u32 = t0; t < n; t += 256u) { m = max(m, sm_scores[off + t]); }
+  smw_r[t0] = m;
+  workgroupBarrier();
+  for (var s: u32 = 128u; s > 0u; s >>= 1u) {
+    if (t0 < s) { smw_r[t0] = max(smw_r[t0], smw_r[t0 + s]); }
+    workgroupBarrier();
+  }
+  let mx = smw_r[0];
+  for (var t: u32 = t0; t < n; t += 256u) { smw_e[t] = exp(sm_scores[off + t] - mx); }
+  workgroupBarrier();
+  if (t0 == 0u) {
+    var sum: f32 = 0.0;
+    for (var t: u32 = 0u; t < n; t++) { sum += smw_e[t]; }
+    smw_r[0] = sum;
+  }
+  workgroupBarrier();
+  let sum = smw_r[0];
+  for (var t: u32 = t0; t < n; t += 256u) { sm_scores[off + t] = smw_e[t] / sum; }
+}
+
 // --- attention out: out[h*hd+i] = sum_t scores[h,t] * vCache[t, kvH*hd+i] ---
 @group(1) @binding(0) var<storage, read> ao_scores: array<f32>;
 @group(1) @binding(1) var<storage, read> ao_vc: array<f32>;

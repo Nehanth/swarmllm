@@ -32,7 +32,7 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true }) {
     this.replay = replayRollback !== false;
     this.device = device;
     this.mvVariant = matvecVariant;
@@ -58,6 +58,8 @@ export class Qwen35Engine {
     const qDim = nH * hd, kvDim = nKV * hd;
     this.dims = { dim, nH, nKV, hd, nRot, inter, dState, nKH, nVH, dInner, keyDim, convDim, vocab, qDim, kvDim };
     this.maxSeq = maxSeq;
+    // workgroup softmax (bit-identical, see engine/wgsl/base.js); its staging array holds 2048 positions
+    this.softmaxWG = softmaxWG !== false && maxSeq <= 2048;
     const [lo, hi] = layerRange;
     this.lo = lo; this.hi = hi;
     this.hasEmbed = hasEmbed; this.hasHead = hasHead;
@@ -121,7 +123,7 @@ export class Qwen35Engine {
       matvec_q8_gu: ["ro", "ro", "ro", "ro", "ro", "rw", "u"], matvec_q8_gu_b: ["ro", "ro", "ro", "ro", "ro", "rw", "u"],
       matvec_q4_gu: ["ro", "ro", "ro", "ro", "ro", "rw", "u"], matvec_q4_gu_b: ["ro", "ro", "ro", "ro", "ro", "rw", "u"],
       rmsnorm: ["ro", "ro", "rw", "u"], head_norm: ["rw", "ro", "u"],
-      attn_scores: ["ro", "ro", "rw"], attn_softmax: ["rw"],
+      attn_scores: ["ro", "ro", "rw"], attn_softmax: ["rw"], attn_softmax_wg: ["rw"],
       attn_out: ["ro", "ro", "rw"], silu_mul: ["rw", "ro"], add_res: ["rw", "ro"],
       dn_conv: ["ro", "ro", "rw", "rw", "u"],
       dn_gates: ["ro", "ro", "ro", "ro", "rw", "rw", "u"],
@@ -459,7 +461,8 @@ export class Qwen35Engine {
       {
         const p = enc.beginComputePass();
         this._d(p, "attn_scores", L.bgScores, D.nH * seqLen);
-        this._d(p, "attn_softmax", L.bgSoftmax, D.nH, 1);
+        if (this.softmaxWG) this._d(p, "attn_softmax_wg", L.bgSoftmax, D.nH * 256, 256);
+        else this._d(p, "attn_softmax", L.bgSoftmax, D.nH, 1);
         this._d(p, "attn_out", L.bgAttnOut, D.qDim);
         this._d(p, "sigmoid_mul", L.bgSigMul, D.qDim);
         this._dop(p, L.mvO);
@@ -615,7 +618,7 @@ export class Qwen35Engine {
     const slice = (b, c) => ({ buffer: b.buf, offset: c * b.stride, size: b.n * 4 });
     const part = (b, c, off, size) => ({ buffer: b.buf, offset: c * b.stride + off, size });
     this.frameBufsB = cix.map(() => dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
-    const colPipes = ["rmsnorm", "head_norm", "attn_scores", "attn_softmax", "attn_out",
+    const colPipes = ["rmsnorm", "head_norm", "attn_scores", "attn_softmax", "attn_softmax_wg", "attn_out",
       "silu_mul", "add_res", "rope_part", "qsplit", "sigmoid_mul",
       "dn_gates", "dn_conv", "dn_l2", "dn_delta", "dn_gatenorm",
       "rmsnorm_mc", "add_res_mc", "dn_gates_mc", "dn_conv_mc", "dn_l2_mc", "dn_pre_mc", "dn_delta_mc", "dn_gatenorm_mc",
@@ -794,7 +797,8 @@ export class Qwen35Engine {
         for (let c = 0; c < nCols; c++) {   // shared score scratch: columns in turn
           const C = LB.cols[c];
           this._dCol(p, "attn_scores", c, C.scores, D.nH * (basePos + c + 1));
-          this._dCol(p, "attn_softmax", c, C.softmax, D.nH, 1);
+          if (this.softmaxWG) this._dCol(p, "attn_softmax_wg", c, C.softmax, D.nH * 256, 256);
+          else this._dCol(p, "attn_softmax", c, C.softmax, D.nH, 1);
           this._dCol(p, "attn_out", c, C.attnOut, D.qDim);
         }
         this._dMC(p, "sigmoid_mul_mc", M.sigMul, D.qDim, 64, nCols);
