@@ -17,6 +17,8 @@ each has a switch for A/B timing on real hardware.
 | attention | scores → softmax → out, whole row per head; the fast softmax stops at 2048 | `attn_flash` + `attn_combine`: splits of 256 positions, the 6 query heads that share a KV head read each K/V row once, online softmax, fixed-order merge |
 | room context (27B) | 2048 tokens | 8192 tokens (0.54 GB of KV for the whole model, split over the devices) |
 
+- Batched passes (prefill, verify) use `attn_flash_t2`: two columns per workgroup, each K/V row
+  read once for both, same bits as the one-column kernel (`attnTile: false` to compare).
 - `kv_store` writes the new K/V rows as packed f16 pairs in one dispatch (it replaces two
   buffer copies per column).
 - The same kernels serve decode (1 column) and verify / prefill (many columns), and all their
