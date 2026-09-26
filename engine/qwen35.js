@@ -32,7 +32,8 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0 }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true }) {
+    this.replay = replayRollback !== false;
     this.device = device;
     this.mvVariant = matvecVariant;
     this.coopWG = coopWG; this.coopRows = coopRows;
@@ -577,10 +578,22 @@ export class Qwen35Engine {
       this.xposeGated = xp(B.gated, B.aoT, D.dInner);
       this.xposeAttnOut = xp(B.attnOut, B.aoT, D.qDim);
     }
-    // rollback shadows for the recurrent layers (speculative decoding)
-    for (const L of this.layers) if (!L.isFull && !L.S_shadow) {
-      L.S_shadow = dev.createBuffer({ size: 7 * L.S.size, usage: S });
+    // Rollback for the recurrent layers (speculative decoding). Snapshots: the state after every
+    // verify column, 7 slots (~3.1 MB each per layer on the 27B: ~1 GB for a whole model).
+    // Replay (default): one pre-verify copy plus each column's delta-rule inputs; a rejection
+    // copies the state back and re-runs dn_delta_mc over the accepted columns: same kernel, same
+    // inputs, same order, so the state is bit-identical, in ~1/7 of the memory. The conv state
+    // snapshots are small and stay either way.
+    const maxCols = Math.max(NC, 8);
+    this._dummy = this._dummy || dev.createBuffer({ size: 256, usage: S });
+    for (const L of this.layers) if (!L.isFull && !L.conv_shadow) {
       L.conv_shadow = dev.createBuffer({ size: 7 * L.convState.size, usage: S });
+      if (this.replay) {
+        L.S_shadow = this._dummy;
+        L.S_pre = dev.createBuffer({ size: L.S.size, usage: S });
+        L.rp = { conv: dev.createBuffer({ size: maxCols * B.convOut.stride, usage: S }),
+          beta: dev.createBuffer({ size: maxCols * B.beta.stride, usage: S }), decay: dev.createBuffer({ size: maxCols * B.decay.stride, usage: S }) };
+      } else L.S_shadow = dev.createBuffer({ size: 7 * L.S.size, usage: S });
     }
     this.stageLogitsN = dev.createBuffer({ size: NC * D.vocab * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const slice = (b, c) => ({ buffer: b.buf, offset: c * b.stride, size: b.n * 4 });
@@ -676,6 +689,9 @@ export class Qwen35Engine {
           whole(B.beta), whole(B.decay), whole(B.convOut), mcU(0, st(B.alpha), st(B.convOut)), dn]),
         delta: this._bg2res(this.pipes.dn_delta_mc, [whole(B.convOut), whole(B.beta), whole(B.decay), { buffer: L.S }, whole(B.dOut),
           mcU(0, st(B.convOut), st(B.beta), st(B.dOut)), dn, { buffer: L.S_shadow }]),
+        // replay: the same kernel over the saved inputs of the accepted columns
+        replay: L.rp ? this._bg2res(this.pipes.dn_delta_mc, [{ buffer: L.rp.conv }, { buffer: L.rp.beta }, { buffer: L.rp.decay }, { buffer: L.S }, whole(B.dOut),
+          mcU(0, st(B.convOut), st(B.beta), st(B.dOut)), dn, { buffer: this._dummy }]) : null,
         gatenorm: this._bg2res(this.pipes.dn_gatenorm_mc, [whole(B.dOut), whole(B.z), { buffer: L.ssmNorm }, whole(B.gated),
           mcU(0, st(B.dOut), st(B.z), st(B.gated)), dn]),
       });
@@ -771,6 +787,8 @@ export class Qwen35Engine {
         p.end();
       }
     } else {
+      const R = this.replay && L.rp && this._snapNow;   // a verify pass: keep what replay needs
+      if (R && R.base === 0) enc.copyBufferToBuffer(L.S, 0, L.S_pre, 0, L.S.size);
       const p = enc.beginComputePass();
       this._dMC(p, "rmsnorm_mc", M.norm1, 256, 256, nCols);
       if (G) this._dop(p, this.xposeXn);
@@ -783,6 +801,8 @@ export class Qwen35Engine {
       this._dop(p, LB.out, nCols);
       if (!LB.out.acc) this._dMC(p, "add_res_mc", M.addTmp, D.dim, 64, nCols);
       p.end();
+      if (R) for (const [src, dst] of [[B.convOut, L.rp.conv], [B.beta, L.rp.beta], [B.decay, L.rp.decay]])
+        enc.copyBufferToBuffer(src.buf, 0, dst, R.base * src.stride, nCols * src.stride);
     }
     {
       const p = enc.beginComputePass();
@@ -814,12 +834,17 @@ export class Qwen35Engine {
   }
   // ids.length columns (1..4). snapshot: save recurrent state after every
   // non-final column so restoreDN(k) can undo a rejected speculative suffix.
+  _snapWord(snapshot, n) {   // frame.snap: slot base + 1 | total << 8 | replay (bit 31); records the verify chunk for the encoder
+    if (!snapshot) { this._snapNow = null; return 0; }
+    const base = typeof snapshot === "object" ? snapshot.base : 0, total = typeof snapshot === "object" ? snapshot.total : n;
+    this._snapNow = { base, total };
+    return (((total << 8) | (base + 1)) | (this.replay ? 0x80000000 : 0)) >>> 0;
+  }
   async embedRunBatch(ids, basePos, snapshot = false) {
     if (!this.B) this._initBatch();
     const n = ids.length;
     this.pos = basePos;
-    const sp = !snapshot ? 0 : typeof snapshot === "object"
-      ? ((snapshot.total << 8) | (snapshot.base + 1)) : ((n << 8) | 1);
+    const sp = this._snapWord(snapshot, n);
     for (let c = 0; c < n; c++) {
       this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, n, sp]));
       this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(ids[c]));
@@ -831,8 +856,7 @@ export class Qwen35Engine {
     const { dim } = this.dims;
     const n = xs.length / dim;
     this.pos = basePos;
-    const sp = !snapshot ? 0 : typeof snapshot === "object"
-      ? ((snapshot.total << 8) | (snapshot.base + 1)) : ((n << 8) | 1);
+    const sp = this._snapWord(snapshot, n);
     for (let c = 0; c < n; c++) {
       this.device.queue.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([basePos + c, basePos + c + 1, n, sp]));
       this.device.queue.writeBuffer(this.B.x.buf, c * this.B.x.stride, xs.subarray(c * dim, (c + 1) * dim));
@@ -925,8 +949,16 @@ export class Qwen35Engine {
   }
   _restoreDN(k) {   // recurrent state as it was after verify column k
     const enc = this.device.createCommandEncoder();
-    for (const L of this.layers) if (!L.isFull) {
-      enc.copyBufferToBuffer(L.S_shadow, k * L.S.size, L.S, 0, L.S.size);
+    if (this.replay) this.device.queue.writeBuffer(this.frameBufsB[0], 0, new Uint32Array([0, 1, k + 1, 0]));   // replay columns 0..k
+    for (let i = 0; i < this.layers.length; i++) {
+      const L = this.layers[i];
+      if (L.isFull) continue;
+      if (this.replay) {
+        enc.copyBufferToBuffer(L.S_pre, 0, L.S, 0, L.S.size);
+        const p = enc.beginComputePass();
+        this._dMC(p, "dn_delta_mc", this.layerB[i].mc.replay, this.dims.nVH * 128, 128, 1);
+        p.end();
+      } else enc.copyBufferToBuffer(L.S_shadow, k * L.S.size, L.S, 0, L.S.size);
       enc.copyBufferToBuffer(L.conv_shadow, k * L.convState.size, L.convState, 0, L.convState.size);
     }
     this.device.queue.submit([enc.finish()]);
@@ -1029,6 +1061,7 @@ export class Qwen35Engine {
 
   async prefillTokens(ids) {
     if (!this.B) this._initBatch();
+    this._snapNow = null;   // not a verify: nothing to keep for replay
     let i = 0, sinceSync = 0;
     const NC = this.NC;
     while (ids.length - i >= NC) {
