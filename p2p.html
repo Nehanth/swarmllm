@@ -304,6 +304,8 @@
   #chat-tools button:hover { color: var(--text); }
   #chat-tools button.on { color: var(--accent); border-color: var(--accent); }
   #chat-tools button[hidden] { display: none; }
+  #ai-output .m.replaced { opacity: 0.4; }
+  #ai-output .m.replaced .bubble { text-decoration: line-through; text-decoration-color: var(--faint); }
   #ctx-meter { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
   #ctx-meter.warn { color: var(--warn); }
   .bubble.drafts { white-space: pre-wrap; font-family: var(--mono); font-size: 12.5px; }
@@ -478,6 +480,8 @@
     <div id="ai-output"></div>
     <div id="chat-tools" hidden>
       <button id="new-chat" type="button" hidden title="forget the conversation">new chat</button>
+      <button id="continue-btn" type="button" hidden title="the answer hit the length cap: keep going">continue ↦</button>
+      <button id="regen-btn" type="button" hidden title="ask the last question again">regenerate ↻</button>
       <button id="draft-view" type="button" title="mark the words the draft head guessed right">show drafts</button>
       <button id="export-chat" type="button" title="save the chat as markdown">save</button>
       <span id="ctx-meter"></span>

@@ -133,3 +133,13 @@ Deno.test("preflight: every browser without WebGPU gets a specific remedy", () =
   ok(yes.ok && /apple metal-3/.test(yes.line), "ok line names the GPU");
   ok(!no(UA.firefox).ok && /ask questions/.test(no(UA.firefox).line), "guests are told they can still ask");
 });
+Deno.test("conversation: an open assistant turn (Continue) extends the caches without an end token", () => {
+  const t1 = [{ role: "user", text: "a" }];
+  const answer = [77, 78];
+  const closed = buildIds(tok, { turns: [...t1, { role: "assistant", ids: answer }] });
+  const open = buildIds(tok, { turns: [...t1, { role: "assistant", ids: answer, open: true }] });
+  eq(open, closed.slice(0, open.length), "open is the closed turn minus <|im_end|>\\n");
+  eq(closed.length - open.length, 2);
+  // what a capped speculative answer leaves in the caches (all but the last emitted token) is a prefix
+  eq(reusablePrefix(open.slice(0, -1), open), open.length - 1);
+});
