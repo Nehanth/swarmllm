@@ -71,3 +71,33 @@ End-to-end on the GB10 (two headless Chromium tabs, real PeerJS signaling and We
 27B in the emulator (GB10, `npm run e2e -- --phone --model qwen3.8-27b`, host 53 layers + embed/head, worker 9, phone-shaped tab 2, `japan` prompt, 400-token answers, weights served from local disk, loopback network): `--wire off` prefill 4.3 / 4.1 s, decode 10.3 / 9.9 tok/s; `--wire stripe4` prefill 4.5 / 4.2 s, decode 10.4 / 10.7 tok/s. Equal within noise on loopback, as expected; 459 frames per link each way. Both runs trip bug #31 (prompt + 400 tokens > 512 context): 1,741 GPU validation lines in the room log, which the emulator now reports.
 
 Topology change (host link + on-demand chain links instead of a full mesh) and `--devices N` in the emulator, GB10, 27B, `japan` prompt, local signaling, loopback: 3 devices online in 3.0 min, prefill 4.5 s, decode 10.4 tok/s; 16 devices (8 phone-shaped, 64 layers dealt 18+embed / 4-5 per worker / 2 per phone) online in 2.3 min, prefill 8.3 / 7.2 s, decode 3.8 / 4.7 tok/s, every device holding one host link and two chain links, no errors. The decode drop on a zero-latency network is per-hop processing (unpack, upload, readback, pack), about 15 ms per hop, now a measured target. 64 tabs in one Chromium fail at `vkCreateDevice` (one GPU process, driver device cap); not a room limit.
+
+## 2026-09-26: Qwen3.6-35B-A3B MoE on real hardware (GB10), expert kernels rebuilt
+
+File: bartowski `Qwen_Qwen3.6-35B-A3B-Q4_0.gguf` (shared experts Q5_0 → Q8 on load, routers BF16 → f32 exact).
+Reference: llama.cpp b10840 CUDA on the same file: 85.5 tok/s decode, 2520 tok/s pp512 (27B: 13.8 decode).
+
+Correctness: greedy output matches llama.cpp on three chat prompts (tests/test_moe.js); speculative decoding
+identical to plain. Plain "The capital of France is" is a near tie after " Paris" ("." 19.029 vs "," 18.968 here;
+llama.cpp CUDA picks ","), so it is not used as a golden.
+
+Per-token GPU time (timestamp queries, tests/prof_ts.js), before → after rebuilding the MoE kernels on the
+cooperative-GEMV layout (4 threads per block, vec4 x reuse across rows, unpack4x dequant) and a parallel router:
+
+| kernel      | before (µs × 40) | after |
+|-------------|------------------|-------|
+| moe_gu_q4   | 288              | 71    |
+| moe_dn_q4   | 169              | 43    |
+| moe_router  | 165              | 32    |
+| GPU total   | 41.7 ms          | 22.8 ms |
+
+Decode tok/s, plain / speculative (K=3):
+
+| | Deno (GB10) | Chrome (GB10) |
+|---|---|---|
+| MoE before | 17.8 / 9–20 | n/a |
+| MoE after  | 27.0 / 15–27 | 32–40 / 52–59 |
+| 27B (unchanged) | 9.7 / 15.9 | 9.4–10.8 / 18.7–22.6 |
+
+Deno adds ~11.7 ms per GPU sync (an empty submit + 4-byte readback: 11.7 ms in Deno, 0.76 ms in Chrome), so
+Chrome numbers (tests/bench/chrome_bench.mjs) are the ones to quote. CPU encode is 4.5 ms per MoE token (732 dispatches).

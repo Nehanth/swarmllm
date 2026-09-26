@@ -1,0 +1,37 @@
+<!doctype html><title>engine bench</title><pre id="log"></pre>
+<script type="module">
+// Decode benchmark in a real browser tab (Chrome): same checks as tests/test_moe.js / test_mtp.js.
+import { Qwen35Engine } from "../../engine/qwen35.js";
+import { makeTokenizer, argmax } from "../../engine/engine.js";
+import { parseGGUFHeader, qwen35Weights, tokenizerFromGGUF, streamEntryToGPU } from "../../engine/gguf.js";
+const q = new URLSearchParams(location.search), MODEL = q.get("model"), N = +(q.get("tokens") || 40), K = +(q.get("k") || 3), GOLD = JSON.parse(q.get("gold") || "[]");
+const log = (s) => { document.getElementById("log").textContent += s + "\n"; console.log(s); };
+const readAt = async (off, len) => { const r = await fetch(MODEL, { headers: { Range: `bytes=${off}-${off + len - 1}` } }); return new Uint8Array(await r.arrayBuffer()); };
+try {
+  const ad = await navigator.gpu.requestAdapter(); const device = await ad.requestDevice({ requiredLimits: { maxBufferSize: ad.limits.maxBufferSize, maxStorageBufferBindingSize: ad.limits.maxStorageBufferBindingSize } });
+  const G = parseGGUFHeader((await readAt(0, 64 << 20)).buffer); const tok = makeTokenizer(tokenizerFromGGUF(G.meta));
+  const arch = G.meta["general.architecture"], L = G.meta[arch + ".block_count"] - (G.meta[arch + ".nextn_predict_layers"] || 0);
+  // stream Q4_0/Q8_0 tensors straight into GPU buffers, as the room does (a 21 GB model does not fit in a tab's JS heap)
+  G.streamEntry = (info) => streamEntryToGPU(device, info, (i) => fetch(MODEL, { headers: { Range: `bytes=${i.byteOffset}-${i.byteOffset + i.byteLength - 1}` } }));
+  let t0 = performance.now();
+  const weights = await qwen35Weights(G, (i) => readAt(i.byteOffset, i.byteLength), { lo: 0, hi: L, hasEmbed: true, hasHead: true, mtp: true });
+  const eng = await Qwen35Engine.create({ device, meta: G.meta, weights, layerRange: [0, L], hasEmbed: true, hasHead: true, maxSeq: 512 });
+  log(`${arch}: loaded in ${((performance.now() - t0) / 1000).toFixed(0)}s, mtp ${!!eng.mtp}, adapter ${ad.info?.vendor}`);
+  const V = tok.vocab, chat = (s) => [V["<|im_start|>"], ...tok.encode("user\n" + s), V["<|im_end|>"], ...tok.encode("\n"), V["<|im_start|>"], ...tok.encode("assistant\n"), V["<think>"], ...tok.encode("\n\n"), V["</think>"], ...tok.encode("\n\n")];
+  const out = [];
+  for (const [i, prompt] of ["Write the Python code for two sum. Code only.", "Explain what a hash map is in two sentences."].entries()) {
+    const ids = chat(prompt);
+    eng.reset(); if (eng.mtp) eng.mtpFill = false; await eng.prefillTokens(ids.slice(0, -1)); let lg = await eng.forwardToken(ids.at(-1));
+    let next = argmax(lg); const gen = [next]; t0 = performance.now();
+    for (let j = 1; j < N; j++) { lg = await eng.forwardToken(next); next = argmax(lg); gen.push(next); }
+    const plain = (N - 1) / ((performance.now() - t0) / 1000), text = tok.decode(gen), g = GOLD[i] || "", n = Math.min(text.length, g.length);
+    let spec = null, same = null, acc = "";
+    if (eng.mtp) { eng.reset(); eng.mtpFill = true; eng.mtp.stats = { drafts: 0, accepted: 0 }; await eng.prefillTokens(ids.slice(0, -1)); lg = await eng.forwardToken(ids.at(-1));
+      next = argmax(lg); const sp = [next]; t0 = performance.now(); while (sp.length < N) { for (const x of await eng.specStep(next, argmax, K)) sp.push(x); next = sp.at(-1); }
+      spec = (sp.length - 1) / ((performance.now() - t0) / 1000); same = gen.every((x, j) => sp[j] === x); acc = `${eng.mtp.stats.accepted}/${eng.mtp.stats.drafts}`; }
+    const r = { prompt, plain: +plain.toFixed(2), spec: spec && +spec.toFixed(2), acceptance: acc, specIdentical: same, golden: g ? (n > 20 && text.slice(0, n) === g.slice(0, n)) : null, text: text.slice(0, 90) };
+    out.push(r); log(JSON.stringify(r));
+  }
+  window.RESULT = out;
+} catch (e) { log("ERROR " + (e.stack || e)); window.RESULT = { error: String(e) }; }
+</script>
