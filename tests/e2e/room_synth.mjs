@@ -136,6 +136,7 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
     await tabs.host.selectOption("#ai-model", MODEL_KEY);
     await tabs.host.waitForFunction(() => !document.getElementById("ai-start").disabled, null, { timeout: 20000 });
     const tLoad = Date.now();
+    if (arg("split")) await tabs.host.selectOption("#ai-split", arg("split"));
     await tabs.host.click("#ai-start");
     log(`[${label}] start pressed`);
     const poll = setInterval(async () => { for (const [n, p] of Object.entries(tabs)) { try { log(`[${label}] ${n}: ${(await status(p)).slice(0, 140)}`); } catch {} } }, 15000);
@@ -202,6 +203,15 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
       log(`[${label}] round ${r} (${secs}s) host status: ${per.host.status}`);
       for (const [n, v] of Object.entries(per)) console.log(`[${label}] round ${r} ${n}: stats=${JSON.stringify(v.stats)}\n    answer=${JSON.stringify(v.answer.slice(0, 400))}`);
       await tabs.host.waitForTimeout(500);
+      // --redeal-after R [--redeal-split speed]: after round R, re-deal the layers (the conversation
+      // carries on: the next question re-prefills it on the new split)
+      if (arg("redeal-after") !== undefined && +arg("redeal-after") === r && r + 1 < ROUNDS) {
+        if (arg("redeal-split")) await tabs.host.selectOption("#ai-split", arg("redeal-split"));
+        await tabs.host.evaluate(() => { const b = document.getElementById("ai-redeal"); b.hidden = false; b.click(); });
+        await tabs.host.waitForFunction(() => /cluster online/.test(document.getElementById("ai-status").textContent), null, { timeout: TIMEOUT });
+        const split = await tabs.host.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => /layer split/.test(t)).pop());
+        log(`[${label}] re-dealt after round ${r}: ${split}`);
+      }
       if (flag("new-chat") && r + 1 < ROUNDS) {
         await tabs.host.click("#new-chat").catch((e) => log(`[${label}] new chat: ${String(e).slice(0, 100)}`));
         await tabs.host.waitForTimeout(500);
