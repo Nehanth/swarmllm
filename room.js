@@ -616,15 +616,47 @@ const streamWithRetry = (url, streamOpts) => async (info) => {
     return streamEntryToGPU(ai.device, info, (i) => rangeFetch(url, i.byteOffset, i.byteOffset + i.byteLength - 1, true), streamOpts);
   }
 };
+// Prefetch: a shard is hundreds of tensors (a 27B worker with 30 layers fetches ~450), and fetching
+// them one after another pays the model host's time-to-first-byte every time. When the loader
+// asks for a tensor, the next PREFETCH tensors of the shard (file order) are requested too, so
+// several are in flight at once. Phones keep one: every buffered body is RAM they do not have.
+// ?prefetch=N overrides (0 = off, for A/B).
+const PREFETCH_Q = new URLSearchParams(location.search).get("prefetch");
+const prefetcher = { url: null, list: [], at: new Map(), pending: new Map() };
+function planPrefetch(url, infos) {
+  prefetcher.url = url;
+  prefetcher.list = infos.filter(Boolean).sort((a, b) => a.byteOffset - b.byteOffset);
+  prefetcher.at = new Map(prefetcher.list.map((x, i) => [x.byteOffset, i]));
+  prefetcher.pending = new Map();
+}
+function rangeOf(url, info) {
+  const lo = info.byteOffset, hi = info.byteOffset + info.byteLength - 1;
+  if (url !== prefetcher.url) return rangeFetch(url, lo, hi);
+  const ahead = PREFETCH_Q != null ? Math.max(0, parseInt(PREFETCH_Q, 10) || 0) : myMeta?.phone ? 1 : 4;
+  const i = prefetcher.at.get(lo);
+  if (i !== undefined) for (let k = i + 1; k <= i + ahead && k < prefetcher.list.length; k++) {
+    const n = prefetcher.list[k];
+    if (!prefetcher.pending.has(n.byteOffset)) {
+      const p = rangeFetch(url, n.byteOffset, n.byteOffset + n.byteLength - 1);
+      p.catch(() => {});
+      prefetcher.pending.set(n.byteOffset, p);
+    }
+  }
+  const p = prefetcher.pending.get(lo);
+  if (p) { prefetcher.pending.delete(lo); return p.catch(() => rangeFetch(url, lo, hi)); }   // a failed prefetch retries in line
+  return rangeFetch(url, lo, hi);
+}
+// the tensors a shard loads, for the prefetcher (a superset is harmless: the list only orders fetches)
+function shardInfos(G, names) { return [...new Set(names)].map((n) => G.tensors[n]).filter(Boolean); }
 const openRangeOf = (url) => async (info) => {
   if (pacerHook) await pacerHook();
   crumb("streaming " + info.name + " (" + (info.byteLength / 2 ** 20).toFixed(0) + " MB)");
-  return rangeFetch(url, info.byteOffset, info.byteOffset + info.byteLength - 1);
+  return rangeOf(url, info);
 };
 const rangeBytesOf = (url) => async (info) => {
   if (pacerHook) await pacerHook();
   crumb("fetching " + info.name + " (" + (info.byteLength / 2 ** 20).toFixed(0) + " MB)");
-  let r = await rangeFetch(url, info.byteOffset, info.byteOffset + info.byteLength - 1);
+  let r = await rangeOf(url, info);
   let bytes = new Uint8Array(await r.arrayBuffer());
   if (bytes.length !== info.byteLength) {
     r = await rangeFetch(url, info.byteOffset, info.byteOffset + info.byteLength - 1, true);
@@ -956,6 +988,15 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
     // tokens that the trunk then verifies in one batched pass (same output, faster)
     const opts = { lo: range[0], hi: range[1], hasEmbed, hasHead, mtp: hasHead };
     const total = qwen35ShardBytes(G, opts);
+    const names = [];
+    for (let l = range[0]; l < range[1]; l++) names.push(...Object.values(qwen35LayerNames(l)).filter((v) => typeof v === "string"));
+    if (hasEmbed || hasHead) names.push(GGML_EMBED);
+    if (hasHead) {
+      names.push(GGML_FINAL_NORM, GGML_OUTPUT);
+      const N = G.meta["qwen35.block_count"] - 1;
+      names.push(...Object.values(qwen35LayerNames(N, true)).filter((v) => typeof v === "string"), ...["eh_proj", "enorm", "hnorm", "shared_head_norm"].map((x) => `blk.${N}.nextn.${x}.weight`));
+    }
+    planPrefetch(M.gguf, shardInfos(G, names));
     G.streamEntry = streamWithRetry(M.gguf, streamOpts);
     const weights = await qwen35Weights(G, rangeBytesOf(M.gguf), opts, (done) => onProg(done, total),
       (e, name) => gpuUploadEntry(ai.device, e, name === GGML_EMBED));   // straight to the GPU, RAM stays flat
@@ -976,6 +1017,11 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
     ai.G = G; ai.GModel = modelKey;
     const opts = { lo: range[0], hi: range[1], hasEmbed, hasHead };
     const total = ggufShardBytes(G, opts);
+    const names = [];
+    for (let l = range[0]; l < range[1]; l++) names.push(...Object.values(ggmlLayerNames(l)));
+    if (hasEmbed || hasHead) names.push(GGML_EMBED);
+    if (hasHead) names.push(GGML_FINAL_NORM, GGML_OUTPUT);
+    planPrefetch(M.gguf, shardInfos(G, names));
     G.streamEntry = streamWithRetry(M.gguf, streamOpts);
     const weights = await ggufWeights(G, rangeBytesOf(M.gguf), opts, (done) => onProg(done, total),
       (e, name) => gpuUploadEntry(ai.device, e, name === GGML_EMBED));
@@ -995,6 +1041,7 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
       layerRange: range, hasEmbed, hasHead, maxSeq: MAX_SEQ,
     });
   }
+  prefetcher.pending.clear(); prefetcher.url = null;
   ai.range = range;
   ai.model = modelKey;
   aiLoading(false);
