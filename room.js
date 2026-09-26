@@ -847,7 +847,7 @@ function renderBot(m, live) {
   const b = m.querySelector(".bubble");
   if (draftView && m.pieces.length) {
     b.classList.add("drafts");
-    b.innerHTML = m.pieces.map((p) => p.d ? `<span class="dr">${esc(p.t)}</span>` : esc(p.t)).join("") + (live ? '<span class="cursor"></span>' : "");
+    b.innerHTML = m.pieces.map((p) => p.d ? `<span class="dr${p.d === 2 ? " lk" : ""}">${esc(p.t)}</span>` : esc(p.t)).join("") + (live ? '<span class="cursor"></span>' : "");
   } else {
     b.classList.remove("drafts");
     b.innerHTML = mdChat(m.pieces.map((p) => p.t).join("")) + (live ? '<span class="cursor"></span>' : "");
@@ -855,7 +855,7 @@ function renderBot(m, live) {
 }
 function chatBotPiece(text, d) {
   if (!botEl) chatBotStart();
-  botEl.pieces.push({ t: text, d: d ? 1 : 0 });
+  botEl.pieces.push({ t: text, d: d === 2 ? 2 : d ? 1 : 0 });
   renderBot(botEl, true);
   scrollChat();
 }
@@ -932,7 +932,7 @@ function setDraftView(on) {
   $("draft-view").classList.toggle("on", on);
   $("draft-view").textContent = on ? "hide drafts" : "show drafts";
   for (const m of document.querySelectorAll("#ai-output .m.bot")) if (m.pieces) renderBot(m, m === botEl);
-  if (on) toast("tinted words were guessed by the draft head and confirmed by the whole swarm in one lap");
+  if (on) toast("blue: guessed by the draft head · green: copied from earlier in the chat · both confirmed by the whole swarm in one lap");
 }
 // the swarm card: this room's best finished answer speed, its devices and layers, as a PNG
 function openCard() {
@@ -1691,7 +1691,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
       reply += piece;
       count++;
       chatBotPiece(piece, drafted);
-      sendChat({ t: "ai-token", text: piece, d: drafted ? 1 : 0 }, askerId);
+      sendChat({ t: "ai-token", text: piece, d: drafted || 0 }, askerId);
       const tps = count / ((performance.now() - t0) / 1000);
       aiStatus(`generating… ${count} tok · ${tps.toFixed(1)} tok/s`);
     };
@@ -1772,7 +1772,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
           const tk = toks[j];
           if (eos(tk)) { done = true; break; }
           if (count >= maxNew) { done = true; capped = true; if (j === toks.length - 1) pendTok = tk; break; }
-          emit(tk, j < toks.length - 1);   // all but the last were drafts the trunk accepted
+          emit(tk, j < toks.length - 1 ? (viaLookup ? 2 : 1) : 0);   // all but the last were drafts the trunk accepted (2: from lookup)
         }
         next = toks[toks.length - 1];
         const d = ai.engine.mtp.stats.drafts - st0.drafts;
