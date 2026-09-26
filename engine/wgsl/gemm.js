@@ -28,7 +28,7 @@ export const GEMM_S = {
 };
 
 export function gemmWGSL({ N = 16, T = 64, R = 2, KB = 2, splits = [2, 4, 8, 16],
-                          dIns = [5120, 6144, 17408], pairs = null, UNPACK = true } = {}) {
+                          dIns = [5120, 6144, 17408], pairs = null, pairs8 = [], UNPACK = true } = {}) {
   // pairs: [[dIn, S], ...] to emit exactly the kernels a model needs (each is
   // fully unrolled, so the module size and shader compile time scale with it)
   const rng = (n) => Array.from({ length: n }, (_, i) => i);
@@ -85,6 +85,59 @@ fn gemm_q4_${dIn}_s${S}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_inv
 }`;
   };
 
+  // Q8_0 twin of the kernel above (llama.cpp MMQ-style tiles, same row-stationary schedule and
+  // split-K reduce): a block is 32 signed bytes = two vec4<u32> in sequence (no nibble
+  // interleave), dequantized with unpack4xI8. The real 27B keeps ffn_down, ssm_out and
+  // attn_output in Q8_0, so without this they stayed on the batched GEMV in prefill.
+  const WV8 = TM * KB * 2, WPT8 = WV8 / T;
+  if (WV8 % T) throw new Error("gemm q8: T must divide the stage size");
+  const dq8 = (m, s) => UNPACK
+    ? `vec4<f32>(unpack4xI8(${m})) * ${s}`
+    : `vec4<f32>(f32(bitcast<i32>(${m} << 24u) >> 24u), f32(bitcast<i32>(${m} << 16u) >> 24u), f32(bitcast<i32>(${m} << 8u) >> 24u), f32(bitcast<i32>(${m}) >> 24u)) * ${s}`;
+  const kernel8 = (dIn, S) => {
+    const nb = dIn / 32, nStages = nb / KB;
+    if (nb % 2) throw new Error("gemm q8: dIn must be a multiple of 64 (f16 scales are paired)");
+    if (nStages % S) throw new Error(`gemm q8: S=${S} must divide ${nStages} stages for dIn=${dIn}`);
+    const stPerWG = nStages / S, W2 = 2 * KB;   // vec4 words per row per stage
+    return `
+@compute @workgroup_size(${T})
+fn gemm_q8_${dIn}_s${S}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x;
+  let dOut = qb_shape.dOut;
+  let wgl = wg.y * 32768u + wg.x;
+  let tile = wgl / ${S}u; let split = wgl % ${S}u;
+  let row0 = tile * ${TM}u; let st0 = split * ${stPerWG}u; let rb = row0 + t * ${R}u;
+  ${RR.map((r) => QN.map((q) => `var a${r}_${q} = vec4<f32>(0.0);`).join(" ")).join("\n  ")}
+  ${rng(WPT8).map((j) => `let li${j} = t + ${j * T}u; let lr${j} = min(row0 + li${j} / ${W2}u, dOut - 1u); let lb${j} = li${j} % ${W2}u;`).join("\n  ")}
+  ${rng(WPT8).map((j) => `var w${j} = gm_qs4[lr${j} * ${2 * nb}u + st0 * ${W2}u + lb${j}];`).join("\n  ")}
+  ${rng(XPT).map((j) => `var xv${j} = gm_xT[st0 * ${XV}u + t + ${j * T}u];`).join("\n  ")}
+  for (var s: u32 = 0u; s < ${stPerWG}u; s++) {
+    workgroupBarrier();
+    ${rng(WPT8).map((j) => `gm_W8[li${j}] = w${j};`).join(" ")}
+    ${rng(XPT).map((j) => `gm_X[t + ${j * T}u] = xv${j};`).join(" ")}
+    workgroupBarrier();
+    let bs = (st0 + s) * ${KB}u;
+    if (s + 1u < ${stPerWG}u) {
+      ${rng(WPT8).map((j) => `w${j} = gm_qs4[lr${j} * ${2 * nb}u + (st0 + s + 1u) * ${W2}u + lb${j}];`).join(" ")}
+      ${rng(XPT).map((j) => `xv${j} = gm_xT[(st0 + s + 1u) * ${XV}u + t + ${j * T}u];`).join(" ")}
+    }
+    ${RR.map((r) => rng(Math.max(1, KB >> 1)).map((pp) => `let sw${r}_${pp} = q4_sc[((min(rb + ${r}u, dOut - 1u) * ${nb}u + bs) >> 1u) + ${pp}u];`).join(" ")).join(" ")}
+    ${rng(KB).map((b) => `
+    {
+      ${RR.map((r) => `let sv${r} = unpack2x16float(sw${r}_${b >> 1})[${b & 1}u];`).join(" ")}
+      ${RR.map((r) => `let wa${r} = gm_W8[(t * ${R}u + ${r}u) * ${W2}u + ${2 * b}u]; let wb${r} = gm_W8[(t * ${R}u + ${r}u) * ${W2}u + ${2 * b + 1}u];`).join("\n      ")}
+      ${rng(8).map((j) => `
+      { ${RR.map((r) => `let d${r} = ${dq8(`w${j < 4 ? "a" : "b"}${r}[${j % 4}]`, `sv${r}`)};`).join(" ")}
+        ${rng(4).map((i) => { const k = 32 * b + 4 * j + i; return `
+        { ${QN.map((q) => `let x${q} = gm_X[${k * (N / 4) + q}u];`).join(" ")} ${RR.map((r) => QN.map((q) => `a${r}_${q} += d${r}[${i}] * x${q};`).join(" ")).join(" ")} }`; }).join("")}
+      }`).join("")}
+    }`).join("")}
+  }
+  let pb = split * ${N}u * dOut;
+  ${RR.map((r) => `if (rb + ${r}u < dOut) { ${QN.map((q) => rng(4).map((c) => `q4_y[pb + ${4 * q + c}u * dOut + rb + ${r}u] = a${r}_${q}[${c}];`).join(" ")).join(" ")} }`).join("\n  ")}
+}`;
+  };
+
   // Fixed-order split-K reduce. `_acc` folds the residual add in, exactly like
   // matvec_*_coop_b_acc. Writes into the engine's column-strided y layout.
   const reduce = (S, ACC) => `
@@ -114,7 +167,12 @@ fn gemm_xpose(@builtin(global_invocation_id) gid: vec3<u32>) {
     const key = `${dIn}:${S}`; if (seen.has(key)) continue; seen.add(key);
     if (((dIn / 32) / KB) % S === 0) kernels.push(kernel(dIn, S));
   }
-  const usedSplits = [...new Set(want.map(([, S]) => S))];
+  const seen8 = new Set();
+  for (const [dIn, S] of pairs8) {
+    const key = `${dIn}:${S}`; if (seen8.has(key)) continue; seen8.add(key);
+    if (((dIn / 32) / KB) % S === 0) kernels.push(kernel8(dIn, S));
+  }
+  const usedSplits = [...new Set([...want, ...pairs8].map(([, S]) => S))];
   return /* wgsl */ `
 // ---- row-stationary Q4_0 GEMM (N=${N}, T=${T}, R=${R}, KB=${KB}) ----
 // Aliases of bindings already declared by the matvec kernels. Legal because no
@@ -123,6 +181,7 @@ fn gemm_xpose(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(1) @binding(0) var<storage, read> gm_p: array<f32>;           // split-K partials / xpose source
 @group(1) @binding(2) var<storage, read> gm_xT: array<vec4<f32>>;    // column-major activations
 var<workgroup> gm_W: array<vec4<u32>, ${WV}>;
+${pairs8.length ? `var<workgroup> gm_W8: array<vec4<u32>, ${WV8}>;` : ""}
 var<workgroup> gm_X: array<vec4<f32>, ${XV}>;
 ${kernels.join("\n")}
 ${usedSplits.map((S) => reduce(S, false) + reduce(S, true)).join("\n")}

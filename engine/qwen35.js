@@ -32,7 +32,7 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true }) {
     this.replay = replayRollback !== false;
     this.device = device;
     this.mvVariant = matvecVariant;
@@ -76,6 +76,21 @@ export class Qwen35Engine {
         if (S && dOut >= 256 && dIn % 64 === 0 && ((dIn / 32) / 2) % S === 0) this._gemmShapes.set(`${dOut}x${dIn}`, S);
       }
     }
+    // Q8_0 tensors with a pinned shape get the Q8 GEMM (engine/wgsl/gemm.js kernel8): in the real
+    // 27B these are ffn_down, ssm_out and attn_output, ~40% of a DeltaNet layer's bytes
+    this._gemm8Pairs = [];
+    if (this._gemmShapes.size && gemm8 !== false) {
+      const q8keys = new Set();
+      const note = (e, dOut, dIn) => { if (e && e.kind === "q8") q8keys.add(`${dOut}x${dIn}`); };
+      for (const L of [...weights.layers, ...(weights.mtp ? [weights.mtp.layer] : [])]) {
+        note(L.ffnDown, dim, inter); note(L.wOut, dim, dInner); note(L.wo, dim, qDim);
+      }
+      for (const k of q8keys) {
+        const S = this._gemmShapes.get(k), dIn = +k.split("x")[1];
+        if (S && ((dIn / 32) / 2) % S === 0) this._gemm8Pairs.push([dIn, S]);
+      }
+    }
+    this._gemm8Set = new Set(this._gemm8Pairs.map(([dIn, S]) => `${dIn}:${S}`));
     this.gemmOn = this._gemmShapes.size > 0;
     this._gemmDIns = [...new Set([...this._gemmShapes.keys()].map((k) => +k.split("x")[1]))];
     this._gemmSplits = [...new Set(this._gemmShapes.values())];
@@ -85,7 +100,7 @@ export class Qwen35Engine {
     // ---- pipelines with explicit layouts ----
     const unpack = await probeUnpack(device);
     const mod = device.createShaderModule({ code: WGSL + coopWGSL(coopWG, coopRows, 64, batchCols, coopRowsB, unpack)
-      + (this.gemmOn ? gemmWGSL({ N: batchCols, pairs: this._gemmPairs, UNPACK: unpack }) : "") + WGSL2 });
+      + (this.gemmOn ? gemmWGSL({ N: batchCols, pairs: this._gemmPairs, pairs8: this._gemm8Pairs, UNPACK: unpack }) : "") + WGSL2 });
     const C = GPUShaderStage.COMPUTE;
     const layout0 = device.createBindGroupLayout({
       entries: [
@@ -134,6 +149,7 @@ export class Qwen35Engine {
     // matvec_q4_coop_b layout (qs, sc, x, y, shape) verbatim
     if (this.gemmOn) {
       for (const [dIn, S] of this._gemmPairs) G1[`gemm_q4_${dIn}_s${S}`] = G1.matvec_q4_coop_b;
+      for (const [dIn, S] of this._gemm8Pairs) G1[`gemm_q8_${dIn}_s${S}`] = G1.matvec_q4_coop_b;
       for (const S of this._gemmSplits) { G1[`gemm_red_s${S}`] = G1.matvec_q4_coop_b; G1[`gemm_red_s${S}_acc`] = G1.matvec_q4_coop_b; }
       G1.gemm_xpose = G1.matvec_q4_coop_b;
     }
@@ -398,7 +414,7 @@ export class Qwen35Engine {
     if (this.skip && this.skip.has(op.pipe)) return;
     // full-width prefill passes go through the row-stationary GEMM; anything
     // narrower (decode, speculative verify, prompt tail) uses the GEMV ladder
-    if (op.gemm && nCols === this.NC && this.gemm !== false) {
+    if (op.gemm && nCols === this.NC && this.gemm !== false && !(op.gemm.q8 && this.gemm8 === false)) {
       const g = op.gemm, z = (this._gz ^= 1);
       this._d3(pass, g.pipe, g.bg[z], g.wgs);
       this._d3(pass, g.red, g.redBg[z], g.redWgs);
@@ -622,9 +638,10 @@ export class Qwen35Engine {
         op[`wgs${W}`] = Math.ceil(dOut / this._rowsFor(W));   // narrower twins carry more rows per workgroup
       }
       const S2 = this._gemmShapes.get(`${dOut}x${dIn}`);
-      if (S2 && w.kind === "q4" && xT) {
-        const gp = `gemm_q4_${dIn}_s${S2}`, rp = `gemm_red_s${S2}${acc ? "_acc" : ""}`;
+      if (S2 && xT && (w.kind === "q4" || (w.kind === "q8" && this._gemm8Set.has(`${dIn}:${S2}`)))) {
+        const gp = `gemm_${w.kind}_${dIn}_s${S2}`, rp = `gemm_red_s${S2}${acc ? "_acc" : ""}`;
         op.gemm = {
+          q8: w.kind === "q8",
           pipe: gp, wgs: Math.ceil(dOut / GEMM_TILE) * S2,
           bg: [0, 1].map((z) => this._bg(this.pipes[gp], 1, [w.qs, w.sc, xT, this.gemmP[z], shp])),
           red: rp, redBg: [0, 1].map((z) => this._bg(this.pipes[rp], 1, [this.gemmP[z], w.sc, w.sc, yB.buf, shp])),
