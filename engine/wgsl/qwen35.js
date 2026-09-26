@@ -258,7 +258,7 @@ fn dn_conv_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
     cvm_y[col * cvm_mc.s1 + c] = acc / (1.0 + exp(-acc));
     s0 = s1; s1 = s2; s2 = x;
     let cvSB = frame.snap & 0xffu;       // snapshot slot base + 1 (0 = off)
-    if (cvSB != 0u && cvSB + col < (frame.snap >> 8u)) {
+    if (cvSB != 0u && cvSB + col < ((frame.snap >> 8u) & 0xffu)) {
       let so = (cvSB - 1u + col) * n * 3u + c * 3u;
       cvm_shadow[so] = s0; cvm_shadow[so + 1u] = s1; cvm_shadow[so + 2u] = s2;
     }
@@ -322,7 +322,9 @@ fn dn_delta_mc(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
     }
     dlm_o[col * dlm_mc.s2 + vOff + j] = (sq + d * kq) * scale;
     let dlSB = frame.snap & 0xffu;     // snapshot slot base + 1 (0 = off)
-    if (dlSB != 0u && dlSB + col < (frame.snap >> 8u)) {
+    // bit 31: replay rollback (the engine keeps one pre-verify state and re-runs this kernel
+    // on rejection), so no per-column state snapshots; the conv snapshots stay (they are tiny)
+    if (dlSB != 0u && (frame.snap & 0x80000000u) == 0u && dlSB + col < ((frame.snap >> 8u) & 0xffu)) {
       let slot = dlSB - 1u + col;
       for (var i: u32 = 0u; i < dS; i++) { dlm_shadow[slot * sSize + Sb + i * dS + j] = dlm_s[Sb + i * dS + j]; }
     }
