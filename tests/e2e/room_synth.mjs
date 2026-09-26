@@ -218,6 +218,13 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
       log(`[${label}] social: reaction count reached the host; host sees "${hostSees}"`);
       await g.fill("#ai-prompt", "");
     }
+    // --card PATH: open the swarm card and save a screenshot of it
+    if (arg("card")) {
+      await tabs.host.click("#card-btn");
+      await tabs.host.locator("#card-canvas").screenshot({ path: arg("card") });
+      log(`[${label}] swarm card saved to ${arg("card")}`);
+      await tabs.host.click("#card-close");
+    }
     // --regen: press Regenerate after the last round; with greedy sampling the answer must repeat
     if (flag("regen")) {
       const k = await tabs.host.evaluate(() => document.querySelectorAll(".m.bot .stats").length);

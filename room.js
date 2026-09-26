@@ -15,6 +15,7 @@ import { makeLink, attachWire, wireReady, sendFrame, PROTOCOL } from "./room/tra
 import { PERSONAS, specials, fitContext, reusablePrefix } from "./room/conversation.js";
 import { planSplit, ladder, bestFit, codeFromLocation } from "./room/plan.js";
 import { qrSVG } from "./room/qr.js";
+import { drawCard } from "./room/card.js";
 import { probe as preflight, deviceKind } from "./room/preflight.js";
 
 // Hidden-state transport (room/transport.js). ?wire=off falls back to PeerJS messages;
@@ -799,6 +800,28 @@ function setDraftView(on) {
   for (const m of document.querySelectorAll("#ai-output .m.bot")) if (m.pieces) renderBot(m, m === botEl);
   if (on) toast("tinted words were guessed by the draft head and confirmed by the whole swarm in one lap");
 }
+// the swarm card: this room's best finished answer speed, its devices and layers, as a PNG
+function openCard() {
+  const nodes = lastMap?.nodes?.length ? lastMap.nodes : [{ name: myName, layers: "", host: 1 }];
+  const tps = bestTps || lastMap?.st?.tps || lastSoloTps || 0;
+  drawCard($("card-canvas"), { model: (MODELS[ai.model || $("ai-model").value]?.label || "").split("\u00b7")[0].trim(),
+    code: roomCode, nodes, tps, acc: lastMap?.st?.acc, lap: lastMap?.st?.lap, date: new Date().toISOString().slice(0, 10) });
+  $("card").hidden = false;
+}
+async function cardBlob() { return new Promise((res) => $("card-canvas").toBlob(res, "image/png")); }
+$("card-btn").addEventListener("click", openCard);
+$("card-close").addEventListener("click", () => { $("card").hidden = true; });
+$("card").addEventListener("click", (e) => { if (e.target === $("card")) $("card").hidden = true; });
+$("card-save").addEventListener("click", async () => {
+  const a = document.createElement("a"); a.href = URL.createObjectURL(await cardBlob()); a.download = `swarm-${roomCode || "room"}.png`; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+});
+$("card-share").addEventListener("click", async () => {
+  const file = new File([await cardBlob()], `swarm-${roomCode || "room"}.png`, { type: "image/png" });
+  if (navigator.canShare?.({ files: [file] })) navigator.share({ files: [file], title: "Our SwarmLLM room" }).catch(() => {});
+  else toast("this browser can't share images: use save");
+});
+let lastSoloTps = 0;
 function exportChat() {
   const lines = [`# SwarmLLM room ${roomCode || ""}`, "", `_${new Date().toISOString().slice(0, 16).replace("T", " ")} · ${MODELS[ai.model || $("ai-model").value]?.label || ""}_`, ""];
   for (const m of document.querySelectorAll("#ai-output .m")) {
@@ -1362,8 +1385,11 @@ function mapStats(tps, acc) {
   const gpu = mapNodes().reduce((s, x) => s + (x.ms || 0), 0);
   return { tps, acc, lap: Math.round(lap), gpu: Math.round(gpu), net: Math.max(0, Math.round(lap - gpu)) };
 }
+let lastMap = null, bestTps = 0;
 function renderMap(nodes, st, live) {
   const el = $("swarm-map"); if (!el || !nodes?.length) return;
+  lastMap = { nodes, st: { ...(lastMap?.st || {}), ...(st || {}) } };
+  if (st?.tps && !live) bestTps = Math.max(bestTps, st.tps);
   el.hidden = false;
   el.classList.toggle("live", !!live);
   const lap = Math.max(120, Math.min(4000, st?.lap || 600));
@@ -1585,6 +1611,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
       + (capped ? (ai.pos >= MAX_SEQ - 2 ? ` · stopped: context full (${MAX_SEQ} tokens)` : ` · stopped at ${count} tokens`) : "")
       + (dropped ? ` · ${dropped} oldest exchange${dropped > 1 ? "s" : ""} forgotten to fit` : "");
     if (ai.chain.length && count) pushMap(count / Math.max(secs, 1e-3), acc, false, true);
+    else if (count > 8) lastSoloTps = Math.max(lastSoloTps, count / Math.max(secs, 1e-3));
   } catch (err) {
     failed = err;
     ai.fed = null;            // the caches are in an unknown state: the next question starts clean

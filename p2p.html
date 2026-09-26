@@ -358,6 +358,8 @@
   .sheet .row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
   .sheet .row button { font-family: var(--mono); font-size: 12px; border-radius: 100px; padding: 8px 16px; }
   .sheet .row button[hidden] { display: none; }
+  .sheet.wide { width: min(680px, 100%); }
+  #card-canvas { width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--border); }
   #room-over-why { font-size: 14px; color: var(--muted); }
   #join-status.warn { color: var(--warn); max-width: 420px; text-align: center; }
   @media (max-width: 820px) {
@@ -495,6 +497,7 @@
       <button id="continue-btn" type="button" hidden title="the answer hit the length cap: keep going">continue ↦</button>
       <button id="regen-btn" type="button" hidden title="ask the last question again">regenerate ↻</button>
       <button id="draft-view" type="button" title="mark the words the draft head guessed right">show drafts</button>
+      <button id="card-btn" type="button" title="a picture of what this room just did">swarm card</button>
       <button id="export-chat" type="button" title="save the chat as markdown">save</button>
       <button id="read-aloud" type="button" title="read answers aloud with this device's voice">read aloud</button>
       <span id="typing-note"></span>
@@ -512,6 +515,13 @@
     <div id="share-code"></div>
     <div id="share-url"></div>
     <div class="row"><button id="share-copy" type="button">copy link</button><button id="share-native" type="button" hidden>share…</button><button id="share-close" type="button">close</button></div>
+  </div>
+</div>
+<div id="card" class="overlay" hidden>
+  <div class="sheet wide" role="dialog" aria-label="swarm card">
+    <div class="k">YOUR SWARM</div>
+    <canvas id="card-canvas" width="1200" height="630"></canvas>
+    <div class="row"><button id="card-save" type="button">save PNG</button><button id="card-share" type="button">share…</button><button id="card-close" type="button">close</button></div>
   </div>
 </div>
 <div id="room-over" class="overlay" hidden>
