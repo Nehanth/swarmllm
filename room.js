@@ -1201,6 +1201,7 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
   }
   prefetcher.pending.clear(); prefetcher.url = null;
   if (ai.peerBytes) log("swarm", `${myName}: ${(ai.peerBytes / 2 ** 20).toFixed(1)} MB of weights came from devices in the room, ${((ai.netBytes || 0) / 2 ** 20).toFixed(1)} MB from the network`);
+  if (ai.engine) ai.engine.mtpBatchFill = MTP_BATCH;
   ai.range = range;
   ai.model = modelKey;
   aiLoading(false);
@@ -1467,9 +1468,16 @@ function resetState() {
 // (roadmap 25: +18–45% tokens per lap after a prompt). Drafts only change speed, never output.
 // ?fill=0 turns it off for A/B runs.
 const FILL_DRAFTS = new URLSearchParams(location.search).get("fill") !== "0";
+const MTP_BATCH = new URLSearchParams(location.search).get("mtpbatch") !== "0";   // ?mtpbatch=0: one draft-cache row per submit, for A/B
 function fillDrafts(h, ids, i0, basePos, n) {
   if (!FILL_DRAFTS || !ai.engine?.mtp) return;
-  const dim = ai.engine.dims.dim;
+  const dim = ai.engine.dims.dim, E = ai.engine;
+  // the whole round in one batched pass: its returned hiddens go into the engine's batch columns
+  if (MTP_BATCH && E._mtpFillBatch && E.B && n > 1 && n <= (E.NC || 4)) {
+    for (let c = 0; c < n; c++) E.device.queue.writeBuffer(E.B.x.buf, c * E.B.x.stride, h.subarray(c * dim, (c + 1) * dim));
+    E._mtpFillBatch(ids, i0, basePos, n);
+    return;
+  }
   for (let c = 0; c < n; c++) {
     const next = ids[i0 + c + 1];
     if (next === undefined) break;
