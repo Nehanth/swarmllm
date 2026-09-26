@@ -698,10 +698,11 @@ function chatUser(name, text) {
   m.dataset.name = name; m.dataset.text = text;
   o.appendChild(m); scrollChat();
 }
-function chatBotStart() {
+function chatBotStart(mid) {
   const o = aiOut();
   const m = document.createElement("div");
   m.className = "m bot";
+  if (mid != null) m.dataset.mid = mid;
   m.innerHTML = `<div class="who">swarm</div><div class="bubble"><span class="cursor"></span></div>`;
   m.pieces = [];
   o.appendChild(m); scrollChat();
@@ -728,7 +729,68 @@ function chatBotEnd(note, stats) {
   if (note) botEl.pieces = [{ t: note, d: 0 }];
   renderBot(botEl, false);
   if (stats) { const s = document.createElement("div"); s.className = "stats"; s.textContent = stats; botEl.appendChild(s); }
+  if (!note && botEl.dataset.mid) {
+    const r = document.createElement("div");
+    r.className = "reacts";
+    r.innerHTML = REACTIONS.map((e) => `<button type="button" data-e="${e}" aria-label="react ${e}">${e}<b></b></button>`).join("");
+    botEl.appendChild(r);
+    if (readAloud && botEl.pieces.length) speak(botEl.pieces.map((p) => p.t).join(""));
+  }
   botEl = null;
+}
+
+// ---- the room's social bits: reactions, who is typing, answers read aloud ----
+const REACTIONS = ["\u{1F44D}", "\u{1F525}", "\u{1F92F}", "\u{1F602}", "\u{1F41D}"];
+const myReacts = new Set();   // "mid|emoji" this device has on
+function renderReacts(mid, counts) {
+  const m = document.querySelector(`#ai-output .m.bot[data-mid="${CSS.escape(String(mid))}"]`); if (!m) return;
+  for (const b of m.querySelectorAll(".reacts button")) {
+    const n = counts?.[b.dataset.e] || 0;
+    b.querySelector("b").textContent = n ? String(n) : "";
+    b.classList.toggle("on", n > 0);
+    b.classList.toggle("mine", myReacts.has(mid + "|" + b.dataset.e));
+  }
+}
+function hostReact(mid, e, from) {
+  if (!REACTIONS.includes(e)) return;
+  ai.reacts ||= new Map();
+  const per = ai.reacts.get(mid) || {}; ai.reacts.set(mid, per);
+  const set = per[e] ||= new Set();
+  if (set.has(from)) set.delete(from); else set.add(from);
+  const counts = Object.fromEntries(Object.entries(per).map(([k, v]) => [k, v.size]));
+  broadcastAll({ t: "ai-reacts", mid, counts });
+  renderReacts(mid, counts);
+}
+$("ai-output").addEventListener("click", (ev) => {
+  const b = ev.target.closest(".reacts button"); if (!b) return;
+  const mid = b.closest(".m.bot")?.dataset.mid; if (!mid) return;
+  const key = mid + "|" + b.dataset.e;
+  if (myReacts.has(key)) myReacts.delete(key); else myReacts.add(key);
+  if (ai.role === "host") hostReact(mid, b.dataset.e, peer.id);
+  else if (ai.hostId) sendTo(ai.hostId, { t: "ai-react", mid, e: b.dataset.e });
+});
+let typingAt = 0;
+function noteTyping() {
+  const now = Date.now();
+  if (now - typingAt < 2000 || !$("ai-prompt").value.trim()) return;
+  typingAt = now;
+  if (ai.role === "host") { if (ai.visibility === "all") broadcastAll({ t: "ai-typing", name: myName }); }
+  else if (ai.hostId && conns.has(ai.hostId)) sendTo(ai.hostId, { t: "ai-typing" });
+}
+let typingTimer = null;
+function showTyping(name) {
+  $("typing-note").textContent = `${name} is typing\u2026`;
+  clearTimeout(typingTimer);
+  typingTimer = setTimeout(() => { $("typing-note").textContent = ""; }, 3500);
+}
+let readAloud = false;
+function speak(raw) {
+  try {
+    const text = raw.replace(/<think>[\s\S]*?(<\/think>|$)/g, "").replace(/[*_`#>]+/g, "").trim();
+    if (!text) return;
+    speechSynthesis.cancel();
+    speechSynthesis.speak(new SpeechSynthesisUtterance(text.slice(0, 4000)));
+  } catch {}
 }
 function setDraftView(on) {
   draftView = on;
@@ -1377,8 +1439,9 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
 
   setAfterAnswer(false, false);
   if (!cont) chatUser(asker, text);
-  chatBotStart();
-  sendChat({ t: "ai-genstart", name: asker, text, asker: askerId, cont: cont ? 1 : 0 }, askerId);
+  const mid = ai.msgSeq = (ai.msgSeq || 0) + 1;
+  chatBotStart(mid);
+  sendChat({ t: "ai-genstart", name: asker, text, asker: askerId, cont: cont ? 1 : 0, mid }, askerId);
   mascot("Thinking… every word is taking a lap through the room.");
 
   const answer = [];          // sampled ids of this answer, verbatim, for the next turn's history
@@ -1540,7 +1603,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
   sendChat({ t: "ai-gendone", stats, ctx, failed: failed ? 1 : 0, capped: canContinue ? 1 : 0 }, askerId);   // unlocks every send box
   setAfterAnswer(canContinue, !failed);
   if (cont && ai.transcript.length) { const t = ai.transcript[ai.transcript.length - 1]; t.reply += reply; t.stats = stats; }
-  else ai.transcript.push({ name: asker, text, reply, stats });
+  else ai.transcript.push({ name: asker, text, reply, stats, mid });
   if (ai.transcript.length > 50) ai.transcript.shift();
   setCtx(ctx.used, ctx.max);
   if (!failed) aiStatus(`ready — prefill ${prefilled} tok in ${(tPre / 1000).toFixed(1)}s${ai.chain.length ? ` / ${preFrames} frame${preFrames === 1 ? "" : "s"}` : ""}${reused ? ` (${reused} reused)` : ""}, ${stats}`);
@@ -1745,12 +1808,22 @@ async function aiOnData(from, d) {
       toast(`answers now: ${PERSONAS[d.persona]?.label || d.persona}${d.thinking ? " · thinking first" : ""}`);
       break;
     case "ai-regen": markReplaced(); break;
+    case "ai-react": if (ai.role === "host") hostReact(String(d.mid), d.e, from); break;
+    case "ai-reacts": renderReacts(String(d.mid), d.counts); break;
+    case "ai-typing":
+      if (ai.role === "host") {
+        if (ai.visibility !== "all") break;
+        const name = conns.get(from)?.name || "someone";
+        for (const id of conns.keys()) if (id !== from) sendTo(id, { t: "ai-typing", name });
+        showTyping(name);
+      } else showTyping(d.name || "someone");
+      break;
     case "ai-cmd": aiCommand(d.cmd, from); break;
     case "ai-genstart":
       setAfterAnswer(false, false);
       if (!d.cont)
       chatUser(d.name, d.hidden ? "asked something (the host keeps the chat private)" : d.text);
-      chatBotStart();
+      chatBotStart(d.hidden ? null : d.mid);
       setBusyUI(true, d.asker === peer.id);
       mascot(`${d.name} asked something. Thinking…`);
       break;
@@ -1765,7 +1838,7 @@ async function aiOnData(from, d) {
     case "ai-history":
       for (const it of d.items || []) {
         chatUser(it.name, it.text);
-        chatBotStart();
+        chatBotStart(it.mid);
         botEl.pieces = [{ t: it.reply || "", d: 0 }];
         chatBotEnd(null, it.stats);
       }
@@ -1868,7 +1941,14 @@ function growPrompt() {
   if (!$("ai-prompt").value) queueMicrotask(sendLabel); const p = $("ai-prompt"); p.style.height = "auto"; p.style.height = Math.min(p.scrollHeight, 160) + "px"; }
 // the button stops while it says Stop; Enter always sends (or queues) the text, never stops
 $("ai-send").addEventListener("click", () => { if ($("ai-send").classList.contains("stop")) aiStop(); else aiSubmit(); });
-$("ai-prompt").addEventListener("input", () => { growPrompt(); sendLabel(); });
+$("ai-prompt").addEventListener("input", () => { growPrompt(); sendLabel(); noteTyping(); });
+if (!("speechSynthesis" in window)) $("read-aloud").hidden = true;
+$("read-aloud").addEventListener("click", () => {
+  readAloud = !readAloud;
+  $("read-aloud").classList.toggle("on", readAloud);
+  if (!readAloud) try { speechSynthesis.cancel(); } catch {}
+  toast(readAloud ? "answers are read aloud by this device's own voice (nothing leaves the room)" : "read aloud off");
+});
 $("ai-prompt").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing && !myMeta?.phone) { e.preventDefault(); aiSubmit(); }
 });
