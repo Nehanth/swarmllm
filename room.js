@@ -1870,10 +1870,14 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
         const tStep = performance.now();
         // prompt lookup first: if the text is repeating something in the context, verify what
         // followed it last time (free to guess, up to 7 at once); otherwise the draft head
-        const lk = LOOKUP && ai.engine.specStepDrafts && ai.fed ? lookupDrafts([...ai.fed, next], Math.min(7, roomLeft, maxNew - count)) : [];
+        // a lookup run that was accepted in full is probably a copy in progress (code being edited,
+        // a file quoted back): let the next one run long, up to what one verify can take
+        const lkMax = ai.lkFull ? (ai.engine.maxDrafts || 7) : 7;
+        const lk = LOOKUP && ai.engine.specStepDrafts && ai.fed ? lookupDrafts([...ai.fed, next], Math.min(lkMax, roomLeft, maxNew - count)) : [];
         const viaLookup = lk.length >= 2;
         const toks = viaLookup ? await ai.engine.specStepDrafts(next, sample, lk, spec) : await ai.engine.specStep(next, sample, K, spec);
         if (viaLookup) copied += toks.length - 1;
+        ai.lkFull = viaLookup && toks.length === lk.length + 1;
         // specStep wrote `next` and the accepted drafts; its last token is the next `next`
         ai.fed.push(next, ...toks.slice(0, -1));
         const tps = toks.length / ((performance.now() - tStep) / 1000);

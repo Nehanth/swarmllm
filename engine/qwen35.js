@@ -119,6 +119,9 @@ export class Qwen35Engine {
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
   async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false, attnGlue = true, dnFuse = true, attnMC = true, attnFlash = true }) {
     this.replay = replayRollback !== false;
+    // longest draft run one verify can take: with replay rollback the limit is the replay buffers
+    // (max(batchCols, 8) columns), so prompt-lookup drafts can run to 15 tokens when code is being copied
+    this.maxDrafts = this.replay ? Math.min(15, Math.max(batchCols, 8) - 1) : 7;
     this.device = device;
     this.mvVariant = matvecVariant;
     this.coopWG = coopWG; this.coopRows = coopRows;
@@ -769,7 +772,7 @@ export class Qwen35Engine {
     const maxCols = Math.max(NC, 8);
     this._dummy = this._dummy || dev.createBuffer({ size: 256, usage: S });
     for (const L of this.layers) if (!L.isFull && !L.conv_shadow) {
-      L.conv_shadow = dev.createBuffer({ size: 7 * L.convState.size, usage: S });
+      L.conv_shadow = dev.createBuffer({ size: Math.max(7, this.maxDrafts) * L.convState.size, usage: S });
       if (this.replay) {
         L.S_shadow = this._dummy;
         L.S_pre = dev.createBuffer({ size: L.S.size, usage: S });
@@ -1252,7 +1255,7 @@ export class Qwen35Engine {
   // specStep), the accepted ones after it from the exact trunk hiddens.
   async specStepDrafts(tNext, sample, drafts, { runTrunk = null, onReject = null } = {}) {
     const pos = this.pos, M2 = this.mtp, { dim } = this.dims;
-    const K = Math.max(1, Math.min(7, drafts.length));
+    const K = Math.max(1, Math.min(this.maxDrafts || 7, drafts.length));
     drafts = drafts.slice(0, K);
     if (M2) await this.mtpRun(null, tNext, pos, false);
     const { lgs, hs } = await this.verifyN([tNext, ...drafts], pos, runTrunk);
