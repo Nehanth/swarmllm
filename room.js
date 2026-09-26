@@ -758,10 +758,17 @@ function exportChat() {
 // guests (the host honours ai-stop from the asker only).
 function setBusyUI(busy, canStop) {
   const b = $("ai-send");
-  b.classList.toggle("stop", !!(busy && canStop));
-  b.textContent = busy && canStop ? "Stop" : "Send";
-  b.disabled = !!(busy && !canStop);
+  b.dataset.canStop = busy && canStop ? "1" : "";
+  b.disabled = false;
   $("ai-row").classList.toggle("busy", !!busy);
+  sendLabel();
+}
+// while busy, the button stops the answer when the box is empty and queues the text otherwise
+function sendLabel() {
+  const b = $("ai-send"), busy = $("ai-row").classList.contains("busy"), typed = !!$("ai-prompt").value.trim();
+  const stop = busy && b.dataset.canStop === "1" && !typed;
+  b.classList.toggle("stop", stop);
+  b.textContent = stop ? "Stop" : busy ? "Queue" : "Send";
 }
 function setCtx(used, max) {
   const el = $("ctx-meter"); if (!el) return;
@@ -1360,7 +1367,6 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
   ai.busy = "gen";
   ai.abort = false;
   ai.askerId = askerId;
-  if (askerId === peer.id && !cont) { $("ai-prompt").value = ""; growPrompt(); }
   ai.lastAsker = askerId;
   setBusyUI(true, true);
   const S = specials(ai.tok);
@@ -1542,6 +1548,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
   ai.busy = false;
   ai.abort = false;
   setBusyUI(false);
+  setTimeout(nextQueued, 0);
   if (ai.degraded) showRedeal(true);
   void t0Gen;
 }
@@ -1777,9 +1784,12 @@ async function aiOnData(from, d) {
       break;
     case "ai-ask":
       if (ai.role !== "host") break;
-      if (ai.busy === "gen") { sendTo(from, { t: "ai-busy" }); break; }
-      aiGenerate(d.text, d.name, from);
+      aiAsk(String(d.text || "").slice(0, 8000), d.name, from);
       break;
+    case "ai-queued":
+      toast(d.pos === 1 ? "queued: yours is next" : `queued: ${d.pos - 1} question${d.pos > 2 ? "s" : ""} ahead of yours`);
+      break;
+    case "ai-queue": showQueue(d.n); break;
     case "ai-stop":
       if (ai.role === "host" && ai.busy === "gen" && from === ai.askerId) { ai.abort = true; aiStatus(`${e?.name || "the asker"} pressed stop…`); }
       break;
@@ -1812,11 +1822,36 @@ $("draft-view").addEventListener("click", () => setDraftView(!draftView));
 $("export-chat").addEventListener("click", exportChat);
 for (const [id, cmd] of [["continue-btn", "continue"], ["regen-btn", "regen"]])
   $(id).addEventListener("click", () => { setAfterAnswer(false, false); if (ai.role === "host") aiCommand(cmd, peer.id); else if (ai.hostId) sendTo(ai.hostId, { t: "ai-cmd", cmd }); });
+// Questions asked while the swarm is answering wait in the host's queue and run in order, one
+// generation at a time (every device is busy with every token). At most QUEUE_MAX waiting, two
+// per device.
+const QUEUE_MAX = 10;
+function aiAsk(text, name, from) {
+  if (!text) return;
+  if (ai.busy !== "gen" && !ai.queue?.length && !ai.degraded) { aiGenerate(text, name, from); return; }
+  ai.queue ||= [];
+  if (ai.queue.length >= QUEUE_MAX || ai.queue.filter((q) => q.from === from).length >= 2) {
+    const why = "the queue is full, try again after this answer";
+    if (from === peer.id) toast(why); else sendTo(from, { t: "ai-busy", why });
+    return;
+  }
+  ai.queue.push({ text, name, from });
+  const pos = ai.queue.length;
+  if (from === peer.id) toast(pos === 1 ? "queued: yours is next" : `queued: ${pos - 1} ahead of yours`);
+  else sendTo(from, { t: "ai-queued", pos });
+  broadcastAll({ t: "ai-queue", n: ai.queue.length }); showQueue(ai.queue.length);
+}
+function nextQueued() {
+  if (ai.role !== "host" || ai.busy || ai.degraded || !ai.engine || !ai.queue?.length) return;
+  const q = ai.queue.shift();
+  broadcastAll({ t: "ai-queue", n: ai.queue.length }); showQueue(ai.queue.length);
+  aiGenerate(q.text, q.name, q.from);
+}
+function showQueue(n) { $("queue-note").textContent = n ? `${n} queued` : ""; }
 function aiSubmit() {
-  if ($("ai-send").classList.contains("stop")) { aiStop(); return; }
   const text = $("ai-prompt").value.trim();
-  if (!text || $("ai-row").classList.contains("busy")) return;
-  if (ai.role === "host") { aiGenerate(); return; }
+  if (!text) return;
+  if (ai.role === "host") { $("ai-prompt").value = ""; growPrompt(); aiAsk(text, myName, peer.id); return; }
   const hostId = ai.hostId;
   if (!conns.has(hostId)) { toast("not connected to the host"); return; }
   $("ai-prompt").value = ""; growPrompt();
@@ -1829,9 +1864,11 @@ function aiStop() {
 }
 // the prompt box grows with its text; Enter sends and Shift+Enter is a new line (phones: the
 // keyboard's return key is a new line, the Send button sends)
-function growPrompt() { const p = $("ai-prompt"); p.style.height = "auto"; p.style.height = Math.min(p.scrollHeight, 160) + "px"; }
-$("ai-send").addEventListener("click", aiSubmit);
-$("ai-prompt").addEventListener("input", growPrompt);
+function growPrompt() {
+  if (!$("ai-prompt").value) queueMicrotask(sendLabel); const p = $("ai-prompt"); p.style.height = "auto"; p.style.height = Math.min(p.scrollHeight, 160) + "px"; }
+// the button stops while it says Stop; Enter always sends (or queues) the text, never stops
+$("ai-send").addEventListener("click", () => { if ($("ai-send").classList.contains("stop")) aiStop(); else aiSubmit(); });
+$("ai-prompt").addEventListener("input", () => { growPrompt(); sendLabel(); });
 $("ai-prompt").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing && !myMeta?.phone) { e.preventDefault(); aiSubmit(); }
 });

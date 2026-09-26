@@ -306,6 +306,9 @@
   #chat-tools button[hidden] { display: none; }
   #ai-output .m.replaced { opacity: 0.4; }
   #ai-output .m.replaced .bubble { text-decoration: line-through; text-decoration-color: var(--faint); }
+  #queue-note { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--accent); }
+  #queue-note:empty { display: none; }
+  #queue-note:not(:empty) + #ctx-meter { margin-left: 10px; }
   #ctx-meter { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
   #ctx-meter.warn { color: var(--warn); }
   .bubble.drafts { white-space: pre-wrap; font-family: var(--mono); font-size: 12.5px; }
@@ -484,6 +487,7 @@
       <button id="regen-btn" type="button" hidden title="ask the last question again">regenerate ↻</button>
       <button id="draft-view" type="button" title="mark the words the draft head guessed right">show drafts</button>
       <button id="export-chat" type="button" title="save the chat as markdown">save</button>
+      <span id="queue-note"></span>
       <span id="ctx-meter"></span>
     </div>
     <div id="ai-row"><textarea id="ai-prompt" rows="1" placeholder="ask the swarm…" enterkeyhint="send"></textarea><button id="ai-send" class="primary">Send</button></div>
