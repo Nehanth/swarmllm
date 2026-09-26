@@ -642,7 +642,7 @@ let ai = {
   conv: { turns: [] },   // host: the conversation (room/conversation.js)
   fed: [],               // host: the exact tokens every device's caches hold, in order; null = unknown, reset first
   pendingCtl: {},        // host: control for the chain that rides on the next frame ({ reset } or { rb })
-  settings: { persona: "default", sampling: "creative", thinking: false },
+  settings: { persona: "default", sampling: "creative", thinking: false, length: "normal" },
   transcript: [],        // host: [{ name, text, reply, stats }] for devices that join later
   teleBy: new Map(),     // host: worker id -> compute ms per frame kind, from ai-tele
   q: Promise.resolve(),  // worker: frames run strictly one after another, in arrival order
@@ -1304,6 +1304,9 @@ function sendChat(msg, askerId) {
   if (msg.t !== "ai-token") for (const id of hidden) sendTo(id, { t: msg.t, name: msg.name, stats: msg.stats, asker: msg.asker, ctx: msg.ctx, hidden: true });
 }
 
+// answer length the host picks; ?maxnew=N overrides it (tests)
+const ANSWER_LEN = { short: 150, normal: MAX_NEW, long: 1200 };
+const MAXNEW_PARAM = Math.max(0, parseInt(new URLSearchParams(location.search).get("maxnew"), 10) || 0);
 async function aiGenerate(textArg, who, askerId = peer.id) {
   const text = (textArg ?? $("ai-prompt").value).trim();
   const asker = who || myName;
@@ -1342,7 +1345,8 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
     if (!reused) resetState();
     const ids = fit.ids.slice(reused);
     prefilled = ids.length;
-    const maxNew = Math.min(thinking ? MAX_NEW_THINKING : MAX_NEW, MAX_SEQ - fit.ids.length);
+    const cap = thinking ? MAX_NEW_THINKING : (ANSWER_LEN[ai.settings.length] ?? MAX_NEW);
+    const maxNew = Math.min(MAXNEW_PARAM || cap, MAX_SEQ - fit.ids.length);
     aiStatus(reused ? `prefill: ${ids.length} new tokens (${reused} already in the room's caches)…` : `prefill: ${ids.length} tokens…`);
     const t0Pre = performance.now();
     let logits = await aiPrefill(ids);
@@ -1415,7 +1419,9 @@ async function aiGenerate(textArg, who, askerId = peer.id) {
         let K = pickK();
         const roomLeft = MAX_SEQ - ai.engine.pos - 2;
         if (roomLeft < 1) { capped = true; break; }
-        K = Math.min(K, roomLeft, maxNew - count + 1);
+        // never draft past the answer cap: every token a step writes into the caches is then an
+        // emitted one, so a capped answer is still a prefix of the next turn and nothing re-prefills
+        K = Math.min(K, roomLeft, maxNew - count);
         const tStep = performance.now();
         const toks = await ai.engine.specStep(next, sample, K, spec);
         // specStep wrote `next` and the accepted drafts; its last token is the next `next`
@@ -1705,10 +1711,10 @@ $("ai-visibility").addEventListener("change", (e) => {
 for (const [k, v] of Object.entries(PERSONAS)) $("ai-persona").add(new Option(v.label, k));
 for (const [k, v] of Object.entries(SAMPLING)) $("ai-sampling").add(new Option(v.label, k));
 function styleChanged() {
-  ai.settings = { persona: $("ai-persona").value, sampling: $("ai-sampling").value, thinking: $("ai-thinking").checked };
+  ai.settings = { persona: $("ai-persona").value, sampling: $("ai-sampling").value, thinking: $("ai-thinking").checked, length: $("ai-length").value };
   broadcastAll({ t: "ai-style", ...ai.settings });
 }
-for (const id of ["ai-persona", "ai-sampling", "ai-thinking"]) $(id).addEventListener("change", styleChanged);
+for (const id of ["ai-persona", "ai-sampling", "ai-thinking", "ai-length"]) $(id).addEventListener("change", styleChanged);
 $("cache-clear").addEventListener("click", async (ev) => {
   ev.preventDefault();
   try { await caches.delete("swarmllm-weights-v1"); weightCache = null; toast("cached weights cleared"); } catch { toast("could not clear the cache"); }

@@ -115,8 +115,9 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
   const pledges = pledgesFor(nDev);
   const out = { label, devices: nDev, rounds: [], errors: errs };
   const base = `http://127.0.0.1:${PORT}/p2p.html?signal=127.0.0.1:${SIGNAL_PORT}`;
+  const maxNewQ = arg("max-new", ""); const baseQ = maxNewQ ? `&maxnew=${maxNewQ}` : "";
   try {
-    for (const p of Object.values(tabs)) await p.goto(base);
+    for (const p of Object.values(tabs)) await p.goto(base + baseQ);
     for (const p of Object.values(tabs)) await p.waitForFunction(() => document.getElementById("join-gb").value !== "", null, { timeout: 60000 });
     for (const [i, n] of names.entries()) { await tabs[n].fill("#name-input", n + "-e2e"); await tabs[n].fill("#join-gb", pledges[i] || "5"); }
     await tabs.host.click("#create-btn");
