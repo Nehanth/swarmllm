@@ -64,7 +64,7 @@ export function serveRepo(port, extra = {}) {
 }
 
 // ---------------------------------------------------------------- in-page test body
-async function pageMain({ modelUrl, tokens: N, cols, ks, wg, noSplit }) {
+async function pageMain({ modelUrl, tokens: N, cols, ks, wg, noSplit, kvQ8 }) {
   const { Qwen35Engine } = await import("/engine/qwen35.js");
   const { parseGGUFHeader, qwen35Weights, tokenizerFromGGUF, f32ToF16, f16ToF32, GGML_EMBED } = await import("/engine/gguf.js");
   const { makeTokenizer, argmax } = await import("/engine/engine.js");
@@ -105,7 +105,7 @@ async function pageMain({ modelUrl, tokens: N, cols, ks, wg, noSplit }) {
   const show = (ids) => JSON.stringify(tok.decode(ids).slice(0, 90));
 
   for (const NC of cols) {
-    const eopts = { maxSeq: 512, batchCols: NC, coopRowsB: NC >= 16 ? 1 : 4, coopWG: wg };
+    const eopts = { maxSeq: 512, batchCols: NC, coopRowsB: NC >= 16 ? 1 : 4, coopWG: wg, kvQ8 };
     const mk = async (lo, hi, head) => Qwen35Engine.create({ device, meta: G.meta, layerRange: [lo, hi], hasEmbed: head, hasHead: head,
       vocab: G.tensors[GGML_EMBED].shape[0], ...eopts,
       weights: await qwen35Weights(G, bytesOf, { lo, hi, hasEmbed: head, hasHead: head, mtp: head }) });
@@ -310,7 +310,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
     await page.goto(`http://127.0.0.1:${PORT}/__blank.html`);
     const r = await page.evaluate(pageMain, {
       modelUrl: "/__synth.gguf", tokens: +arg("tokens", 40),
-      cols: arg("cols", "4,16").split(",").map(Number), ks: arg("ks", "1,3,7").split(",").map(Number), wg: +arg("wg", 64), noSplit: flag("no-split"),
+      cols: arg("cols", "4,16").split(",").map(Number), ks: arg("ks", "1,3,7").split(",").map(Number), wg: +arg("wg", 64), noSplit: flag("no-split"), kvQ8: flag("q8"),   // --q8: int8 KV cache
     });
     const fails = r.results.filter((x) => !x.ok);
     console.log(`\n${r.results.length - fails.length}/${r.results.length} checks passed in ${((Date.now() - t0) / 1000).toFixed(0)}s`);

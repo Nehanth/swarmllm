@@ -26,9 +26,12 @@ each has a switch for A/B timing on real hardware.
   (same greedy tokens; logit differences at 1e-6 of the logit range, also on a 2300-token prompt
   past the old 2048 limit, and at the 27B's shapes).
 - Switch: `Qwen35Engine.create({ attnFlash: false })` restores the f32 path.
+- int8 KV (`kvQ8: true`, room `?kv=q8`): one f32 scale per 32 values, `kv_store_q8` /
+  `attn_flash_q8` from the same template as the f16 kernel. 36 KB per token for the whole 27B.
+  Opt-in until someone checks long-document quality on the real model.
 - Any `maxSeq` works; the split length grows past 32K so a head never has more than 128 splits.
-  Memory at 32K: 2.1 GB of KV for the whole model; q8 KV would halve it again (research §3,
-  not built; q4 KV is not recommended, it hurts long documents and tool calls).
+  Memory at 32K: 2.1 GB of KV for the whole model in f16, 1.2 GB in int8 (q4 KV is not
+  recommended: it hurts long documents and tool calls, research §3).
 
 ## Sessions: save, restore, rewind, share a prefix
 
