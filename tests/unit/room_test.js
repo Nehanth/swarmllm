@@ -172,3 +172,16 @@ Deno.test("plan: planForSpeed fills the fastest devices first and leaves out the
   eq(o.assigned.reduce((a, b) => a + b, 0), 64);
   eq(o.ranges[o.ranges.length - 1][1], 64);
 });
+
+import { lookupDrafts } from "../../room/lookup.js";
+Deno.test("lookup: drafts continue the most recent earlier copy of the last n-gram", () => {
+  // ... 1 2 3 4 5 ... 1 2 3 -> 4 5
+  eq(lookupDrafts([9, 1, 2, 3, 4, 5, 8, 7, 1, 2, 3], 2), [4, 5]);
+  // the longest n wins, and the most recent copy
+  eq(lookupDrafts([1, 2, 6, 0, 2, 7, 0, 1, 2], 3), [6, 0, 2]);
+  eq(lookupDrafts([5, 2, 9, 9, 3, 5, 2], 4), [9, 9, 3, 5]);
+  // nothing repeats: no drafts
+  eq(lookupDrafts([1, 2, 3, 4, 5], 4), []);
+  // never proposes past the end of the context
+  eq(lookupDrafts([1, 2, 1, 2], 7), [1, 2]);
+});

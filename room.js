@@ -15,6 +15,7 @@ import { makeLink, attachWire, wireReady, sendFrame, PROTOCOL } from "./room/tra
 import { PERSONAS, specials, fitContext, reusablePrefix } from "./room/conversation.js";
 import { planSplit, planForSpeed, ladder, bestFit, codeFromLocation } from "./room/plan.js";
 import { qrSVG } from "./room/qr.js";
+import { lookupDrafts } from "./room/lookup.js";
 import { drawCard } from "./room/card.js";
 import { probe as preflight, deviceKind } from "./room/preflight.js";
 
@@ -1455,6 +1456,7 @@ async function aiPipeToken(id, needLogits = true, fillNext) {
 // Prefill `ids` (the part of the conversation the caches do not hold yet) from ai.pos; returns
 // the logits after the last one.
 const PREFILL_WINDOW = 6;
+const LOOKUP = new URLSearchParams(location.search).get("lookup") !== "0";   // ?lookup=0: draft head only, for A/B
 const TAIL_FRAME = new URLSearchParams(location.search).get("tail") !== "0";   // ?tail=0: old per-token tail, for A/B   // prefill rounds in flight round the chain at once
 async function aiPrefill(ids) {
   if (!ai.chain.length && ai.engine.prefillTokens && ids.length > 1) {
@@ -1653,7 +1655,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
   const answer = [];          // sampled ids of this answer, verbatim, for the next turn's history
   let reply = "", count = 0, capped = false, dropped = 0, failed = null, stats = "";
   const t0Gen = performance.now();
-  let tDecode = 0, tPre = 0, prefilled = 0, reused = 0, preFrames = 0, first = null;
+  let tDecode = 0, tPre = 0, prefilled = 0, reused = 0, preFrames = 0, first = null, copied = 0;
   try {
     // the conversation with this question, trimmed to fit, and how much the caches already hold
     const fit = fitContext(ai.tok, { system: persona.system, turns: cont ? [...ai.conv.turns.slice(0, -1), { ...lastTurn, open: true }] : [...ai.conv.turns, { role: "user", text, name: asker }], thinking }, MAX_SEQ, MIN_ROOM);
@@ -1753,12 +1755,19 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
         // emitted one, so a capped answer is still a prefix of the next turn and nothing re-prefills
         K = Math.min(K, roomLeft, maxNew - count);
         const tStep = performance.now();
-        const toks = await ai.engine.specStep(next, sample, K, spec);
+        // prompt lookup first: if the text is repeating something in the context, verify what
+        // followed it last time (free to guess, up to 7 at once); otherwise the draft head
+        const lk = LOOKUP && ai.engine.specStepDrafts && ai.fed ? lookupDrafts([...ai.fed, next], Math.min(7, roomLeft, maxNew - count)) : [];
+        const viaLookup = lk.length >= 2;
+        const toks = viaLookup ? await ai.engine.specStepDrafts(next, sample, lk, spec) : await ai.engine.specStep(next, sample, K, spec);
+        if (viaLookup) copied += toks.length - 1;
         // specStep wrote `next` and the accepted drafts; its last token is the next `next`
         ai.fed.push(next, ...toks.slice(0, -1));
         const tps = toks.length / ((performance.now() - tStep) / 1000);
-        kc.ema[K] = kc.n[K] ? 0.6 * kc.ema[K] + 0.4 * tps : tps;
-        kc.n[K] = (kc.n[K] || 0) + 1; kc.used[K] = (kc.used[K] || 0) + toks.length;
+        if (!viaLookup) {
+          kc.ema[K] = kc.n[K] ? 0.6 * kc.ema[K] + 0.4 * tps : tps;
+          kc.n[K] = (kc.n[K] || 0) + 1; kc.used[K] = (kc.used[K] || 0) + toks.length;
+        }
         for (let j = 0; j < toks.length; j++) {
           const tk = toks[j];
           if (eos(tk)) { done = true; break; }
@@ -1797,6 +1806,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
     const secs = tDecode / 1000;
     stats = `${count} tok · ${(count / Math.max(secs, 1e-3)).toFixed(1)} tok/s · ${ai.chain.length + 1} device${ai.chain.length ? "s" : ""}`
       + (acc != null ? ` · ${Math.round(acc * 100)}% drafts accepted` : "")
+      + (copied ? ` · ${copied} tok by lookup` : "")
       + (ai.abort ? " · stopped" : "")
       + (capped ? (ai.pos >= MAX_SEQ - 2 ? ` · stopped: context full (${MAX_SEQ} tokens)` : ` · stopped at ${count} tokens`) : "")
       + (dropped ? ` · ${dropped} oldest exchange${dropped > 1 ? "s" : ""} forgotten to fit` : "");
