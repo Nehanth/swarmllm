@@ -185,3 +185,15 @@ Deno.test("lookup: drafts continue the most recent earlier copy of the last n-gr
   // never proposes past the end of the context
   eq(lookupDrafts([1, 2, 1, 2], 7), [1, 2]);
 });
+
+import { badF32, packF16, WireRangeError, wireStats } from "../../room/wire.js";
+Deno.test("wire: badF32 finds a single Inf or NaN anywhere; packF16 refuses f16-overflowing frames", () => {
+  const a = new Float32Array(5120).fill(1);
+  ok(!badF32(a));
+  for (const i of [0, 1, 96, 97, 2500, 5119]) { const b = a.slice(); b[i] = Infinity; ok(badF32(b), "inf at " + i); b[i] = NaN; ok(badF32(b), "nan at " + i); }
+  const big = a.slice(); big[1234] = -278.7;
+  packF16(big); ok(Math.abs(wireStats.lastMax - 278.7) < 1e-3, "max |x| recorded");
+  big[1234] = 70000;
+  let threw = false; try { packF16(big); } catch (e) { threw = e instanceof WireRangeError; }
+  ok(threw, "a value beyond 65504 is refused, not sent as Inf");
+});

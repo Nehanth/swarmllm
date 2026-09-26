@@ -1,9 +1,12 @@
 // Wire format for activations between peers: f16 packing, binary/base64 frames, NaN checks.
 import { f32ToF16, f16ToF32 } from "../engine/gguf.js";
 
+// Any NaN or Inf anywhere. (It used to sample every 97th element; the 27B's residual stream has
+// ~3 "massive" channels, so an Inf there slipped through ~96% of the time, and WGSL's finite-math
+// assumption can turn it into finite garbage one hop later.) x - x is 0 only for finite x.
 export function badF32(a) {
-  for (let i = 0; i < a.length; i += 97) if (!Number.isFinite(a[i])) return true;
-  return !Number.isFinite(a[0]) || !Number.isFinite(a[a.length - 1]);
+  for (let i = 0; i < a.length; i++) if (a[i] - a[i] !== 0) return true;
+  return false;
 }
 
 export function f32ToB64(f) {
@@ -15,9 +18,24 @@ export function f32ToB64(f) {
 
 export const WIRE_F16 = true;
 
+// Largest |x| of the last frame packed (telemetry: how close each boundary gets to f16's range).
+export const wireStats = { lastMax: 0 };
+// Beyond this an activation would become Inf in f16 (65504 is the largest finite value).
+export const F16_MAX = 65504;
+export class WireRangeError extends Error {}
+
 export function packF16(f) {
   const out = new Uint16Array(f.length);
-  for (let i = 0; i < f.length; i++) out[i] = f32ToF16(f[i]);
+  let mx = 0;
+  for (let i = 0; i < f.length; i++) {
+    const v = f[i];
+    const a = v < 0 ? -v : v;
+    if (a > mx) mx = a;
+    out[i] = f32ToF16(v);
+  }
+  wireStats.lastMax = mx;
+  // fail loudly instead of sending Inf, which downstream kernels may turn into silent garbage
+  if (!(mx <= F16_MAX)) throw new WireRangeError(`an activation reached ${mx.toExponential(2)}, beyond f16's range (${F16_MAX}): this model cannot be split at this boundary with the f16 wire`);
   return out;
 }
 
