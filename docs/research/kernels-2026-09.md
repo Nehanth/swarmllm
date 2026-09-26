@@ -39,6 +39,9 @@ Correctness was checked on SwiftShader with synthetic models (tests/e2e/*_synth.
 | Batched draft-cache fill | `engine.mtpBatchFill = false`, room `?mtpbatch=0` | solo prefill 43.7 → ~55–65 tok/s (item 2) | same bench, prefill line; `tests/test_mtp.js` must stay equal |
 | Replay rollback | `replayRollback: false` | ~0.9 GB less GPU memory for a whole-model device; spec tok/s ±small | `tests/test_mtp.js`, `tests/test_mtp_split.js` (spec == plain); GPU memory in the browser task manager |
 | Draft head over the first N vocab rows | `?draftvocab=N` (off by default) | cheaper drafts; acceptance may drop | room stats line "N% drafts accepted" and tok/s with N = 32768 / 65536 vs off |
+| One-submit draft chain | on only with `draftChain: true` / room `?draftchain=1` (default off: +~675 MB of GPU memory for the embedding table, or its first `draftvocab` rows) | GB10 ceiling −52 ms per K=3 step (item 4) | spec tok/s with `?draftchain=1` vs without, best with `&draftvocab=32768` |
+| Register-resident `dn_delta` / `dn_delta_mc` | none (bit-identical) | kernel 1.24× at 1 column, 2.03× at 16 (spec microbenchmark); ~2% decode, ~4% prefill end to end | `benchmarks/bench_breakdown.js` DeltaNet family |
+| Workgroup attention softmax | `softmaxWG: false` (bit-identical) | grows with context: largest near 2048 tokens | decode tok/s at a long context |
 | Prompt-lookup drafts | room `?lookup=0` | faster on answers that repeat the context | room tok/s on a summarise/quote prompt, on and off |
 
 The dense-engine fix (batched GEMVs dispatching half their workgroups when autotune picks 8 rows per workgroup) is a correctness fix with no switch: `node tests/e2e/engine_dense_synth.mjs` checks batched vs one-token hiddens for every autotune shape.

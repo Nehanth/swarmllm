@@ -1168,6 +1168,9 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
       batchCols: 16, coopRowsB: 1,
       // ?draftvocab=N: draft over the first N vocabulary rows only (engine/qwen35.js); off by default
       draftVocab: parseInt(new URLSearchParams(location.search).get("draftvocab"), 10) || 0,
+      // ?draftchain=1: the K drafts of a speculative step in one submit (keeps the embedding table,
+      // or its first draftvocab rows, on the GPU); off by default until measured
+      draftChain: new URLSearchParams(location.search).get("draftchain") === "1",
     });
   } else if (M.kind === "gguf") {
     aiStatus("reading model index\u2026");

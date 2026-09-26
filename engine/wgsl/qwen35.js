@@ -342,6 +342,35 @@ fn dn_l2_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(1) @binding(7) var<storage, read_write> dlm_shadow: array<f32>;   // [7][nVH*dState*dState]
 ${dnDeltaRegsWGSL()}
 
+// --- draft chain: the embedding row of the token the last argmax picked, dequantized on the GPU
+// exactly as the host's _embedRowF32 does (f16 scale x small integer: exact in f32), so K drafts
+// can run in one submit instead of K round trips through the CPU ---
+@group(1) @binding(0) var<storage, read> eg_qs: array<u32>;
+@group(1) @binding(1) var<storage, read> eg_sc: array<u32>;
+@group(1) @binding(2) var<storage, read> eg_id: array<u32>;
+@group(1) @binding(3) var<storage, read_write> eg_out: array<f32>;
+@group(1) @binding(4) var<uniform> eg_u: vec4<u32>;       // dim, kind (0 q4, 1 q8), rows
+@compute @workgroup_size(64)
+fn emb_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; let dim = eg_u.x;
+  if (i >= dim) { return; }
+  let id = min(eg_id[0], eg_u.z - 1u);
+  let nb = dim / 32u; let b = i / 32u; let e = i % 32u;
+  let si = id * nb + b;
+  let s = unpack2x16float(eg_sc[si >> 1u])[si & 1u];
+  var q: f32;
+  if (eg_u.y == 0u) {
+    let bi = si * 16u + (e % 16u);
+    let by = (eg_qs[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu;
+    q = f32(i32(select(by & 0xFu, by >> 4u, e >= 16u)) - 8);
+  } else {
+    let bi = si * 32u + e;
+    let by = (eg_qs[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu;
+    q = f32(bitcast<i32>(by << 24u) >> 24u);
+  }
+  eg_out[i] = s * q;
+}
+
 // --- argmax over n floats (single workgroup): out = [index, bitcast(value)] ---
 @group(1) @binding(0) var<storage, read> am_x: array<f32>;
 @group(1) @binding(1) var<storage, read_write> am_out: array<u32>;
