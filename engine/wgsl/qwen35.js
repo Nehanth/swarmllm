@@ -33,6 +33,59 @@ fn dn_delta(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
 }`;
 }
 
+// dn_delta + dn_gatenorm for one token in one dispatch: both use one 128-thread workgroup per
+// value head, so the head's output stays in the workgroup and the gated norm (same tree
+// reduction, same expression) follows a barrier. Bit-identical to the two kernels; q/k/v are
+// read from the whole conv output (q | k | v), so the kernel fits in 7 storage bindings.
+function dnDeltaGnWGSL() {
+  const rows = Array.from({ length: 128 }, (_, i) => i);
+  const load = rows.map((i) => `s[${i}u] = dg_s[Sb + ${i * 128}u + j];`).join(" ");
+  const store = rows.map((i) => `dg_s[Sb + ${i * 128}u + j] = s[${i}u];`).join(" ");
+  const loop1 = rows.map((i) => `{ let sd = s[${i}u] * decay; s[${i}u] = sd; vh += sd * dg1_k[${i}u]; sq += sd * dg1_q[${i}u]; kq += dg1_k[${i}u] * dg1_q[${i}u]; }`).join("\n  ");
+  const loop2 = rows.map((i) => `s[${i}u] += dg1_k[${i}u] * d;`).join(" ");
+  return `
+@group(1) @binding(0) var<storage, read> dg_c: array<f32>;      // conv output [q | k | v]
+@group(1) @binding(1) var<storage, read> dg_beta: array<f32>;
+@group(1) @binding(2) var<storage, read> dg_decay: array<f32>;
+@group(1) @binding(3) var<storage, read_write> dg_s: array<f32>;
+@group(1) @binding(4) var<storage, read> dg_z: array<f32>;
+@group(1) @binding(5) var<storage, read> dg_w: array<f32>;
+@group(1) @binding(6) var<storage, read_write> dg_y: array<f32>;
+@group(1) @binding(7) var<uniform> dg_dn: DN;
+var<workgroup> dg1_k: array<f32, 128>;
+var<workgroup> dg1_q: array<f32, 128>;
+var<workgroup> dg_partial: array<f32, 128>;
+@compute @workgroup_size(128)
+fn dn_delta_gn(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wg.x; let j = lid.x;
+  let kh = h % dg_dn.nKH;
+  let kOff = kh * 128u; let vOff = h * 128u; let Sb = h * 16384u;
+  let decay = dg_decay[h];
+  let scale = inverseSqrt(f32(dg_dn.dState));
+  dg1_k[j] = dg_c[dg_dn.keyDim + kOff + j]; dg1_q[j] = dg_c[kOff + j];
+  var s: array<f32, 128>;
+  ${load}
+  workgroupBarrier();
+  var vh: f32 = 0.0; var sq: f32 = 0.0; var kq: f32 = 0.0;
+  ${loop1}
+  let d = (dg_c[2u * dg_dn.keyDim + vOff + j] - vh) * dg_beta[h];
+  ${loop2}
+  let o = (sq + d * kq) * scale;
+  ${store}
+  dg_partial[j] = o * o;
+  workgroupBarrier();
+  var stride: u32 = 64u;
+  while (stride > 0u) {
+    if (j < stride) { dg_partial[j] += dg_partial[j + stride]; }
+    workgroupBarrier();
+    stride = stride / 2u;
+  }
+  let inv = inverseSqrt(dg_partial[0] / f32(dg_dn.dState) + cfg.eps);
+  let z = dg_z[vOff + j];
+  dg_y[vOff + j] = o * inv * dg_w[j] * (z / (1.0 + exp(-z)));
+}`;
+}
+
 // Register-resident dn_delta_mc (docs/deltanet-prefill-spec.md, RG=1): thread j keeps column j
 // of the head's state S in 128 registers for the whole pass (loaded once, stored once) instead of
 // two read-modify-write sweeps of global memory per column; q/k of each column are staged in
@@ -155,6 +208,7 @@ fn dn_l2(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(1) @binding(6) var<storage, read_write> dl_o: array<f32>; // [dInner]
 @group(1) @binding(7) var<uniform> dl_dn: DN;
 ${dnDelta1RegsWGSL()}
+${dnDeltaGnWGSL()}
 
 // --- gated norm: rmsnorm per head (w[dState]) * silu(z) ---
 @group(1) @binding(0) var<storage, read> gn_x: array<f32>;   // [dInner]

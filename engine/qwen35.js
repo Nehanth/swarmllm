@@ -32,7 +32,7 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false, attnGlue = true }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false, attnGlue = true, dnFuse = true }) {
     this.replay = replayRollback !== false;
     this.device = device;
     this.mvVariant = matvecVariant;
@@ -65,6 +65,8 @@ export class Qwen35Engine {
     // staging array holds one 256-wide head. engine.attnGlue = false restores the five dispatches.
     this.attnGlueOn = attnGlue !== false && hd <= 256;
     this.attnGlue = this.attnGlueOn;
+    // dn_delta + dn_gatenorm in one dispatch for decode (bit-identical); engine.dnFuse = false for A/B
+    this.dnFuse = dnFuse !== false;
     const [lo, hi] = layerRange;
     this.lo = lo; this.hi = hi;
     this.hasEmbed = hasEmbed; this.hasHead = hasHead;
@@ -145,6 +147,7 @@ export class Qwen35Engine {
       dn_gatenorm_mc: ["ro", "ro", "ro", "rw", "u", "u"], qsplit_mc: ["ro", "rw", "rw", "u", "u"],
       head_norm_mc: ["rw", "ro", "u"], rope_part_mc: ["rw", "u", "u"], sigmoid_mul_mc: ["rw", "ro", "u"],
       attn_glue: ["ro", "rw", "rw", "rw", "ro", "ro", "u", "u"],
+      dn_delta_gn: ["ro", "ro", "ro", "rw", "ro", "ro", "rw", "u"],
       argmax: ["ro", "rw", "u"], emb_gather: ["ro", "ro", "ro", "rw", "u"],
     };
     // narrower twins: a verify or tail pass with w live columns pays for w, not batchCols
@@ -322,6 +325,7 @@ export class Qwen35Engine {
           { buffer: this.beta }, { buffer: this.decay },
           { buffer: R.S }, { buffer: this.dOut }, { buffer: this.dnBuf }]);
         R.bgGateNorm = this._bg(this.pipes.dn_gatenorm, 1, [this.dOut, this.z, R.ssmNorm, this.gated, this.dnBuf]);
+        R.bgDeltaGn = this._bg(this.pipes.dn_delta_gn, 1, [this.convOut, this.beta, this.decay, R.S, this.z, R.ssmNorm, this.gated, this.dnBuf]);
       }
       return R;
     };
@@ -509,8 +513,11 @@ export class Qwen35Engine {
       this._dop(p, L.mvAlpha);
       this._d(p, "dn_conv", L.bgConv, D.convDim);
       this._d(p, "dn_pre", L.bgPre, 128, 128);      // gates + L2(q,k) fused
-      this._d(p, "dn_delta", L.bgDelta, D.nVH * 128, 128);
-      this._d(p, "dn_gatenorm", L.bgGateNorm, D.nVH * 128, 128);
+      if (this.dnFuse) this._d(p, "dn_delta_gn", L.bgDeltaGn, D.nVH * 128, 128);
+      else {
+        this._d(p, "dn_delta", L.bgDelta, D.nVH * 128, 128);
+        this._d(p, "dn_gatenorm", L.bgGateNorm, D.nVH * 128, 128);
+      }
       this._dop(p, L.mvOut);
       if (!L.mvOut.acc) this._d(p, "add_res", this.bgAddTmp, D.dim);
       p.end();

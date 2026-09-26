@@ -1,6 +1,8 @@
-// attn_glue (fused) vs qsplit+head_norm+rope_part: every logit of a long prefill (batched path) and a decode
-// (single-token path) must be bit-identical; also times decode.
-//   NODE_PATH=... node tests/e2e/attnglue_synth.mjs [--model f.gguf] [--prompt-len 200] [--tokens 24]
+// Dispatch fusions vs the kernels they replace: attn_glue (qsplit + q/k head_norm + rope),
+// dn_delta_gn (dn_delta + dn_gatenorm) and the batched attention of prefill passes
+// (attn_*_mc: all columns per dispatch). Every logit of the decode after a batched prefill must be
+// bit-identical with each fusion on and off; also times decode.
+//   NODE_PATH=... node tests/e2e/fusion_synth.mjs [--model f.gguf] [--prompt-len 200] [--tokens 24]
 import fs from "fs"; import os from "os"; import path from "path";
 import { loadPlaywright, chromiumPath, GPU_ARGS, serveRepo } from "./engine_synth.mjs";
 import { writeSynth } from "./synth.mjs";
@@ -23,8 +25,8 @@ async function pageMain({ plen, ntok }) {
   const eng = await Qwen35Engine.create({ device, meta: G.meta, layerRange: [0, L], hasEmbed: true, hasHead: true, vocab: G.tensors[GGML_EMBED].shape[0],
     maxSeq: 2048, batchCols: 16, coopRowsB: 1, coopWG: 64, weights: await qwen35Weights(G, bytesOf, { lo: 0, hi: L, hasEmbed: true, hasHead: true, mtp: true }) });
   const prompt = Array.from({ length: plen }, (_, i) => 33 + ((i * 7919) % 90));
-  const run = async (wg) => {
-    eng.attnGlue = wg; eng.reset(); eng.mtpFill = false;
+  const run = async (glue, dn, mc) => {
+    eng.attnGlue = glue; eng.dnFuse = dn; eng.attnMC = mc; eng.reset(); eng.mtpFill = false;
     await eng.prefillTokens(prompt.slice(0, -1));
     const logs = [];
     let lg = await eng.forwardToken(prompt[plen - 1]); logs.push(lg);
@@ -33,12 +35,16 @@ async function pageMain({ plen, ntok }) {
     for (let i = 1; i < ntok; i++) { lg = await eng.forwardToken(argmax(lg)); logs.push(lg); }
     return { logs, msPerTok: (performance.now() - t0) / (ntok - 1) };
   };
-  const a = await run(false), b = await run(true);
-  let diff = 0;
-  for (let i = 0; i < ntok; i++) for (let j = 0; j < a.logs[i].length; j++) if (!Object.is(a.logs[i][j], b.logs[i][j])) diff++;
-  const ok = diff === 0 && !errs.length;
-  say(`${ok ? "PASS" : "FAIL"} ${ntok} decode steps after a ${plen}-token prompt: ${diff} logits differ between the five glue kernels and attn_glue`);
-  say(`decode at pos ~${plen} (SwiftShader, not a GPU number): five glue dispatches ${a.msPerTok.toFixed(0)} ms/token, fused attn_glue ${b.msPerTok.toFixed(0)} ms/token`);
+  const a = await run(false, false, false);
+  let ok = !errs.length;
+  for (const [glue, dn, mc, name] of [[true, false, false, "attn_glue"], [false, true, false, "dn_delta_gn"], [false, false, true, "attn_*_mc"], [true, true, true, "all"]]) {
+    const b = await run(glue, dn, mc);
+    let diff = 0;
+    for (let i = 0; i < ntok; i++) for (let j = 0; j < a.logs[i].length; j++) if (!Object.is(a.logs[i][j], b.logs[i][j])) diff++;
+    ok = ok && diff === 0;
+    say(`${diff === 0 ? "PASS" : "FAIL"} ${name}: ${ntok} decode steps after a ${plen}-token prompt, ${diff} logits differ from the unfused kernels; ${b.msPerTok.toFixed(0)} vs ${a.msPerTok.toFixed(0)} ms/token (SwiftShader, not a GPU number)`);
+  }
+  ok = ok && !errs.length;
   if (errs.length) say("GPU errors: " + errs.slice(0, 2).join(" | "));
   return { out, ok };
 }
@@ -51,6 +57,6 @@ const page = await browser.newPage();
 await page.goto(`http://127.0.0.1:${PORT}/favicon.svg`);
 const res = await page.evaluate(pageMain, { plen: +arg("prompt-len", 200), ntok: +arg("tokens", 24) });
 for (const l of res.out) console.log(l);
-console.log(res.ok ? "ATTN GLUE PASS" : "ATTN GLUE FAIL");
+console.log(res.ok ? "FUSION PASS" : "FUSION FAIL");
 await browser.close(); srv.close(); fs.rmSync(tmp, { recursive: true, force: true });
 process.exit(res.ok ? 0 : 1);
