@@ -949,6 +949,36 @@ export class Qwen35Engine {
     return out;
   }
 
+  // specStep with drafts from the caller (prompt lookup: tokens that followed the same n-gram
+  // earlier in the context) instead of the draft head. Same verify, same acceptance rule, same
+  // rollback, so the output is exactly plain decoding's. The draft head's cache still gets its
+  // rows: tNext's before the verify (this.x holds the trunk hidden of the previous position, as in
+  // specStep), the accepted ones after it from the exact trunk hiddens.
+  async specStepDrafts(tNext, sample, drafts, { runTrunk = null, onReject = null } = {}) {
+    const pos = this.pos, M2 = this.mtp, { dim } = this.dims;
+    const K = Math.max(1, Math.min(7, drafts.length));
+    drafts = drafts.slice(0, K);
+    if (M2) await this.mtpRun(null, tNext, pos, false);
+    const { lgs, hs } = await this.verifyN([tNext, ...drafts], pos, runTrunk);
+    const out = [];
+    let a = 0;
+    for (let k = 0; k <= K; k++) {
+      const t = sample(lgs[k]);
+      out.push(t);
+      if (k < K && t === drafts[k]) a++; else break;
+    }
+    this.lookupStats = this.lookupStats || { drafts: 0, accepted: 0 };
+    this.lookupStats.drafts += K; this.lookupStats.accepted += a;
+    if (a < K) { this._restoreDN(a); if (onReject) await onReject(a); }
+    if (M2) for (let j = 1; j <= a; j++) {
+      this.setHidden(hs.subarray((j - 1) * dim, j * dim));
+      await this.mtpRun(null, out[j - 1], pos + j, false);
+    }
+    this.setHidden(hs.subarray(a * dim, (a + 1) * dim));
+    this.pos = pos + a + 1;
+    return out;
+  }
+
   async prefillTokens(ids) {
     if (!this.B) this._initBatch();
     let i = 0, sinceSync = 0;
