@@ -17,6 +17,7 @@ A SwarmLLM room is a set of browsers that split one model's layers and pass the 
 
 - **Activations are not encryption.** The hidden state that crosses each hop is a lossy transformation of your text. Published attacks reconstruct a large fraction of tokens from mid-model activations (see e.g. [arXiv 2503.09022](https://arxiv.org/abs/2503.09022)). **Assume anyone in your room can read your prompts.** The trust model is "people you would share a document link with", not "strangers".
 - **No verification of remote compute.** A peer could return wrong or manipulated activations. Nothing in the current design detects this. Spot-check auditing is on the roadmap and will be documented here when it ships.
+- **Weights shared inside the room are not verified either.** A device that is missing a byte range of the model can take it from another device in the room that has it cached (only the length is checked), so a malicious peer could hand out altered weights. That is the same trust a room already places in its peers' compute; `?peerweights=0` turns sharing off. Pinned revisions with hashes are roadmap 19.
 - **Noise or permutation "privacy" tricks are not used, deliberately.** They are known to be breakable and would give a false sense of safety.
 - **Peers learn metadata** beyond the shared transcript: device names, memory pledges, layer assignments, and timing, via the room roster.
 

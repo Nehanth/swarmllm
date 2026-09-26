@@ -77,9 +77,14 @@ const log = (...a) => console.error(T(), ...a);
 
 // ---------------------------------------------------------------- one room session
 async function session(browser, modelBytes, peerjsJs, nDev, label) {
-  const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const size = modelBytes.length;
   const blocked = new Set();
+  // --isolate: one browser context per tab, so every "device" has its own Cache API storage (as
+  // real devices do); without it the tabs share one context and one weight cache
+  const ctxs = [];
+  const makeCtx = async () => {
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  ctxs.push(ctx);
   await ctx.route("**/*", async (route) => {
     const req = route.request(), url = req.url();
     if (url.startsWith(`http://127.0.0.1:${PORT}/`) || url.startsWith(`http://127.0.0.1:${SIGNAL_PORT}/`)) return route.continue();
@@ -107,9 +112,12 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
     const rnd = Math.random;
     Math.random = function () { const s = new Error().stack || ""; return /\/room\/sampling\.js/.test(s) ? 0 : rnd(); };
   });
+  return ctx;
+  };
+  const shared = flag("isolate") ? null : await makeCtx();
   const names = ["host", ...Array.from({ length: nDev - 1 }, (_, i) => (nDev === 2 ? "worker" : "worker" + (i + 1)))];
   const tabs = {};
-  for (const n of names) tabs[n] = await ctx.newPage();
+  for (const n of names) tabs[n] = await (shared || await makeCtx()).newPage();
   const errs = Object.fromEntries(names.map((n) => [n, []]));
   for (const [n, p] of Object.entries(tabs)) {
     p.on("console", (m) => { if (m.type() === "error" || m.type() === "warning") errs[n].push(`${m.type()}: ${m.text().slice(0, 240)}`); });
@@ -212,11 +220,13 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
       // --redeal-after R [--redeal-split speed]: after round R, re-deal the layers (the conversation
       // carries on: the next question re-prefills it on the new split)
       if (arg("redeal-after") !== undefined && +arg("redeal-after") === r && r + 1 < ROUNDS) {
+        const req0 = stats.requests || 0;
         if (arg("redeal-split")) await tabs.host.selectOption("#ai-split", arg("redeal-split"));
         await tabs.host.evaluate(() => { const b = document.getElementById("ai-redeal"); b.hidden = false; b.click(); });
         await tabs.host.waitForFunction(() => /cluster online/.test(document.getElementById("ai-status").textContent), null, { timeout: TIMEOUT });
         const split = await tabs.host.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => /layer split/.test(t)).pop());
-        log(`[${label}] re-dealt after round ${r}: ${split}`);
+        log(`[${label}] re-dealt after round ${r}: ${split} \u00b7 ${(stats.requests || 0) - req0} range requests to the model host during the re-deal`);
+        for (const [n, p] of Object.entries(tabs)) { const w = await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent).filter((t) => /came from devices/.test(t)).pop()); if (w) log(`[${label}] ${n}: ${w}`); }
       }
       if (flag("new-chat") && r + 1 < ROUNDS) {
         await tabs.host.click("#new-chat").catch((e) => log(`[${label}] new chat: ${String(e).slice(0, 100)}`));
@@ -274,7 +284,7 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
     for (const [n, p] of Object.entries(tabs)) { try { log(`[${label}] ${n}: ${await status(p)}`); } catch {} }
     try { for (const [n, p] of Object.entries(tabs)) log(`[${label}] ${n} room log: ${JSON.stringify((await p.evaluate(() => [...document.querySelectorAll("#chat-log div")].map((d) => d.textContent))).slice(-6))}`); } catch {}
   } finally {
-    await ctx.close();
+    for (const c of ctxs) await c.close();
   }
   return out;
 }
