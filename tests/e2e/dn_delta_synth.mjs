@@ -5,16 +5,17 @@
 //   NODE_PATH=... node tests/e2e/dn_delta_synth.mjs
 import { loadPlaywright, chromiumPath, GPU_ARGS, serveRepo } from "./engine_synth.mjs";
 const PORT = 18998;
+const REF1 = "@compute @workgroup_size(128)\nfn dn_delta_ref1(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n  let h = wg.x;\n  let j = lid.x;\n  if (h >= dl_dn.nVH || j >= dl_dn.dState) { return; }\n  let kh = h % dl_dn.nKH;\n  let kOff = kh * dl_dn.dState;\n  let vOff = h * dl_dn.dState;\n  let Sb = h * dl_dn.dState * dl_dn.dState;\n  let decay = dl_decay[h];\n  let scale = inverseSqrt(f32(dl_dn.dState));\n  var vhat: f32 = 0.0;\n  var sq: f32 = 0.0;\n  var kq: f32 = 0.0;\n  for (var i: u32 = 0u; i < dl_dn.dState; i++) {\n    let idx = Sb + i * dl_dn.dState + j;\n    let sdec = dl_s[idx] * decay;\n    dl_s[idx] = sdec;\n    let ki = dl_k[kOff + i];\n    let qi = dl_q[kOff + i];\n    vhat += sdec * ki;\n    sq += sdec * qi;\n    kq += ki * qi;\n  }\n  let d = (dl_v[vOff + j] - vhat) * dl_beta[h];\n  for (var i: u32 = 0u; i < dl_dn.dState; i++) {\n    let idx = Sb + i * dl_dn.dState + j;\n    dl_s[idx] += dl_k[kOff + i] * d;\n  }\n  dl_o[vOff + j] = (sq + d * kq) * scale;\n}\n\n";
 const REF = "@compute @workgroup_size(128)\nfn dn_delta_mc_ref(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n  let h = wg.x; let j = lid.x; let dS = dlm_dn.dState;\n  if (h >= dlm_dn.nVH || j >= dS) { return; }\n  let kh = h % dlm_dn.nKH;\n  let kOff = kh * dS; let vOff = h * dS; let Sb = h * dS * dS;\n  let scale = inverseSqrt(f32(dS));\n  let nCols = max(frame.nCols, 1u);\n  let sSize = dlm_dn.nVH * dS * dS;\n  for (var col: u32 = 0u; col < nCols; col++) {\n    let qo = col * dlm_mc.s0 + kOff;\n    let ko = col * dlm_mc.s0 + dlm_dn.keyDim + kOff;\n    let vo = col * dlm_mc.s0 + 2u * dlm_dn.keyDim + vOff;\n    let decay = dlm_decay[col * dlm_mc.s1 + h];\n    var vhat: f32 = 0.0;\n    var sq: f32 = 0.0;\n    var kq: f32 = 0.0;\n    for (var i: u32 = 0u; i < dS; i++) {\n      let idx = Sb + i * dS + j;\n      let sdec = dlm_s[idx] * decay;\n      dlm_s[idx] = sdec;\n      let ki = dlm_c[ko + i];\n      let qi = dlm_c[qo + i];\n      vhat += sdec * ki;\n      sq += sdec * qi;\n      kq += ki * qi;\n    }\n    let d = (dlm_c[vo + j] - vhat) * dlm_beta[col * dlm_mc.s1 + h];\n    for (var i: u32 = 0u; i < dS; i++) {\n      let idx = Sb + i * dS + j;\n      dlm_s[idx] += dlm_c[ko + i] * d;\n    }\n    dlm_o[col * dlm_mc.s2 + vOff + j] = (sq + d * kq) * scale;\n    let dlSB = frame.snap & 0xffu;     // snapshot slot base + 1 (0 = off)\n    // bit 31: replay rollback (the engine keeps one pre-verify state and re-runs this kernel\n    // on rejection), so no per-column state snapshots; the conv snapshots stay (they are tiny)\n    if (dlSB != 0u && (frame.snap & 0x80000000u) == 0u && dlSB + col < ((frame.snap >> 8u) & 0xffu)) {\n      let slot = dlSB - 1u + col;\n      for (var i: u32 = 0u; i < dS; i++) { dlm_shadow[slot * sSize + Sb + i * dS + j] = dlm_s[Sb + i * dS + j]; }\n    }\n  }\n}\n\n";
 
-async function pageMain({ REF }) {
+async function pageMain({ REF, REF1 }) {
   const { WGSL } = await import("/engine/wgsl/base.js");
   const { WGSL2 } = await import("/engine/wgsl/qwen35.js");
   const out = [], say = (s) => out.push(s);
   const adapter = await navigator.gpu.requestAdapter();
   const dev = await adapter.requestDevice();
   const errs = []; dev.addEventListener("uncapturederror", (e) => errs.push(e.error?.message));
-  const mod = dev.createShaderModule({ code: WGSL + WGSL2 + REF });
+  const mod = dev.createShaderModule({ code: WGSL + WGSL2 + REF + REF1 });
   const info = await mod.getCompilationInfo(); for (const m of info.messages) if (m.type === "error") say("WGSL error: " + m.message + " line " + m.lineNum);
   const C = GPUShaderStage.COMPUTE, S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, U = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
   const l0 = dev.createBindGroupLayout({ entries: [0, 1].map((b) => ({ binding: b, visibility: C, buffer: { type: "uniform" } })) });
@@ -56,6 +57,26 @@ async function pageMain({ REF }) {
     const ok = !dS_ && !dO && !dSh; if (!ok) allOk = false;
     say(`${ok ? "PASS" : "FAIL"} nCols ${nCols}, ${tag}: differing S ${dS_}/${a.S.length}, out ${dO}/${a.O.length}, snapshot slots ${dSh}${snap & 0x80000000 ? " (must stay empty)" : ""}`);
   }
+  // the single-token kernel (decode): separate q / k / v bindings
+  {
+    const lS = dev.createBindGroupLayout({ entries: ["ro", "ro", "ro", "ro", "ro", "rw", "rw", "u"].map((x, i) => ({ binding: i, visibility: C, buffer: { type: t[x] } })) });
+    const lay1 = dev.createPipelineLayout({ bindGroupLayouts: [l0, lS] });
+    const p1 = (e) => dev.createComputePipeline({ layout: lay1, compute: { module: mod, entryPoint: e } });
+    const q = mk(conv.slice(0, keyDim)), k = mk(conv.slice(keyDim, 2 * keyDim)), v = mk(conv.slice(2 * keyDim, convDim));
+    const be = mk(beta.slice(0, nVH)), de = mk(decay.slice(0, nVH));
+    const one = async (p) => {
+      const bS = mk(S0), bO = dev.createBuffer({ size: dInner * 4, usage: S });
+      const g1 = dev.createBindGroup({ layout: lS, entries: [q, k, v, be, de, bS, bO, dn].map((b, i) => ({ binding: i, resource: { buffer: b } })) });
+      const e = dev.createCommandEncoder(); const ps = e.beginComputePass(); ps.setPipeline(p); ps.setBindGroup(0, g0); ps.setBindGroup(1, g1); ps.dispatchWorkgroups(nVH); ps.end(); dev.queue.submit([e.finish()]);
+      return { S: await read(bS, S0.length), O: await read(bO, dInner) };
+    };
+    const a = await one(p1("dn_delta_ref1")), b = await one(p1("dn_delta"));
+    let dS1 = 0, dO1 = 0;
+    for (let i = 0; i < a.S.length; i++) if (!Object.is(a.S[i], b.S[i])) dS1++;
+    for (let i = 0; i < a.O.length; i++) if (!Object.is(a.O[i], b.O[i])) dO1++;
+    if (dS1 || dO1) allOk = false;
+    say(`${dS1 || dO1 ? "FAIL" : "PASS"} single-token dn_delta: differing S ${dS1}/${a.S.length}, out ${dO1}/${a.O.length}`);
+  }
   if (errs.length) { allOk = false; say("GPU errors: " + errs.slice(0, 2).join(" | ")); }
   return { out, allOk };
 }
@@ -64,7 +85,7 @@ const { chromium } = await loadPlaywright();
 const browser = await chromium.launch({ executablePath: chromiumPath(), args: GPU_ARGS });
 const page = await browser.newPage();
 await page.goto(`http://127.0.0.1:${PORT}/favicon.svg`);
-const res = await page.evaluate(pageMain, { REF });
+const res = await page.evaluate(pageMain, { REF, REF1 });
 for (const l of res.out) console.log(l);
 console.log(res.allOk ? "DN_DELTA PASS" : "DN_DELTA FAIL");
 await browser.close(); srv.close();

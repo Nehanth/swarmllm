@@ -1,6 +1,38 @@
 // WGSL for the hybrid Qwen 3.5/3.8 engine: Gated-DeltaNet recurrence (single and
 // multi-column, with speculative snapshot slots), gated attention glue, fused pre-pass,
 // and the logits argmax. Base kernels come from ./base.js; GEMVs from ./coop.js.
+// Register-resident single-token dn_delta (decode): the same transform as dn_delta_mc below, for
+// the one-column bindings. Same operations in the same order as the kernel it replaces, so the
+// state and output are bit-identical. Requires dState = 128.
+function dnDelta1RegsWGSL() {
+  const rows = Array.from({ length: 128 }, (_, i) => i);
+  const load = rows.map((i) => `s[${i}u] = dl_s[Sb + ${i * 128}u + j];`).join(" ");
+  const store = rows.map((i) => `dl_s[Sb + ${i * 128}u + j] = s[${i}u];`).join(" ");
+  const loop1 = rows.map((i) => `{ let sd = s[${i}u] * decay; s[${i}u] = sd; vh += sd * dl1_k[${i}u]; sq += sd * dl1_q[${i}u]; kq += dl1_k[${i}u] * dl1_q[${i}u]; }`).join("\n  ");
+  const loop2 = rows.map((i) => `s[${i}u] += dl1_k[${i}u] * d;`).join(" ");
+  return `
+var<workgroup> dl1_k: array<f32, 128>;
+var<workgroup> dl1_q: array<f32, 128>;
+@compute @workgroup_size(128)
+fn dn_delta(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wg.x; let j = lid.x;
+  let kh = h % dl_dn.nKH;
+  let kOff = kh * 128u; let vOff = h * 128u; let Sb = h * 16384u;
+  let decay = dl_decay[h];
+  let scale = inverseSqrt(f32(dl_dn.dState));
+  dl1_k[j] = dl_k[kOff + j]; dl1_q[j] = dl_q[kOff + j];
+  var s: array<f32, 128>;
+  ${load}
+  workgroupBarrier();
+  var vh: f32 = 0.0; var sq: f32 = 0.0; var kq: f32 = 0.0;
+  ${loop1}
+  let d = (dl_v[vOff + j] - vh) * dl_beta[h];
+  ${loop2}
+  dl_o[vOff + j] = (sq + d * kq) * scale;
+  ${store}
+}`;
+}
+
 // Register-resident dn_delta_mc (docs/deltanet-prefill-spec.md, RG=1): thread j keeps column j
 // of the head's state S in 128 registers for the whole pass (loaded once, stored once) instead of
 // two read-modify-write sweeps of global memory per column; q/k of each column are staged in
@@ -122,37 +154,7 @@ fn dn_l2(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(1) @binding(5) var<storage, read_write> dl_s: array<f32>; // [nVH, dState, dState]
 @group(1) @binding(6) var<storage, read_write> dl_o: array<f32>; // [dInner]
 @group(1) @binding(7) var<uniform> dl_dn: DN;
-@compute @workgroup_size(128)
-fn dn_delta(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  let h = wg.x;
-  let j = lid.x;
-  if (h >= dl_dn.nVH || j >= dl_dn.dState) { return; }
-  let kh = h % dl_dn.nKH;
-  let kOff = kh * dl_dn.dState;
-  let vOff = h * dl_dn.dState;
-  let Sb = h * dl_dn.dState * dl_dn.dState;
-  let decay = dl_decay[h];
-  let scale = inverseSqrt(f32(dl_dn.dState));
-  var vhat: f32 = 0.0;
-  var sq: f32 = 0.0;
-  var kq: f32 = 0.0;
-  for (var i: u32 = 0u; i < dl_dn.dState; i++) {
-    let idx = Sb + i * dl_dn.dState + j;
-    let sdec = dl_s[idx] * decay;
-    dl_s[idx] = sdec;
-    let ki = dl_k[kOff + i];
-    let qi = dl_q[kOff + i];
-    vhat += sdec * ki;
-    sq += sdec * qi;
-    kq += ki * qi;
-  }
-  let d = (dl_v[vOff + j] - vhat) * dl_beta[h];
-  for (var i: u32 = 0u; i < dl_dn.dState; i++) {
-    let idx = Sb + i * dl_dn.dState + j;
-    dl_s[idx] += dl_k[kOff + i] * d;
-  }
-  dl_o[vOff + j] = (sq + d * kq) * scale;
-}
+${dnDelta1RegsWGSL()}
 
 // --- gated norm: rmsnorm per head (w[dState]) * silu(z) ---
 @group(1) @binding(0) var<storage, read> gn_x: array<f32>;   // [dInner]
