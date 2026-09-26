@@ -154,3 +154,21 @@ Deno.test("wire: the f16 lookup table matches f16ToF32 for all 65,536 values (Na
     if (Number.isNaN(want) ? !Number.isNaN(got[h]) : !Object.is(Math.fround(want), got[h])) throw new Error("mismatch at " + h);
   }
 });
+
+import { planForSpeed } from "../../room/plan.js";
+Deno.test("plan: planForSpeed fills the fastest devices first and leaves out the ones not needed", () => {
+  // host holds everything: nobody else is needed (fewest hops)
+  eq(planForSpeed(64, [100, 30, 30]).used, [0]);
+  // unmeasured: the biggest device after the host, not everyone
+  eq(planForSpeed(64, [20, 10, 60]).assigned, [20, 0, 44]);
+  // measured: the fast laptop fills before the slow one, whatever their pledges
+  eq(planForSpeed(64, [20, 60, 60], [2, 9, 3]).assigned, [20, 0, 44]);
+  // the slow phone only gets what nobody faster can hold
+  eq(planForSpeed(64, [30, 30, 10], [3, 3, 12]).assigned, [30, 30, 4]);
+  // the host keeps a layer even when it is the slowest
+  eq(planForSpeed(8, [1, 20], [50, 1]).assigned, [1, 7]);
+  // overflow: everyone full, the rest spread by capacity; every layer placed exactly once
+  const o = planForSpeed(64, [10, 10, 10]);
+  eq(o.assigned.reduce((a, b) => a + b, 0), 64);
+  eq(o.ranges[o.ranges.length - 1][1], 64);
+});

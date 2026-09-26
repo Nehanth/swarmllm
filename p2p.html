@@ -464,6 +464,8 @@
         <option value="asker">only whoever asked</option>
       </select>
       <div class="side-hint">every device still computes the answer; this only decides who sees the text</div>
+      <label for="ai-split">layer split</label>
+      <select id="ai-split" class="host-select"><option value="memory">by memory (every device holds some)</option><option value="speed">for speed (fastest devices, fewest hops)</option></select>
       <label for="ai-persona">answer style</label>
       <select id="ai-persona" class="host-select"></select>
       <label for="ai-sampling">sampling</label>

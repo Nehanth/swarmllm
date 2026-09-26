@@ -13,7 +13,7 @@ import { chatRecipients } from "./room/visibility.js";
 import { MODELS, NEED_GB, MAX_SEQ, MAX_NEW, MAX_NEW_THINKING, MIN_ROOM } from "./room/models.js";
 import { makeLink, attachWire, wireReady, sendFrame, PROTOCOL } from "./room/transport.js";
 import { PERSONAS, specials, fitContext, reusablePrefix } from "./room/conversation.js";
-import { planSplit, ladder, bestFit, codeFromLocation } from "./room/plan.js";
+import { planSplit, planForSpeed, ladder, bestFit, codeFromLocation } from "./room/plan.js";
 import { qrSVG } from "./room/qr.js";
 import { drawCard } from "./room/card.js";
 import { probe as preflight, deviceKind } from "./room/preflight.js";
@@ -653,6 +653,7 @@ let ai = {
   settings: { persona: "default", sampling: "creative", thinking: false, length: "normal" },
   transcript: [],        // host: [{ name, text, reply, stats }] for devices that join later
   teleBy: new Map(),     // host: worker id -> compute ms per frame kind, from ai-tele
+  msPerLayer: new Map(), // host: device name -> measured verify compute per layer (the speed split uses it)
   q: Promise.resolve(),  // worker: frames run strictly one after another, in arrival order
 };
 
@@ -1063,9 +1064,22 @@ async function aiStart(modelArg) {
       embedBytes = cfg.vocab_size * d * 4;
     }
     const pledgeOf = (m) => ((m?.contribGB ?? (m?.maxBufGB ? m.maxBufGB * 0.5 : 0.5))) * 2 ** 30;
-    const caps = [Math.max(pledgeOf(myMeta) - embedBytes, layerBytes / 2),
+    let caps = [Math.max(pledgeOf(myMeta) - embedBytes, layerBytes / 2),
       ...ai.chain.map((id) => Math.max(pledgeOf(conns.get(id)?.meta), layerBytes / 2))];
-    const { assigned, ranges } = planSplit(L, caps);
+    let assigned, ranges;
+    if ($("ai-split").value === "speed") {
+      // fastest devices first (measured ms per layer from earlier answers), fewest hops; devices
+      // that are not needed stay in the room as ask-only guests
+      const nameOf = (id) => conns.get(id)?.name || id;
+      const sp = planForSpeed(L, caps.map((c) => Math.floor(c / layerBytes)), [ai.msPerLayer.get(myName), ...ai.chain.map((id) => ai.msPerLayer.get(nameOf(id)))]);
+      const keep = sp.used.filter((i) => i > 0).map((i) => i - 1);
+      ai.chain = keep.map((i) => ai.chain[i]);
+      ai.chainNames = ai.chain.map(nameOf);
+      assigned = sp.used.map((i) => sp.assigned[i]);
+      ranges = sp.used.map((i) => sp.ranges[i]);
+      caps = sp.used.map((i) => caps[i]);
+    } else ({ assigned, ranges } = planSplit(L, caps));
+    ai.layersN = Object.fromEntries([[myName, assigned[0]], ...ai.chain.map((id, i) => [conns.get(id)?.name || id, assigned[i + 1]])]);
 
     const needGB = (L * layerBytes + embedBytes) / 2 ** 30;
     const haveGB = caps.reduce((s, c) => s + c, embedBytes) / 2 ** 30;
@@ -1086,7 +1100,7 @@ async function aiStart(modelArg) {
     broadcastAll({ t: "ai-layers", by: ai.layersByName });
     const splitDesc = [`you ${assigned[0]}+embed`, ...ai.chain.map((id, i) =>
       `${conns.get(id)?.name || id} ${assigned[i + 1]}`)].join(" · ");
-    log("swarm", `${M.label} — layer split by pledge: ${splitDesc}`);
+    log("swarm", `${M.label} — layer split ${$("ai-split").value === "speed" ? "for speed" : "by pledge"}: ${splitDesc}`);
     await aiLoadShard(modelKey, ranges[0], true, true);
     aiStatus(n === 1
       ? `solo: all ${L} layers local — ready`
@@ -1415,6 +1429,13 @@ function pushMap(tps, acc, live, force) {
   renderMap(nodes, st, live);
   broadcastAll({ t: "ai-map", nodes, st, live: live ? 1 : 0 });
 }
+// ms per layer for every device in the chain, from this answer's verify laps (host: its own share
+// of each lap; workers: their ai-tele reports); the speed split deals by these
+function noteSpeeds() {
+  const put = (name, ms, n) => { if (ms > 0 && n > 0) { const v = ms / n, o = ai.msPerLayer.get(name); ai.msPerLayer.set(name, o ? 0.5 * o + 0.5 * v : v); } };
+  put(myName, ai.lapStat?.host, ai.layersN?.[myName]);
+  for (const id of ai.chain) { const name = conns.get(id)?.name || id; put(name, ai.teleBy.get(id)?.spec, ai.layersN?.[name]); }
+}
 // worker: EMA of compute ms per frame kind, reported to the host at most every 700 ms
 function teleNote(kind, ms) {
   const T = ai.tele ||= { at: 0, k: {} };
@@ -1610,7 +1631,7 @@ async function aiGenerate(textArg, who, askerId = peer.id, mode = "ask") {
       + (ai.abort ? " · stopped" : "")
       + (capped ? (ai.pos >= MAX_SEQ - 2 ? ` · stopped: context full (${MAX_SEQ} tokens)` : ` · stopped at ${count} tokens`) : "")
       + (dropped ? ` · ${dropped} oldest exchange${dropped > 1 ? "s" : ""} forgotten to fit` : "");
-    if (ai.chain.length && count) pushMap(count / Math.max(secs, 1e-3), acc, false, true);
+    if (ai.chain.length && count) { pushMap(count / Math.max(secs, 1e-3), acc, false, true); noteSpeeds(); }
     else if (count > 8) lastSoloTps = Math.max(lastSoloTps, count / Math.max(secs, 1e-3));
   } catch (err) {
     failed = err;
@@ -1754,7 +1775,14 @@ async function aiOnData(from, d) {
       else aiStatus(`${d.by} started the model…`);
       break;
     case "ai-next": ai.next = d.next; ensureLink(d.next); break;
-    case "ai-layers": ai.layersByName = d.by; loadCardRender(); break;
+    case "ai-layers":
+      ai.layersByName = d.by; loadCardRender();
+      if (ai.role === "worker" && !d.by[myName]) {   // not in this deal: ask-only guest, GPU memory freed
+        ai.role = "guest"; ai.range = null; ai.engine = null;
+        try { ai.device?.destroy(); } catch {}
+        ai.device = null;
+      }
+      break;
     case "ai-reset":   // the host started a new chat
       clearChat();
       toast(`${d.by || "the host"} started a new chat`);
@@ -1899,6 +1927,9 @@ async function aiOnData(from, d) {
 
 $("ai-start").addEventListener("click", aiStartAnywhere);
 $("ai-redeal").addEventListener("click", aiRedeal);
+$("ai-split").addEventListener("change", () => {
+  if (ai.role === "host" && ai.engine) showRedeal(true, $("ai-split").value === "speed" ? "re-deal to put the layers on the fastest devices (measured on the answers so far)" : "re-deal to split by memory again");
+});
 $("ai-visibility").addEventListener("change", (e) => {
   ai.visibility = e.target.value;
   broadcastAll({ t: "ai-visibility", mode: ai.visibility });
