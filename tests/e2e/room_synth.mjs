@@ -34,7 +34,8 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
+import https from "https";
 import { writeSynth } from "./synth.mjs";
 import { loadPlaywright, chromiumPath, GPU_ARGS, serveRepo } from "./engine_synth.mjs";
 
@@ -83,13 +84,17 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
   // real devices do); without it the tabs share one context and one weight cache
   const ctxs = [];
   const makeCtx = async () => {
-  const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 }, ignoreHTTPSErrors: true });
   ctxs.push(ctx);
   await ctx.route("**/*", async (route) => {
     const req = route.request(), url = req.url();
     if (url.startsWith(`http://127.0.0.1:${PORT}/`) || url.startsWith(`http://127.0.0.1:${SIGNAL_PORT}/`)) return route.continue();
     const cors = { "access-control-allow-origin": "*", "access-control-allow-headers": "range", "access-control-expose-headers": "content-range, content-length, accept-ranges" };
     if (url.split("?")[0] === PEERJS_URL) return route.fulfill({ status: 200, contentType: "text/javascript", headers: cors, body: peerjsJs });
+    // weights come from a local https server (route.continue to it): route.fulfill pushes the body
+    // through the DevTools pipe, which closes on anything over 100 MB (a Q8_0 27B FFN tensor is 94 MB,
+    // ~125 MB as base64)
+    if (url.split("?")[0] === MODEL_URL && weightsURL) return route.continue({ url: weightsURL });
     if (url.split("?")[0] === MODEL_URL) {
       if (req.method() === "OPTIONS") return route.fulfill({ status: 204, headers: { ...cors, "access-control-allow-methods": "GET, HEAD" } });
       const m = /bytes=(\d+)-(\d*)/.exec((await req.allHeaders()).range || "");
@@ -327,6 +332,24 @@ if (!flag("real-autotune")) {
   extra["/engine/autotune.js"] = stub;
 }
 const srv = serveRepo(PORT, extra);
+// local https weight server with Range support (self-signed; the contexts ignore certificate errors)
+let weightsURL = null, wsrv = null;
+try {
+  const tlsDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-tls-"));
+  execSync(`openssl req -x509 -newkey rsa:2048 -nodes -keyout ${tlsDir}/k.pem -out ${tlsDir}/c.pem -days 2 -subj /CN=127.0.0.1 2>/dev/null`);
+  const size = modelBytes.length, TLS_PORT = PORT + 1;
+  wsrv = https.createServer({ key: fs.readFileSync(`${tlsDir}/k.pem`), cert: fs.readFileSync(`${tlsDir}/c.pem`) }, async (q, r) => {
+    const cors = { "access-control-allow-origin": "*", "access-control-allow-headers": "range", "access-control-expose-headers": "content-range, content-length, accept-ranges" };
+    if (q.method === "OPTIONS") { r.writeHead(204, { ...cors, "access-control-allow-methods": "GET, HEAD" }); r.end(); return; }
+    const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || "");
+    if (+arg("ttfb", 0)) await new Promise((res) => setTimeout(res, +arg("ttfb", 0)));
+    stats.requests = (stats.requests || 0) + 1;
+    const lo = m ? +m[1] : 0, hi = m && m[2] ? Math.min(+m[2], size - 1) : size - 1;
+    r.writeHead(m ? 206 : 200, { ...cors, "content-type": "application/octet-stream", "accept-ranges": "bytes", "content-length": String(hi - lo + 1), ...(m ? { "content-range": `bytes ${lo}-${hi}/${size}` } : {}) });
+    r.end(modelBytes.subarray(lo, hi + 1));
+  }).listen(TLS_PORT, "127.0.0.1");
+  weightsURL = `https://127.0.0.1:${TLS_PORT}/model.gguf`;
+} catch (e) { log(`no local https weight server (${String(e).slice(0, 80)}): serving weights through route.fulfill (tensors > 70 MB will not load)`); }
 for (let i = 0; ; i++) {   // wait until the PeerServer answers
   const up = await fetch(`http://127.0.0.1:${SIGNAL_PORT}/peerjs/id`).then((r) => r.ok, () => false);
   if (up) break;
@@ -363,7 +386,7 @@ try {
   console.error("FAILED:", e.stack || e);
   code = 2;
 } finally {
-  await browser.close(); srv.close(); peerServer.kill();
+  await browser.close(); srv.close(); wsrv?.close(); peerServer.kill();
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 process.exit(code);

@@ -174,7 +174,7 @@ export const DEFAULTS = {
 // The 27B's shapes (dim 5120, FFN 17408, 24 q / 4 kv heads of 256, 16 / 48 DeltaNet heads): every
 // matrix hits a pinned prefill-GEMM shape (engine/wgsl/gemm.js GEMM_S), so the GEMM path runs.
 // --shape 27b; fewer layers keep it loadable on SwiftShader (4 layers + draft block ~ 1.1 GB).
-export const SHAPE_27B = { dim: 5120, inter: 17408, nH: 24, nKV: 4, hd: 256, nRot: 64, nKH: 16, nVH: 48, counter: false, layers: 4 };
+export const SHAPE_27B = { dim: 5120, inter: 17408, nH: 24, nKV: 4, hd: 256, nRot: 64, nKH: 16, nVH: 48, counter: false, layers: 4, q8out: true };
 
 // Residual-stream feature dims reserved for the answer-length counter (see buildSynthGGUF).
 const F_MARK = 0, F_COUNT = 1, F_BIAS = 2, NF = 3;
@@ -264,14 +264,16 @@ export function buildSynthGGUF(opts = {}) {
     vec(p + "post_attention_norm.weight", dim, normF);
     mat(p + "ffn_gate.weight", inter, dim, 1, { role: "in" });
     mat(p + "ffn_up.weight", inter, dim, 1, { role: "in" });
-    mat(p + "ffn_down.weight", dim, inter, ls * 2, { role: "out" });
+    // the real 27B file keeps ffn_down, ssm_out and attn_output in Q8_0 (q8out mirrors that)
+    const OT = o.q8out ? GGML.Q8_0 : GGML.Q4_0;
+    mat(p + "ffn_down.weight", dim, inter, ls * 2, { role: "out", type: OT });
     if (full) {
       // [q | gate] per head; the counter head (0) has q = 0 and gate = 0 (sigmoid 0.5)
       mat(p + "attn_q.weight", 2 * qDim, dim, 1, { role: "in", edit: counter ? (x) => x.fill(0, 0, 2 * hd * dim) : null });
       mat(p + "attn_k.weight", kvDim, dim, 1, { role: "in" });
       // kv head 0, component 0 = the marker (normed dim 0)
       mat(p + "attn_v.weight", kvDim, dim, 1, { role: "in", edit: counter ? (x) => { x.fill(0, 0, dim); x[F_MARK] = 1; } : null });
-      mat(p + "attn_output.weight", dim, qDim, ls * 2, { role: "out", edit: counter ? (x) => {
+      mat(p + "attn_output.weight", dim, qDim, ls * 2, { role: "out", type: OT, edit: counter ? (x) => {
         for (let r = 0; r < dim; r++) { x[r * qDim + 0] = 0; x[r * qDim + hd] = 0; }   // heads 0 and 1 share kv head 0
         x[F_COUNT * qDim + 0] = G;
       } : null });
@@ -286,7 +288,7 @@ export function buildSynthGGUF(opts = {}) {
       vec(p + "ssm_a", nVH, () => -(0.3 + rnd() * 1.5));   // A = -exp(A_log) < 0 -> decay in (0, 1)
       f32mat(p + "ssm_conv1d.weight", convDim, 4, () => U(0.6));
       vec(p + "ssm_norm.weight", dState, norm);
-      mat(p + "ssm_out.weight", dim, dInner, ls * 3, { role: "out" });
+      mat(p + "ssm_out.weight", dim, dInner, ls * 3, { role: "out", type: OT });
     }
   };
   for (let i = 0; i < L; i++) layer(i, i % 4 === 3, o.counter && i === 3);
