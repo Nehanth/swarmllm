@@ -39,6 +39,7 @@ import { writeSynth } from "./synth.mjs";
 import { loadPlaywright, chromiumPath, GPU_ARGS, serveRepo } from "./engine_synth.mjs";
 
 const argv = process.argv.slice(2);
+const stats = {};   // model server counters
 const arg = (k, d) => { const i = argv.indexOf("--" + k); return i >= 0 ? argv[i + 1] : d; };
 const args = (k) => argv.flatMap((a, i) => (a === "--" + k ? [argv[i + 1]] : []));
 const flag = (k) => argv.includes("--" + k);
@@ -89,6 +90,9 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
       const m = /bytes=(\d+)-(\d*)/.exec((await req.allHeaders()).range || "");
       if (!m) return route.fulfill({ status: 200, headers: { ...cors, "content-type": "application/octet-stream", "accept-ranges": "bytes" }, body: modelBytes });
       const lo = +m[1], hi = m[2] ? Math.min(+m[2], size - 1) : size - 1;
+      // --ttfb MS: every range request waits this long before its first byte, like a CDN would
+      if (+arg("ttfb", 0)) await new Promise((r) => setTimeout(r, +arg("ttfb", 0)));
+      stats.requests = (stats.requests || 0) + 1;
       if (lo >= size) return route.fulfill({ status: 416, headers: { ...cors, "content-range": `bytes */${size}` } });
       return route.fulfill({ status: 206, headers: { ...cors, "content-type": "application/octet-stream", "accept-ranges": "bytes", "content-range": `bytes ${lo}-${hi}/${size}` },
         body: modelBytes.subarray(lo, hi + 1) });
