@@ -1059,14 +1059,14 @@ function setCtx(used, max) {
 
 async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
   const M = MODELS[modelKey];
-  aiLoading(true, `downloading layers ${range[0]}\u2013${range[1] - 1} of ${M.label.split("\u00b7")[0].trim()}`);
+  aiLoading(true, `loading layers ${range[0]}\u2013${range[1] - 1} of ${M.label.split("\u00b7")[0].trim()}`);
   aiStatus("requesting GPU\u2026");
   mascot("Grabbing my slice of the model… hang tight.");
   // a previous attempt in this tab still owns its weights: release them first, or the
   // second load doubles GPU memory and every buffer after the limit comes back invalid
   if (ai.device) { try { ai.device.destroy(); } catch {} ai.device = null; ai.engine = null; }
   ai.firstGpuError = null;
-  ai.peerBytes = 0; ai.netBytes = 0;
+  ai.peerBytes = 0; ai.netBytes = 0; cacheHits = 0;   // per load: a count left from an earlier load in this tab mislabels the status
   const adapter = await navigator.gpu?.requestAdapter();
   if (!adapter) throw new Error("no WebGPU on this device");
   ai.device = await adapter.requestDevice({
@@ -1108,7 +1108,11 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
 
   const onProg = (done, total) => {
     aiProgress(done, total);
-    aiStatus(cacheHits > done * 0.5 ? `loading weights from this device's cache\u2026` : `downloading weights\u2026`);
+    // name where the bytes are coming from right now: the network, devices in the room, or this device's cache
+    const gb = (b) => (b / 2 ** 30).toFixed(1) + " GB";
+    aiStatus(ai.netBytes ? `downloading weights\u2026${cacheHits ? ` (${gb(cacheHits)} was already on this device)` : ""}`
+      : ai.peerBytes ? `getting weights from devices in the room\u2026`
+      : cacheHits ? `loading weights from this device's cache\u2026` : `downloading weights\u2026`);
     ai.myPct = total ? done / total * 100 : 0;
     ai.prog = ai.prog || {}; ai.progAt = ai.progAt || {};
     ai.prog[myName] = Math.round(ai.myPct); ai.progAt[myName] = Date.now();
