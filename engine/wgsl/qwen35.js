@@ -503,6 +503,17 @@ ${dnDeltaRegsWGSL()}
 @group(1) @binding(2) var<storage, read> eg_id: array<u32>;
 @group(1) @binding(3) var<storage, read_write> eg_out: array<f32>;
 @group(1) @binding(4) var<uniform> eg_u: vec4<u32>;       // dim, kind (0 q4, 1 q8), rows
+// f16 bits -> f32 by hand (not unpack2x16float, which may flush f16 subnormals): the same value
+// the host's f16ToF32 returns for every finite input, subnormals and -0 included. The speculative
+// one-submit verify (engine specFuse) feeds these rows to the trunk, so they must match the host's.
+fn eg_f16(h: u32) -> f32 {
+  let e = (h >> 10u) & 0x1Fu; let m = h & 0x3FFu;
+  var v: f32;
+  if (e == 0u) { v = ldexp(f32(m), -24); }                       // subnormal: m * 2^-24, exact in f32
+  else if (e == 31u) { v = bitcast<f32>(0x7F800000u | (m << 13u)); }
+  else { v = bitcast<f32>(((e + 112u) << 23u) | (m << 13u)); }
+  return select(v, -v, (h & 0x8000u) != 0u);
+}
 @compute @workgroup_size(64)
 fn emb_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x; let dim = eg_u.x;
@@ -510,7 +521,7 @@ fn emb_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
   let id = min(eg_id[0], eg_u.z - 1u);
   let nb = dim / 32u; let b = i / 32u; let e = i % 32u;
   let si = id * nb + b;
-  let s = unpack2x16float(eg_sc[si >> 1u])[si & 1u];
+  let s = eg_f16((eg_sc[si >> 1u] >> ((si & 1u) * 16u)) & 0xFFFFu);
   var q: f32;
   if (eg_u.y == 0u) {
     let bi = si * 16u + (e % 16u);

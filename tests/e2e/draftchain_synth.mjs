@@ -1,5 +1,6 @@
-// One-submit draft chain (engine draftChain) vs one submit per draft: same drafts (so the same
-// acceptance counts) and the same speculative output, K = 3 and 7, with and without draftVocab.
+// One-submit draft chain (engine draftChain) vs one submit per draft, each with and without the
+// one-submit verify (engine specFuse): same drafts (so the same acceptance counts) and the same
+// speculative output as the fully separate path, K = 3 and 7, with and without draftVocab.
 //   NODE_PATH=... node tests/e2e/draftchain_synth.mjs [--model f.gguf]
 import fs from "fs"; import os from "os"; import path from "path";
 import { loadPlaywright, chromiumPath, GPU_ARGS, serveRepo } from "./engine_synth.mjs";
@@ -29,18 +30,21 @@ async function pageMain({ ntok }) {
       weights: await qwen35Weights(G, bytesOf, { lo: 0, hi: L, hasEmbed: true, hasHead: true, mtp: true }) });
     if (!eng.draftChain) { say("FAIL draftChain did not switch on"); allOk = false; continue; }
     for (const K of [3, 7]) {
-      const run = async (chain) => {
-        eng.chainOn = chain; eng.reset(); eng.mtp.stats = { drafts: 0, accepted: 0 };
+      const run = async (chain, fuse) => {
+        eng.chainOn = chain; eng.specFuse = fuse; eng.reset(); eng.mtp.stats = { drafts: 0, accepted: 0 };
         await eng.prefillTokens(prompt.slice(0, -1));
         let next = argmax(await eng.forwardToken(prompt[prompt.length - 1]));
         const toks = [next]; const t0 = performance.now(); let steps = 0;
         while (toks.length < ntok) { const o = await eng.specStep(next, argmax, K); toks.push(...o); next = o[o.length - 1]; steps++; }
         return { toks: toks.slice(0, ntok).join(), st: `${eng.mtp.stats.accepted}/${eng.mtp.stats.drafts}`, ms: (performance.now() - t0) / steps };
       };
-      const a = await run(false), b = await run(true);
-      const ok = a.toks === b.toks && a.st === b.st;
-      if (!ok) allOk = false;
-      say(`${ok ? "PASS" : "FAIL"} draftVocab ${draftVocab || "off"}, K=${K}: output ${a.toks === b.toks ? "identical" : "DIFFERS"}, drafts accepted per-submit ${a.st} vs chain ${b.st}; ms per step (SwiftShader) ${a.ms.toFixed(0)} vs ${b.ms.toFixed(0)}`);
+      const a = await run(false, false);
+      for (const [chain, fuse] of [[true, false], [false, true], [true, true]]) {
+        const b = await run(chain, fuse);
+        const ok = a.toks === b.toks && a.st === b.st;
+        if (!ok) allOk = false;
+        say(`${ok ? "PASS" : "FAIL"} draftVocab ${draftVocab || "off"}, K=${K}, chain ${chain ? "on" : "off"}, fuse ${fuse ? "on" : "off"}: output ${a.toks === b.toks ? "identical" : "DIFFERS"}, drafts accepted separate ${a.st} vs ${b.st}; ms per step (SwiftShader) ${a.ms.toFixed(0)} vs ${b.ms.toFixed(0)}`);
+      }
     }
   }
   if (errs.length) { allOk = false; say("GPU errors: " + errs.slice(0, 2).join(" | ")); }

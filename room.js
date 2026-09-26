@@ -1175,9 +1175,11 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
       batchCols: 16, coopRowsB: 1,
       // ?draftvocab=N: draft over the first N vocabulary rows only (engine/qwen35.js); off by default
       draftVocab: parseInt(new URLSearchParams(location.search).get("draftvocab"), 10) || 0,
-      // ?draftchain=1: the K drafts of a speculative step in one submit (keeps the embedding table,
-      // or its first draftvocab rows, on the GPU); off by default until measured
-      draftChain: new URLSearchParams(location.search).get("draftchain") === "1",
+      // the K drafts of a speculative step, its verify and its LM head in one submit (keeps the
+      // embedding table, or its first draftvocab rows, on the GPU); ?draftchain=0 turns it off
+      draftChain: new URLSearchParams(location.search).get("draftchain") !== "0",
+      // ?specfuse=0: speculative verify as separate trunk / head submits (A/B; same output bits)
+      specFuse: new URLSearchParams(location.search).get("specfuse") !== "0",
       // ?fuse=0: the unfused kernels (attention glue, DeltaNet delta + gated norm, batched
       // attention) for A/B timing; both give the same bits, so devices may differ
       ...(new URLSearchParams(location.search).get("fuse") === "0" ? { attnGlue: false, dnFuse: false, attnMC: false } : {}),

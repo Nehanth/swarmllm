@@ -121,7 +121,7 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false, attnGlue = true, dnFuse = true, attnMC = true, attnFlash = true, kvQ8 = false, attnTile = true }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = true, specFuse = true, attnGlue = true, dnFuse = true, attnMC = true, attnFlash = true, kvQ8 = false, attnTile = true }) {
     this.replay = replayRollback !== false;
     // longest draft run one verify can take: with replay rollback the limit is the replay buffers
     // (max(batchCols, 8) columns), so prompt-lookup drafts can run to 15 tokens when code is being copied
@@ -564,17 +564,24 @@ export class Qwen35Engine {
       M2.proj = mv(M2.ehProj, M2.ehIn, this.x, dim, 2 * dim);           // eh_proj -> MTP residual (in x)
       M2.bgHeadNorm = bgNorm(this.x, M2.headNorm, this.xn);               // shared_head_norm -> xn
     }
-    // One-submit draft chain (roadmap 26 #2, opt-in: it keeps the embedding table on the GPU too,
-    // ~675 MB for the 27B, or only its first draftVocab rows): the K draft steps of a speculative
-    // step go into one command buffer; each step gathers the previous argmax's embedding on the
-    // GPU and has its own frame uniform, and one readback returns all K drafts. Drafts only.
+    // One-submit draft chain (roadmap 26 #2; on by default, draftChain: false or ?draftchain=0 turns
+    // it off; it keeps the embedding table on the GPU too, ~715 MB for the 27B, ~290 MB for the
+    // 35B-A3B, or only its first draftVocab rows): the K draft steps of a speculative step go into
+    // one command buffer; each step gathers the previous argmax's embedding on the GPU (bit-exact
+    // with _embedRowF32) and has its own frame uniform, and one readback returns all K drafts.
+    // With specFuse the same gather also fills the verify columns, so drafts + verify + head are
+    // one submit. Skipped (per-submit drafts) when the table does not fit one storage binding.
     const ce = this.cpuEmbed;
-    if (draftChain && this.mtp && ce && (ce.kind === "q4" || ce.kind === "q8") && ce.qs && ce.scales) {
-      const nb = dim / 32, rows = Math.min(vocab, this.draftVocab || vocab), per = ce.kind === "q4" ? 16 : 32;
+    const egRows = Math.min(vocab, this.draftVocab || vocab), egPer = ce && ce.kind === "q4" ? 16 : 32;
+    const egBytes = egRows * (dim / 32) * egPer, lim = device.limits || {};
+    const egFits = egBytes <= (lim.maxStorageBufferBindingSize ?? Infinity) && egBytes <= (lim.maxBufferSize ?? Infinity);
+    if (draftChain && this.mtp && ce && (ce.kind === "q4" || ce.kind === "q8") && ce.qs && ce.scales && egFits) {
+      const nb = dim / 32, rows = egRows, per = egPer;
       const qs = this._buf(ce.qs.subarray(0, rows * nb * per), GPUBufferUsage.STORAGE);
       const sc = this._buf(ce.scales.subarray(0, Math.ceil(rows * nb / 2)), GPUBufferUsage.STORAGE);
-      this.bgEmbGather = this._bg(this.pipes.emb_gather, 1, [qs, sc, this.argBuf, this.mtp.emb,
-        this._buf(new Uint32Array([dim, ce.kind === "q4" ? 0 : 1, rows, 0]), GPUBufferUsage.UNIFORM)]);
+      const egU = this._buf(new Uint32Array([dim, ce.kind === "q4" ? 0 : 1, rows, 0]), GPUBufferUsage.UNIFORM);
+      this._eg = { qs, sc, u: egU, rows };
+      this.bgEmbGather = this._bg(this.pipes.emb_gather, 1, [qs, sc, this.argBuf, this.mtp.emb, egU]);
       this.stepFrames = Array.from({ length: 8 }, () => device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
       this.bgCommonStep = this.stepFrames.map((f) => {
         const m = {};
@@ -584,6 +591,12 @@ export class Qwen35Engine {
       this.stageArgK = device.createBuffer({ size: 8 * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       this.draftChain = true;
     }
+    // One-submit speculative verify (docs/research/kernels-next-2026-09.md D1): the batched trunk
+    // and the batched LM head of a solo verify go into one command buffer (after the draft chain,
+    // when it is on) with one readback of the logits (and the drafts); the trunk hiddens stay on
+    // the GPU. Same kernels, same inputs, same order: bit-identical. engine.specFuse = false
+    // restores the separate submits (trunk readback, head write-back) for A/B.
+    this.specFuse = specFuse !== false;
   }
 
   _shape(dOut, dIn) {
@@ -875,7 +888,8 @@ export class Qwen35Engine {
           beta: dev.createBuffer({ size: maxCols * B.beta.stride, usage: S }), decay: dev.createBuffer({ size: maxCols * B.decay.stride, usage: S }) };
       } else L.S_shadow = dev.createBuffer({ size: 7 * L.S.size, usage: S });
     }
-    this.stageLogitsN = dev.createBuffer({ size: NC * D.vocab * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    // + 8 x 16 B tail: the fused speculative step (_verifyFused) reads its drafts in the same map
+    this.stageLogitsN = dev.createBuffer({ size: NC * D.vocab * 4 + 128, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const slice = (b, c) => ({ buffer: b.buf, offset: c * b.stride, size: b.n * 4 });
     const part = (b, c, off, size) => ({ buffer: b.buf, offset: c * b.stride + off, size });
     this.frameBufsB = cix.map(() => dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
@@ -1332,10 +1346,22 @@ export class Qwen35Engine {
   // to what it was after column k.
   // the K drafts of specStep in one submit (see draftChain in _init); same kernels, same inputs
   async _draftChain(tNext, pos, K) {
-    const M2 = this.mtp, small = !!this.headOpDraft;
-    this.device.queue.writeBuffer(M2.emb, 0, this._embedRowF32(tNext));
-    for (let k = 0; k < K; k++) this.device.queue.writeBuffer(this.stepFrames[k], 0, new Uint32Array([pos + k, pos + k + 1]));
+    this.device.queue.writeBuffer(this.mtp.emb, 0, this._embedRowF32(tNext));
     const enc = this.device.createCommandEncoder();
+    this._encodeDraftChain(enc, pos, K, this.stageArgK, 0, false);
+    this.device.queue.submit([enc.finish()]);
+    await this.stageArgK.mapAsync(GPUMapMode.READ, 0, K * 16);
+    const a = new Uint32Array(this.stageArgK.getMappedRange(0, K * 16));
+    const drafts = Array.from({ length: K }, (_, k) => a[k * 4]);
+    this.stageArgK.unmap();
+    return drafts;
+  }
+  // Encode the K draft steps (M2.emb must already hold tNext's embedding). Draft k's argmax goes
+  // to stage at stageOff + 16k. toB: also gather draft k's embedding into verify column k + 1 of
+  // B.x (the fused step's trunk input), from the same argBuf value the host reads back.
+  _encodeDraftChain(enc, pos, K, stage, stageOff, toB) {
+    const M2 = this.mtp, small = !!this.headOpDraft;
+    for (let k = 0; k < K; k++) this.device.queue.writeBuffer(this.stepFrames[k], 0, new Uint32Array([pos + k, pos + k + 1]));
     try {
       for (let k = 0; k < K; k++) {
         this._common = this.bgCommonStep[k];
@@ -1351,28 +1377,99 @@ export class Qwen35Engine {
         this._dop(p2, small ? this.headOpDraft : this.headOp);
         this._d(p2, "argmax", small ? this.bgArgmaxDraft : this.bgArgmax, 256, 256);
         p2.end();
-        enc.copyBufferToBuffer(this.argBuf, 0, this.stageArgK, k * 16, 16);
+        enc.copyBufferToBuffer(this.argBuf, 0, stage, stageOff + k * 16, 16);
+        if (toB) {
+          const p3 = enc.beginComputePass();
+          this._d(p3, "emb_gather", this._egB(k + 1), this.dims.dim);
+          p3.end();
+        }
       }
     } finally { this._common = null; }
-    this.device.queue.submit([enc.finish()]);
-    await this.stageArgK.mapAsync(GPUMapMode.READ, 0, K * 16);
-    const a = new Uint32Array(this.stageArgK.getMappedRange(0, K * 16));
-    const drafts = Array.from({ length: K }, (_, k) => a[k * 4]);
-    this.stageArgK.unmap();
-    return drafts;
+  }
+  _egB(c) {   // emb_gather bind group writing batch column c of B.x
+    this._egBG = this._egBG || [];
+    if (!this._egBG[c]) {
+      const E = this._eg, X = this.B.x;
+      this._egBG[c] = this._bg2(this.pipes.emb_gather, [{ buffer: E.qs }, { buffer: E.sc }, { buffer: this.argBuf },
+        { buffer: X.buf, offset: c * X.stride, size: this.dims.dim * 4 }, { buffer: E.u }]);
+    }
+    return this._egBG[c];
+  }
+
+  // One-submit speculative verify (specFuse). tokens: [tNext, ...drafts], or chainK > 0 to draft
+  // tNext's K continuations in the same command buffer (then tokens = [tNext] and the drafts come
+  // back with the logits). Encodes exactly what the separate path runs, in the same order:
+  //   [draft chain] -> embedRunBatch's trunk pass (snapshots on) -> headBatch's norm + LM head
+  // and differs only in where the data waits: the verify columns' embeddings for the drafts are
+  // gathered on the GPU (emb_gather, bit-exact with _embedRowF32), the trunk hiddens stay in B.x
+  // (the separate path reads them to the CPU and writes the same bytes back for the head), and one
+  // mapAsync returns the logits plus the drafts. Returns { lgs, drafts }; B.x keeps the hiddens.
+  async _verifyFused(tokens, pos, chainK = 0) {
+    const { dim, vocab } = this.dims, n = tokens.length + chainK, q = this.device.queue;
+    if (chainK) q.writeBuffer(this.mtp.emb, 0, this._embedRowF32(tokens[0]));
+    this.pos = pos;
+    const sp = this._snapWord(true, n);
+    for (let c = 0; c < n; c++) q.writeBuffer(this.frameBufsB[c], 0, new Uint32Array([pos + c, pos + c + 1, n, sp]));
+    for (let c = 0; c < tokens.length; c++) q.writeBuffer(this.B.x.buf, c * this.B.x.stride, this._embedRowF32(tokens[c]));
+    const enc = this.device.createCommandEncoder();
+    const tail = n * vocab * 4;   // drafts go right after the n logits rows
+    if (chainK) this._encodeDraftChain(enc, pos, chainK, this.stageLogitsN, tail, true);
+    for (let l = 0; l < this.layers.length; l++) this._encodeLayerBatch(enc, l, pos, n);
+    const p = enc.beginComputePass();
+    this._dMC(p, "rmsnorm_mc", this.bgFinalNormMC, 256, 256, n);
+    this._dop(p, this.headB, n);
+    p.end();
+    for (let c = 0; c < n; c++) enc.copyBufferToBuffer(this.B.logits.buf, c * this.B.logits.stride, this.stageLogitsN, c * vocab * 4, vocab * 4);
+    q.submit([enc.finish()]);
+    const bytes = tail + chainK * 16;
+    await this.stageLogitsN.mapAsync(GPUMapMode.READ, 0, bytes);
+    const m = this.stageLogitsN.getMappedRange(0, bytes);
+    const all = new Float32Array(m, 0, n * vocab).slice();
+    const ids = new Uint32Array(m, tail, chainK * 4);
+    const drafts = Array.from({ length: chainK }, (_, k) => ids[k * 4]);
+    this.stageLogitsN.unmap();
+    this.pos = pos + n;
+    const lgs = [];
+    for (let c = 0; c < n; c++) lgs.push(all.subarray(c * vocab, (c + 1) * vocab));
+    return { lgs, drafts };
+  }
+  _canFuse(n, runTrunk) {   // solo verify that fits one batch pass
+    if (this.specFuse === false || runTrunk || n > this.NC || !this.hasHead || !this.hasEmbed) return false;
+    if (!this.B) this._initBatch();
+    return !!this.bgFinalNormMC;
+  }
+
+  // After the verify: roll back the rejected suffix, re-fill the draft cache for the accepted
+  // positions with the exact trunk hiddens, and leave the hidden of the last accepted column in
+  // this.x. hs = null: the hiddens are still in B.x (fused verify), read there by the GPU.
+  async _specAccept(pos, a, K, out, hs, onReject, refill) {
+    const dim = this.dims.dim;
+    if (a < K) { this._restoreDN(a); if (onReject) await onReject(a); }
+    if (refill) for (let j = 1; j <= a; j++) {
+      if (hs) { this.setHidden(hs.subarray((j - 1) * dim, j * dim)); await this.mtpRun(null, out[j - 1], pos + j, false); }
+      else await this.mtpRun(j - 1, out[j - 1], pos + j, false);   // hnorm reads B.x column j - 1: same bytes as setHidden
+    }
+    if (hs) this.setHidden(hs.subarray(a * dim, (a + 1) * dim));
+    else this._adoptHidden(a);
+    this.pos = pos + a + 1;
   }
 
   async specStep(tNext, sample, K = 3, { runTrunk = null, onReject = null } = {}) {
-    const pos = this.pos, M2 = this.mtp, { dim } = this.dims;
+    const pos = this.pos, M2 = this.mtp;
     K = Math.max(1, Math.min(7, K));
-    let drafts = [];
-    if (this.draftChain && this.chainOn !== false) drafts = await this._draftChain(tNext, pos, K);
-    else for (let k = 0; k < K; k++) {
-      // after the first call this.x holds the MTP block's own output hidden,
-      // which is what chained drafting feeds back in
-      drafts.push(await this.mtpRun(null, k === 0 ? tNext : drafts[k - 1], pos + k, "argmax"));
+    const chain = this.draftChain && this.chainOn !== false;
+    let drafts = [], lgs, hs = null;
+    if (chain && this._canFuse(K + 1, runTrunk)) ({ lgs, drafts } = await this._verifyFused([tNext], pos, K));
+    else {
+      if (chain) drafts = await this._draftChain(tNext, pos, K);
+      else for (let k = 0; k < K; k++) {
+        // after the first call this.x holds the MTP block's own output hidden,
+        // which is what chained drafting feeds back in
+        drafts.push(await this.mtpRun(null, k === 0 ? tNext : drafts[k - 1], pos + k, "argmax"));
+      }
+      if (this._canFuse(K + 1, runTrunk)) ({ lgs } = await this._verifyFused([tNext, ...drafts], pos));
+      else ({ lgs, hs } = await this.verifyN([tNext, ...drafts], pos, runTrunk));
     }
-    const { lgs, hs } = await this.verifyN([tNext, ...drafts], pos, runTrunk);
     const out = [];
     let a = 0;   // accepted drafts
     for (let k = 0; k <= K; k++) {
@@ -1381,14 +1478,7 @@ export class Qwen35Engine {
       if (k < K && t === drafts[k]) a++; else break;
     }
     M2.stats.drafts += K; M2.stats.accepted += a;
-    if (a < K) { this._restoreDN(a); if (onReject) await onReject(a); }
-    // re-fill the draft cache for the accepted positions with exact trunk hiddens
-    for (let j = 1; j <= a; j++) {
-      this.setHidden(hs.subarray((j - 1) * dim, j * dim));
-      await this.mtpRun(null, out[j - 1], pos + j, false);
-    }
-    this.setHidden(hs.subarray(a * dim, (a + 1) * dim));
-    this.pos = pos + a + 1;
+    await this._specAccept(pos, a, K, out, hs, onReject, true);
     return out;
   }
 
@@ -1402,7 +1492,9 @@ export class Qwen35Engine {
     const K = Math.max(1, Math.min(this.maxDrafts || 7, drafts.length));
     drafts = drafts.slice(0, K);
     if (M2) await this.mtpRun(null, tNext, pos, false);
-    const { lgs, hs } = await this.verifyN([tNext, ...drafts], pos, runTrunk);
+    let lgs, hs = null;
+    if (this._canFuse(K + 1, runTrunk)) ({ lgs } = await this._verifyFused([tNext, ...drafts], pos));
+    else ({ lgs, hs } = await this.verifyN([tNext, ...drafts], pos, runTrunk));
     const out = [];
     let a = 0;
     for (let k = 0; k <= K; k++) {
@@ -1412,13 +1504,7 @@ export class Qwen35Engine {
     }
     this.lookupStats = this.lookupStats || { drafts: 0, accepted: 0 };
     this.lookupStats.drafts += K; this.lookupStats.accepted += a;
-    if (a < K) { this._restoreDN(a); if (onReject) await onReject(a); }
-    if (M2) for (let j = 1; j <= a; j++) {
-      this.setHidden(hs.subarray((j - 1) * dim, j * dim));
-      await this.mtpRun(null, out[j - 1], pos + j, false);
-    }
-    this.setHidden(hs.subarray(a * dim, (a + 1) * dim));
-    this.pos = pos + a + 1;
+    await this._specAccept(pos, a, K, out, hs, onReject, !!M2);
     return out;
   }
 
