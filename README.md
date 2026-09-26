@@ -140,7 +140,7 @@ Model weights and the GGUF format come from the [Qwen](https://huggingface.co/Qw
 
 ## Name
 
-"SwarmLLM" is a common name in this space. This project is independent and not affiliated with the [SWARM-LLM paper](https://arxiv.org/abs/2606.14711), [enapt/SwarmLLM](https://github.com/enapt/SwarmLLM), or any other project using the name.
+"SwarmLLM" is a common name in this space. This project is independent and not affiliated with the [SWARM-LLM paper](https://arxiv.org/abs/2606.14711) (a routing layer for swarms of edge small language models), [enapt/SwarmLLM](https://github.com/enapt/SwarmLLM) (a native Rust app that pools computers over a public network to run large models), or any other project using the name.
 
 ## License
 
