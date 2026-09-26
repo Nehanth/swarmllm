@@ -32,7 +32,7 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false, attnGlue = true, dnFuse = true }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false, attnGlue = true, dnFuse = true, attnMC = true }) {
     this.replay = replayRollback !== false;
     this.device = device;
     this.mvVariant = matvecVariant;
@@ -67,6 +67,10 @@ export class Qwen35Engine {
     this.attnGlue = this.attnGlueOn;
     // dn_delta + dn_gatenorm in one dispatch for decode (bit-identical); engine.dnFuse = false for A/B
     this.dnFuse = dnFuse !== false;
+    // batched attention for verify / prefill passes (one dispatch per stage for all columns instead
+    // of three per column; bit-identical, needs the workgroup softmax). engine.attnMC = false for A/B.
+    this.attnMCOn = attnMC !== false && this.softmaxWG;
+    this.attnMC = this.attnMCOn;
     const [lo, hi] = layerRange;
     this.lo = lo; this.hi = hi;
     this.hasEmbed = hasEmbed; this.hasHead = hasHead;
@@ -148,6 +152,7 @@ export class Qwen35Engine {
       head_norm_mc: ["rw", "ro", "u"], rope_part_mc: ["rw", "u", "u"], sigmoid_mul_mc: ["rw", "ro", "u"],
       attn_glue: ["ro", "rw", "rw", "rw", "ro", "ro", "u", "u"],
       dn_delta_gn: ["ro", "ro", "ro", "rw", "ro", "ro", "rw", "u"],
+      attn_scores_mc: ["ro", "ro", "rw", "u"], attn_softmax_wg_mc: ["rw"], attn_out_mc: ["ro", "ro", "rw", "u"],
       argmax: ["ro", "rw", "u"], emb_gather: ["ro", "ro", "ro", "rw", "u"],
     };
     // narrower twins: a verify or tail pass with w live columns pays for w, not batchCols
@@ -660,7 +665,8 @@ export class Qwen35Engine {
       "silu_mul", "add_res", "rope_part", "qsplit", "sigmoid_mul",
       "dn_gates", "dn_conv", "dn_l2", "dn_delta", "dn_gatenorm",
       "rmsnorm_mc", "add_res_mc", "dn_gates_mc", "dn_conv_mc", "dn_l2_mc", "dn_pre_mc", "dn_delta_mc", "dn_gatenorm_mc",
-      "qsplit_mc", "head_norm_mc", "rope_part_mc", "sigmoid_mul_mc", "attn_glue"];
+      "qsplit_mc", "head_norm_mc", "rope_part_mc", "sigmoid_mul_mc", "attn_glue",
+      "attn_scores_mc", "attn_softmax_wg_mc", "attn_out_mc"];
     this.bgCommonB = cix.map((c) => {
       const m = {};
       for (const name of colPipes)
@@ -699,6 +705,8 @@ export class Qwen35Engine {
       if (this.mtp) this.mtp.bgHNormB = cix.map((c) => this._bg2res(this.pipes.rmsnorm,
         [slice(B.x, c), { buffer: this.mtp.hnorm.buf }, { buffer: this.mtp.ehIn, offset: D.dim * 4, size: D.dim * 4 }, { buffer: this.uDim }]));
     }
+    // per-column score rows for the batched attention (NC x nH x maxSeq; 3 MB at 16 x 24 x 2048)
+    if (this.attnMCOn && !this.scoresMC) this.scoresMC = dev.createBuffer({ size: NC * this.dims.nH * this.maxSeq * 4, usage: GPUBufferUsage.STORAGE });
     this._mcU = this._mcU || {};
     const mcU = (n, s0 = 0, s1 = 0, s2 = 0) => {
       const k = n + "," + s0 + "," + s1 + "," + s2;
@@ -735,6 +743,9 @@ export class Qwen35Engine {
         kNorm: this._bg2res(this.pipes.head_norm_mc, [whole(B.k), { buffer: L.kNorm.buf }, mcU(D.nKV, st(B.k))]),
         ropeQ: this._bg2res(this.pipes.rope_part_mc, [whole(B.q), mcU(D.nH, st(B.q)), dn]),
         ropeK: this._bg2res(this.pipes.rope_part_mc, [whole(B.k), mcU(D.nKV, st(B.k)), dn]),
+        scoresMC: this.scoresMC && this._bg2res(this.pipes.attn_scores_mc, [whole(B.q), { buffer: L.kCache }, { buffer: this.scoresMC }, mcU(0, st(B.q))]),
+        softmaxMC: this.scoresMC && this._bg2res(this.pipes.attn_softmax_wg_mc, [{ buffer: this.scoresMC }]),
+        outMC: this.scoresMC && this._bg2res(this.pipes.attn_out_mc, [{ buffer: this.scoresMC }, { buffer: L.vCache }, whole(B.attnOut), mcU(0, st(B.attnOut))]),
         glue: this._bg2res(this.pipes.attn_glue, [whole(B.qFull), whole(B.q), whole(B.gAttn), whole(B.k),
           { buffer: L.qNorm.buf }, { buffer: L.kNorm.buf }, mcU(st(B.k), st(B.qFull), st(B.q), st(B.gAttn)), dn]),
         sigMul: this._bg2res(this.pipes.sigmoid_mul_mc, [whole(B.attnOut), whole(B.gAttn), mcU(D.qDim, st(B.attnOut), st(B.gAttn))]),
@@ -837,7 +848,11 @@ export class Qwen35Engine {
       }
       {
         const p = enc.beginComputePass();
-        for (let c = 0; c < nCols; c++) {   // shared score scratch: columns in turn
+        if (this.attnMC && M.scoresMC) {
+          this._dMC(p, "attn_scores_mc", M.scoresMC, basePos + nCols, 64, nCols, D.nH);
+          this._dMC(p, "attn_softmax_wg_mc", M.softmaxMC, D.nH * 256, 256, nCols);
+          this._dMC(p, "attn_out_mc", M.outMC, D.qDim, 64, nCols);
+        } else for (let c = 0; c < nCols; c++) {   // shared score scratch: columns in turn
           const C = LB.cols[c];
           this._dCol(p, "attn_scores", c, C.scores, D.nH * (basePos + c + 1));
           if (this.softmaxWG) this._dCol(p, "attn_softmax_wg", c, C.softmax, D.nH * 256, 256);
