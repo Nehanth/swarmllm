@@ -6,7 +6,7 @@ import { f32ToF16, f16ToF32, parseGGUFHeader, ggufWeights, ggufShardBytes, GGML_
   ggmlLayerNames, qwen35Weights, qwen35ShardBytes, qwen35MtpBytes, qwen35LayerNames, tokenizerFromGGUF, gpuUploadEntry, streamEntryToGPU }
   from "./engine/gguf.js";
 import { Qwen35Engine } from "./engine/qwen35.js";
-import { WIRE_F16, badF32, f32ToB64, packF16, unpackF16, asU16, packWire, unpackWire, asF32, b64ToF32 } from "./room/wire.js";
+import { WIRE_F16, badF32, f32ToB64, packF16, unpackF16, asU16, packWire, unpackWire, asF32, b64ToF32, wireStats } from "./room/wire.js";
 import { esc, md, mdChat } from "./room/markdown.js";
 import { pickSampler, SAMPLING } from "./room/sampling.js";
 import { chatRecipients } from "./room/visibility.js";
@@ -1449,6 +1449,7 @@ function lapDone(key, h) { const w = ai.waiters.get(key); if (w) { ai.waiters.de
 // so it reaches every device strictly before the frame it applies to
 function sendChain(msg) {
   ai.frames = (ai.frames || 0) + 1;
+  ai.hostAmax = Math.max(0.9 * (ai.hostAmax || 0), wireStats.lastMax || 0);
   const ctl = ai.pendingCtl; ai.pendingCtl = {};
   sendHidden(ai.chain[0], { ...msg, ...ctl });
 }
@@ -1602,11 +1603,11 @@ function noteLap(lapMs, hostMs) {
   L.n++;
 }
 function mapNodes(kind = "spec") {
-  const nodes = [{ name: myName, layers: ai.layersByName?.[myName] || "", ms: ai.lapStat?.host, host: 1 }];
+  const nodes = [{ name: myName, layers: ai.layersByName?.[myName] || "", ms: ai.lapStat?.host, host: 1, amax: ai.hostAmax }];
   for (const id of ai.chain) {
     const t = ai.teleBy.get(id) || {};
     const name = conns.get(id)?.name || id;
-    nodes.push({ name, layers: ai.layersByName?.[name] || "", ms: t[kind] ?? t.spec ?? t.one });
+    nodes.push({ name, layers: ai.layersByName?.[name] || "", ms: t[kind] ?? t.spec ?? t.one, amax: t.amax });
   }
   return nodes;
 }
@@ -1629,7 +1630,7 @@ function renderMap(nodes, st, live) {
   el.querySelector(".sm-track").innerHTML = nodes.map((x, i) => `<div class="sm-node${x.host ? " host" : ""}" style="--i:${i}">
       <div class="sm-dot"></div><div class="sm-name">${esc(String(x.name))}</div>
       <div class="sm-sub">${x.host ? "embed · " : ""}${x.layers ? "L" + esc(String(x.layers)) : ""}${x.host ? " · head" : ""}</div>
-      <div class="sm-ms">${x.ms ? Math.round(x.ms) + " ms" : ""}</div></div>`).join('<div class="sm-link"><i></i></div>')
+      <div class="sm-ms">${x.ms ? Math.round(x.ms) + " ms" : ""}${x.amax ? ` <span class="sm-amax" title="largest activation this device sent (f16 tops out at 65504)">|x|≤${Math.round(x.amax)}</span>` : ""}</div></div>`).join('<div class="sm-link"><i></i></div>')
     + (nodes.length > 1 ? '<div class="sm-link back"><i></i></div>' : "");
   const bits = [];
   if (st?.tps) bits.push(`${st.tps.toFixed(1)} tok/s`);
@@ -1656,12 +1657,14 @@ function noteSpeeds() {
 // worker: EMA of compute ms per frame kind, reported to the host at most every 700 ms
 function teleNote(kind, ms) {
   const T = ai.tele ||= { at: 0, k: {} };
+  T.amax = Math.max(T.amax || 0, wireStats.lastMax || 0);
   const k = T.k[kind] ||= { ema: ms, n: 0 };
   k.ema = k.n ? 0.7 * k.ema + 0.3 * ms : ms; k.n++;
   const now = performance.now();
   if (now - T.at > 700 && ai.hostId) {
     T.at = now;
-    sendTo(ai.hostId, { t: "ai-tele", k: Object.fromEntries(Object.entries(T.k).map(([a, b]) => [a, Math.round(b.ema * 10) / 10])) });
+    sendTo(ai.hostId, { t: "ai-tele", k: Object.fromEntries(Object.entries(T.k).map(([a, b]) => [a, Math.round(b.ema * 10) / 10])), amax: Math.round(T.amax * 10) / 10 });
+    T.amax = 0;
   }
 }
 
@@ -2162,8 +2165,9 @@ async function aiOnData(from, d) {
       break;
     case "ai-error":
       aiStatus(`peer ${e?.name || from} failed: ${d.message}`);
+      if (ai.role === "host" && ai.chain.includes(from)) failWaiters(new Error(`${e?.name || from}: ${d.message}`));
       break;
-    case "ai-tele": if (ai.role === "host") ai.teleBy.set(from, d.k || {}); break;
+    case "ai-tele": if (ai.role === "host") { ai.teleBy.set(from, { ...(d.k || {}), amax: +d.amax || 0 }); } break;
     case "ai-inv-req": cachedRanges(d.url).then((have) => sendTo(from, { t: "ai-inv", url: d.url, have })); break;
     case "ai-inv": if (ai.invWait && ai.invWait.url === d.url && Array.isArray(d.have)) ai.invWait.inv[from] = d.have.slice(0, 20000); break;
     case "ai-wget": if (PEER_WEIGHTS) serveWeight(from, d); else sendTo(from, { t: "ai-wpart", id: d.id, miss: 1 }); break;
