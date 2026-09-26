@@ -16,6 +16,8 @@ Browsers in a room form a WebRTC mesh (PeerJS signaling for the introduction onl
 | `ai-ask` / `ai-busy {why?}` | guest → host / host → guest | anyone in the room can ask; one generation at a time |
 | `ai-queued {pos}` / `ai-queue {n}` | host → asker / host → all | a question asked while the swarm is answering waits in the host's queue (at most 10, two per device) and runs next; the asker learns its place, every screen shows how many are waiting |
 | `ai-cmd {cmd}` | guest → host | `continue` a capped answer or `regen`erate the last one; honoured from the host or whoever asked last. `ai-regen` (host → all) greys out the replaced exchange |
+| `ai-react {mid, e}` / `ai-reacts {mid, counts}` | guest → host / host → all | emoji reactions on an answer; `mid` is the answer id the host puts in `ai-genstart`. The host toggles per device and broadcasts the counts |
+| `ai-typing {name?}` | guest → host → others | "… is typing", relayed only while the chat is visible to everyone |
 | `ai-stop` | guest → host | stop the answer being generated. Honoured from the device that asked (the host can always stop); decoding ends after the lap in flight and `ai-gendone` unlocks every screen |
 | `ai-degraded {why}` | host → all | a device in the chain left; every lap in flight failed at once and the room waits for a re-deal |
 | `ai-redeal {by, model}` | host → all | the host is dealing the layers again over the devices now in the room (after a departure, or to include late joiners); fresh `ai-load`s follow, cached ranges reload in seconds, the conversation is kept and re-prefilled on the next question |

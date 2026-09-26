@@ -207,6 +207,17 @@ async function session(browser, modelBytes, peerjsJs, nDev, label) {
         await tabs.host.waitForTimeout(500);
       }
     }
+    // --social: a guest reacts to the last answer and types; the host sees the count and the note
+    if (flag("social") && names[1]) {
+      const g = tabs[names[1]];
+      await g.click("#ai-output .m.bot:last-of-type .reacts button:nth-child(2)");
+      await tabs.host.waitForFunction(() => document.querySelector("#ai-output .m.bot:last-of-type .reacts button:nth-child(2) b")?.textContent === "1", null, { timeout: 10000 });
+      await g.type("#ai-prompt", "hmm");
+      await tabs.host.waitForFunction(() => /is typing/.test(document.getElementById("typing-note").textContent), null, { timeout: 10000 });
+      const hostSees = await tabs.host.textContent("#typing-note");
+      log(`[${label}] social: reaction count reached the host; host sees "${hostSees}"`);
+      await g.fill("#ai-prompt", "");
+    }
     // --regen: press Regenerate after the last round; with greedy sampling the answer must repeat
     if (flag("regen")) {
       const k = await tabs.host.evaluate(() => document.querySelectorAll(".m.bot .stats").length);

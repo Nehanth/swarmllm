@@ -306,6 +306,15 @@
   #chat-tools button[hidden] { display: none; }
   #ai-output .m.replaced { opacity: 0.4; }
   #ai-output .m.replaced .bubble { text-decoration: line-through; text-decoration-color: var(--faint); }
+  .reacts { display: flex; gap: 4px; margin-top: 5px; opacity: 0.35; transition: opacity 0.2s; }
+  .m.bot:hover .reacts, .reacts:has(.on) { opacity: 1; }
+  .reacts button { font-size: 13px; padding: 2px 7px; border-radius: 100px; background: transparent; line-height: 1.3; }
+  .reacts button b { font-family: var(--mono); font-size: 10px; font-weight: 500; margin-left: 3px; color: var(--muted); }
+  .reacts button b:empty { display: none; margin: 0; }
+  .reacts button.on { border-color: var(--border); background: var(--panel); }
+  .reacts button.mine { border-color: var(--accent); }
+  #typing-note { font-family: var(--mono); font-size: 10.5px; color: var(--muted); font-style: italic; }
+  #typing-note:empty { display: none; }
   #queue-note { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--accent); }
   #queue-note:empty { display: none; }
   #queue-note:not(:empty) + #ctx-meter { margin-left: 10px; }
@@ -487,6 +496,8 @@
       <button id="regen-btn" type="button" hidden title="ask the last question again">regenerate ↻</button>
       <button id="draft-view" type="button" title="mark the words the draft head guessed right">show drafts</button>
       <button id="export-chat" type="button" title="save the chat as markdown">save</button>
+      <button id="read-aloud" type="button" title="read answers aloud with this device's voice">read aloud</button>
+      <span id="typing-note"></span>
       <span id="queue-note"></span>
       <span id="ctx-meter"></span>
     </div>
