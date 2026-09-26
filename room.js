@@ -1181,6 +1181,8 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
       // ?fuse=0: the unfused kernels (attention glue, DeltaNet delta + gated norm, batched
       // attention) for A/B timing; both give the same bits, so devices may differ
       ...(new URLSearchParams(location.search).get("fuse") === "0" ? { attnGlue: false, dnFuse: false, attnMC: false } : {}),
+      // ?kv=q8: int8 KV cache (~56% of f16's memory) for long contexts; changes the numerics a little
+      kvQ8: new URLSearchParams(location.search).get("kv") === "q8",
     });
   } else if (M.kind === "gguf") {
     aiStatus("reading model index\u2026");

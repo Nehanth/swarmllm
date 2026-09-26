@@ -26,10 +26,13 @@ export class Qwen35Engine {
   // is exactly the same as never having left (tests/e2e/state_synth.mjs). A device only holds its
   // own layers, so in a room every device saves and restores its own part under the same key.
   _stateParts(pos = this.pos) {
-    const kvRow = this.dims.kvDim * (this.flash ? 2 : 4);
+    const kvRow = this.dims.kvDim * (this.kvQ8 ? 1 : this.flash ? 2 : 4), scRow = this.dims.kvDim / 32 * 4;
     const parts = [];
     for (const L of this.mtpLayer ? [...this.layers, this.mtpLayer] : this.layers) {
-      if (L.isFull) parts.push({ buf: L.kCache, bytes: pos * kvRow }, { buf: L.vCache, bytes: pos * kvRow });
+      if (L.isFull) {
+        parts.push({ buf: L.kCache, bytes: pos * kvRow }, { buf: L.vCache, bytes: pos * kvRow });
+        if (this.kvQ8) parts.push({ buf: L.kScale, bytes: pos * scRow }, { buf: L.vScale, bytes: pos * scRow });
+      }
       else parts.push({ buf: L.S, bytes: L.S.size }, { buf: L.convState, bytes: L.convState.size });
     }
     parts.push({ buf: this.x, bytes: this.dims.dim * 4 });
@@ -37,7 +40,7 @@ export class Qwen35Engine {
   }
   // What a saved state must match to be loaded here.
   stateSignature() {
-    return { v: 1, lo: this.lo, hi: this.hi, mtp: !!this.mtpLayer, flash: !!this.flash, dims: [this.dims.dim, this.dims.kvDim, this.dims.nVH, this.dims.convDim] };
+    return { v: 1, lo: this.lo, hi: this.hi, mtp: !!this.mtpLayer, flash: !!this.flash, kvQ8: !!this.kvQ8, dims: [this.dims.dim, this.dims.kvDim, this.dims.nVH, this.dims.convDim] };
   }
   // Read the state back to the CPU: { sig, pos, parts: [ArrayBuffer] }. One part at a time through
   // one staging buffer, so a long context never needs one giant mapping.
@@ -117,7 +120,7 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false, attnGlue = true, dnFuse = true, attnMC = true, attnFlash = true }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0, replayRollback = true, gemm8 = true, softmaxWG = true, draftChain = false, attnGlue = true, dnFuse = true, attnMC = true, attnFlash = true, kvQ8 = false }) {
     this.replay = replayRollback !== false;
     this.device = device;
     this.mvVariant = matvecVariant;
@@ -152,6 +155,11 @@ export class Qwen35Engine {
     this.flash = attnFlash !== false && hd <= 256 && nH % nKV === 0 && nH / nKV <= 8 && nH / nKV * hd <= 2048;
     this.faSplit = Math.max(256, Math.ceil(maxSeq / 128 / 64) * 64);   // <= 128 splits per head
     this.faSplits = Math.ceil(maxSeq / this.faSplit);
+    // kvQ8: int8 K/V with one scale per 32 values (~56% of f16's memory: 36 KB per token for the
+    // whole 27B), for 32K+ contexts. Off by default: it changes the numerics (tests/e2e/flash_synth.mjs --q8).
+    this.kvQ8 = this.flash && kvQ8 === true && hd % 32 === 0;
+    this.ksPipe = this.kvQ8 ? "kv_store_q8" : "kv_store";
+    this.faPipe = this.kvQ8 ? "attn_flash_q8" : "attn_flash";
     // fused attention glue (qsplit + q/k head_norm + rope in one dispatch, bit-identical); its
     // staging array holds one 256-wide head. engine.attnGlue = false restores the five dispatches.
     this.attnGlueOn = attnGlue !== false && hd <= 256;
@@ -244,6 +252,7 @@ export class Qwen35Engine {
       attn_glue: ["ro", "rw", "rw", "rw", "ro", "ro", "u", "u"],
       dn_delta_gn: ["ro", "ro", "ro", "rw", "ro", "ro", "rw", "u"],
       kv_store: ["ro", "ro", "rw", "rw", "u"], attn_flash: ["ro", "ro", "ro", "rw", "rw", "u"], attn_combine: ["ro", "ro", "rw", "u"],
+      kv_store_q8: ["ro", "ro", "rw", "rw", "rw", "rw", "u"], attn_flash_q8: ["ro", "ro", "ro", "ro", "ro", "rw", "rw", "u"],
       attn_scores_mc: ["ro", "ro", "rw", "u"], attn_softmax_wg_mc: ["rw"], attn_out_mc: ["ro", "ro", "rw", "u"],
       argmax: ["ro", "rw", "u"], emb_gather: ["ro", "ro", "ro", "rw", "u"],
     };
@@ -380,9 +389,13 @@ export class Qwen35Engine {
       if (L.isFull) {
         R.wq = up(L.wq); R.wk = up(L.wk); R.wv = up(L.wv); R.wo = up(L.wo);
         R.qNorm = up(L.qNorm); R.kNorm = up(L.kNorm);
-        const kvBytes = this.flash ? 2 : 4;   // f16 pairs with flash attention
+        const kvBytes = this.kvQ8 ? 1 : this.flash ? 2 : 4;   // int8 / f16 pairs / f32
         R.kCache = device.createBuffer({ size: maxSeq * kvDim * kvBytes, usage: S });
         R.vCache = device.createBuffer({ size: maxSeq * kvDim * kvBytes, usage: S });
+        if (this.kvQ8) {
+          R.kScale = device.createBuffer({ size: maxSeq * kvDim / 32 * 4, usage: S });
+          R.vScale = device.createBuffer({ size: maxSeq * kvDim / 32 * 4, usage: S });
+        }
         R.mvQ = mv(R.wq, this.xn, this.qFull, nH * hd * 2, dim);
         R.mvK = mv(R.wk, this.xn, this.k, kvDim, dim);
         R.mvV = mv(R.wv, this.xn, this.v, kvDim, dim);
@@ -395,8 +408,9 @@ export class Qwen35Engine {
         this._uZero4 = this._uZero4 || this._buf(new Uint32Array(4), GPUBufferUsage.UNIFORM);
         if (this.flash) {
           this._uZero4 = this._uZero4 || this._buf(new Uint32Array(4), GPUBufferUsage.UNIFORM);
-          R.bgKvStore = this._bg(this.pipes.kv_store, 1, [this.k, this.v, R.kCache, R.vCache, this._uZero4]);
-          R.bgFlash = this._bg(this.pipes.attn_flash, 1, [this.q, R.kCache, R.vCache, this.faO, this.faML, this.faU1]);
+          const sc = this.kvQ8 ? [R.kScale, R.vScale] : [];
+          R.bgKvStore = this._bg(this.pipes[this.ksPipe], 1, [this.k, this.v, R.kCache, R.vCache, ...sc, this._uZero4]);
+          R.bgFlash = this._bg(this.pipes[this.faPipe], 1, [this.q, R.kCache, R.vCache, ...sc, this.faO, this.faML, this.faU1]);
           R.bgCombine = this._bg(this.pipes.attn_combine, 1, [this.faO, this.faML, this.attnOut, this.faU1]);
         }
         R.bgGlue = this._bg(this.pipes.attn_glue, 1, [this.qFull, this.q, this.gAttn, this.k, R.qNorm.buf, R.kNorm.buf, this._uZero4, this.dnBuf]);
@@ -615,8 +629,8 @@ export class Qwen35Engine {
       {
         const p = enc.beginComputePass();
         if (this.flash) {
-          this._dxyz(p, "kv_store", L.bgKvStore, Math.ceil(D.kvDim / 2 / 64), 1, 1);
-          this._dxyz(p, "attn_flash", L.bgFlash, Math.ceil(seqLen / this.faSplit), 1, D.nKV);
+          this._dxyz(p, this.ksPipe, L.bgKvStore, Math.ceil(D.kvDim / (this.kvQ8 ? 32 : 2) / 64), 1, 1);
+          this._dxyz(p, this.faPipe, L.bgFlash, Math.ceil(seqLen / this.faSplit), 1, D.nKV);
           this._dxyz(p, "attn_combine", L.bgCombine, D.nH, 1, 1);
         } else {
           this._d(p, "attn_scores", L.bgScores, D.nH * seqLen);
@@ -786,7 +800,7 @@ export class Qwen35Engine {
       "dn_gates", "dn_conv", "dn_l2", "dn_delta", "dn_gatenorm",
       "rmsnorm_mc", "add_res_mc", "dn_gates_mc", "dn_conv_mc", "dn_l2_mc", "dn_pre_mc", "dn_delta_mc", "dn_gatenorm_mc",
       "qsplit_mc", "head_norm_mc", "rope_part_mc", "sigmoid_mul_mc", "attn_glue",
-      "attn_scores_mc", "attn_softmax_wg_mc", "attn_out_mc", "kv_store", "attn_flash", "attn_combine"];
+      "attn_scores_mc", "attn_softmax_wg_mc", "attn_out_mc", "kv_store", "attn_flash", "attn_combine", "kv_store_q8", "attn_flash_q8"];
     this.bgCommonB = cix.map((c) => {
       const m = {};
       for (const name of colPipes)
@@ -864,8 +878,10 @@ export class Qwen35Engine {
         kNorm: this._bg2res(this.pipes.head_norm_mc, [whole(B.k), { buffer: L.kNorm.buf }, mcU(D.nKV, st(B.k))]),
         ropeQ: this._bg2res(this.pipes.rope_part_mc, [whole(B.q), mcU(D.nH, st(B.q)), dn]),
         ropeK: this._bg2res(this.pipes.rope_part_mc, [whole(B.k), mcU(D.nKV, st(B.k)), dn]),
-        kvStore: this.flash && this._bg2res(this.pipes.kv_store, [whole(B.k), whole(B.v), { buffer: L.kCache }, { buffer: L.vCache }, mcU(0, st(B.k), st(B.v))]),
-        flash: this.flash && this._bg2res(this.pipes.attn_flash, [whole(B.q), { buffer: L.kCache }, { buffer: L.vCache }, { buffer: this.faO }, { buffer: this.faML },
+        kvStore: this.flash && this._bg2res(this.pipes[this.ksPipe], [whole(B.k), whole(B.v), { buffer: L.kCache }, { buffer: L.vCache },
+          ...(this.kvQ8 ? [{ buffer: L.kScale }, { buffer: L.vScale }] : []), mcU(0, st(B.k), st(B.v))]),
+        flash: this.flash && this._bg2res(this.pipes[this.faPipe], [whole(B.q), { buffer: L.kCache }, { buffer: L.vCache },
+          ...(this.kvQ8 ? [{ buffer: L.kScale }, { buffer: L.vScale }] : []), { buffer: this.faO }, { buffer: this.faML },
           { buffer: this.faUB }]),
         combine: this.flash && this._bg2res(this.pipes.attn_combine, [{ buffer: this.faO }, { buffer: this.faML }, whole(B.attnOut), { buffer: this.faUB }]),
         scoresMC: this.scoresMC && this._bg2res(this.pipes.attn_scores_mc, [whole(B.q), { buffer: L.kCache }, { buffer: this.scoresMC }, mcU(0, st(B.q))]),
@@ -974,8 +990,8 @@ export class Qwen35Engine {
       {
         const p = enc.beginComputePass();
         if (this.flash) {
-          this._dMC(p, "kv_store", M.kvStore, D.kvDim / 2, 64, nCols);
-          this._dMC(p, "attn_flash", M.flash, Math.ceil((basePos + nCols) / this.faSplit) * 256, 256, nCols, D.nKV);
+          this._dMC(p, this.ksPipe, M.kvStore, D.kvDim / (this.kvQ8 ? 32 : 2), 64, nCols);
+          this._dMC(p, this.faPipe, M.flash, Math.ceil((basePos + nCols) / this.faSplit) * 256, 256, nCols, D.nKV);
           this._dMC(p, "attn_combine", M.combine, D.nH * 256, 256, nCols);
         } else if (this.attnMC && M.scoresMC) {
           this._dMC(p, "attn_scores_mc", M.scoresMC, basePos + nCols, 64, nCols, D.nH);
