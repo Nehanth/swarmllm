@@ -32,7 +32,7 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, draftVocab = 0 }) {
     this.device = device;
     this.mvVariant = matvecVariant;
     this.coopWG = coopWG; this.coopRows = coopRows;
@@ -316,6 +316,16 @@ export class Qwen35Engine {
       this.bgArgmax = this._bg(this.pipes.argmax, 1, [this.logits, this.argBuf, this._buf(new Uint32Array([vocab, 0, 0, 0]), GPUBufferUsage.UNIFORM)]);
       this.bgFinalNorm = bgNorm(this.x, this.finalNorm, this.xn);
       this.headOp = mv(this.headEntry, this.xn, this.logits, vocab, dim);
+      // Draft head over the first `draftVocab` rows only (BPE ids roughly follow frequency, so the
+      // prefix holds the common tokens): the head is the biggest matrix a draft reads (0.7 GB on
+      // the 27B), and drafts only need to be good guesses. The verify pass still uses the full
+      // head, so the output is unchanged; a rare token just can't be drafted. Off by default.
+      const dv = draftVocab > 0 && draftVocab < vocab ? Math.ceil(draftVocab / 64) * 64 : 0;
+      if (dv && dv < vocab) {
+        this.draftVocab = dv;
+        this.headOpDraft = mv(this.headEntry, this.xn, this.logits, dv, dim);
+        this.bgArgmaxDraft = this._bg(this.pipes.argmax, 1, [this.logits, this.argBuf, this._buf(new Uint32Array([dv, 0, 0, 0]), GPUBufferUsage.UNIFORM)]);
+      }
     }
 
     this.bgCommonFor = {};
@@ -864,8 +874,9 @@ export class Qwen35Engine {
     if (wantLogits) {
       const p = enc.beginComputePass();
       this._d(p, "rmsnorm", M2.bgHeadNorm, 256, 256);
-      this._dop(p, this.headOp);
-      if (wantLogits === "argmax") this._d(p, "argmax", this.bgArgmax, 256, 256);
+      const small = wantLogits === "argmax" && this.headOpDraft;
+      this._dop(p, small ? this.headOpDraft : this.headOp);
+      if (wantLogits === "argmax") this._d(p, "argmax", small ? this.bgArgmaxDraft : this.bgArgmax, 256, 256);
       p.end();
     }
     if (wantLogits === "argmax") enc.copyBufferToBuffer(this.argBuf, 0, this.stageArg, 0, 16);

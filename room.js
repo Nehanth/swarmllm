@@ -1112,6 +1112,8 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
       // columns and drop to the 8- or 4-column GEMV twins automatically, so
       // the generated stream is unchanged.
       batchCols: 16, coopRowsB: 1,
+      // ?draftvocab=N: draft over the first N vocabulary rows only (engine/qwen35.js); off by default
+      draftVocab: parseInt(new URLSearchParams(location.search).get("draftvocab"), 10) || 0,
     });
   } else if (M.kind === "gguf") {
     aiStatus("reading model index\u2026");
