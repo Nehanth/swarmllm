@@ -529,7 +529,7 @@ async function keepAwake() {
     if (!wakeLock) awakeStatus("screen stays awake (video) \u2713");
   } catch (e) { if (!wakeLock) awakeStatus("\u26a0 can\u2019t keep the screen awake: set Auto-Lock to Never"); }
 }
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") keepAwake(); });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { keepAwake(); document.title = "SwarmLLM \u00b7 room"; } });
 document.addEventListener("touchstart", keepAwake, { passive: true });
 $("create-btn").addEventListener("click", () => { keepAwake(); start(true); });
 // (auto-rejoin removed: the user prefers to see what happened)
@@ -812,10 +812,20 @@ function loadCardRender() {
     return `<div class="lc-row${pct >= 100 ? " done" : ""}"><div class="n">${esc(String(nm))}${l ? `<small>layers ${esc(String(l))}</small>` : ""}</div><div class="bar"><div class="fill" style="width:${pct}%"></div></div><div class="pct">${pct >= 100 ? "ready" : pct + "%"}</div></div>`;
   }).join("");
 }
+// download progress with a time-left estimate from the recent rate (EMA over ~5 s)
+const eta = { t: 0, done: 0, rate: 0 };
 function aiProgress(done, total, note) {
   const pct = total ? Math.min(100, Math.round(done / total * 100)) : 0;
+  const now = performance.now();
+  if (done < eta.done || !eta.t) { eta.t = now; eta.done = done; eta.rate = 0; }
+  else if (now - eta.t > 500) {
+    const r = (done - eta.done) / ((now - eta.t) / 1000);
+    eta.rate = eta.rate ? 0.8 * eta.rate + 0.2 * r : r; eta.t = now; eta.done = done;
+  }
+  const left = eta.rate > 0 && total > done ? (total - done) / eta.rate : 0;
+  const leftTxt = left > 1 ? ` · ~${left > 90 ? Math.round(left / 60) + " min" : Math.round(left) + " s"} left` : "";
   $("ldg-fill").style.width = pct + "%";
-  $("ldg-sub").textContent = `${(done / 2 ** 20).toFixed(0)} MB of ${(total / 2 ** 20).toFixed(0)} MB · ${pct}%` + (note ? " · " + note : "");
+  $("ldg-sub").textContent = `${(done / 2 ** 20).toFixed(0)} MB of ${(total / 2 ** 20).toFixed(0)} MB · ${pct}%${leftTxt}` + (note ? " · " + note : "");
 }
 function aiOut() { const o = $("ai-output"); o.style.display = "block"; $("ai-empty").style.display = "none"; return o; }
 
@@ -851,6 +861,11 @@ function renderBot(m, live) {
   } else {
     b.classList.remove("drafts");
     b.innerHTML = mdChat(m.pieces.map((p) => p.t).join("")) + (live ? '<span class="cursor"></span>' : "");
+    if (!live) for (const pre of b.querySelectorAll("pre")) {   // finished code blocks get a copy button
+      const w = document.createElement("div"); w.className = "code-wrap";
+      pre.replaceWith(w); w.appendChild(pre);
+      w.insertAdjacentHTML("beforeend", '<button type="button" class="copy-code">copy</button>');
+    }
   }
 }
 function chatBotPiece(text, d) {
@@ -863,11 +878,14 @@ function chatBotEnd(note, stats) {
   if (!botEl) chatBotStart();
   if (note) botEl.pieces = [{ t: note, d: 0 }];
   renderBot(botEl, false);
+  // a finished answer in a background tab: say so in the tab title until the tab is looked at
+  if (!note && document.hidden) { document.title = "\u2713 answer ready \u00b7 SwarmLLM"; }
   if (stats) { const s = document.createElement("div"); s.className = "stats"; s.textContent = stats; botEl.appendChild(s); }
   if (!note && botEl.dataset.mid) {
     const r = document.createElement("div");
     r.className = "reacts";
-    r.innerHTML = REACTIONS.map((e) => `<button type="button" data-e="${e}" aria-label="react ${e}">${e}<b></b></button>`).join("");
+    r.innerHTML = REACTIONS.map((e) => `<button type="button" data-e="${e}" aria-label="react ${e}">${e}<b></b></button>`).join("")
+      + '<button type="button" class="copy-ans" title="copy the answer">copy</button>';
     botEl.appendChild(r);
     if (readAloud && botEl.pieces.length) speak(botEl.pieces.map((p) => p.t).join(""));
   }
@@ -879,7 +897,7 @@ const REACTIONS = ["\u{1F44D}", "\u{1F525}", "\u{1F92F}", "\u{1F602}", "\u{1F41D
 const myReacts = new Set();   // "mid|emoji" this device has on
 function renderReacts(mid, counts) {
   const m = document.querySelector(`#ai-output .m.bot[data-mid="${CSS.escape(String(mid))}"]`); if (!m) return;
-  for (const b of m.querySelectorAll(".reacts button")) {
+  for (const b of m.querySelectorAll(".reacts button[data-e]")) {
     const n = counts?.[b.dataset.e] || 0;
     b.querySelector("b").textContent = n ? String(n) : "";
     b.classList.toggle("on", n > 0);
@@ -896,8 +914,19 @@ function hostReact(mid, e, from) {
   broadcastAll({ t: "ai-reacts", mid, counts });
   renderReacts(mid, counts);
 }
+function copyText(text, what) {
+  if (!navigator.clipboard) { toast("this browser can't copy here"); return; }
+  navigator.clipboard.writeText(text).then(() => toast(`${what} copied`), () => toast("couldn't copy"));
+}
+// copy an answer (its raw text, markdown and all) or one code block
 $("ai-output").addEventListener("click", (ev) => {
-  const b = ev.target.closest(".reacts button"); if (!b) return;
+  const ca = ev.target.closest(".copy-ans");
+  if (ca) { const m = ca.closest(".m.bot"); if (m?.pieces) copyText(m.pieces.map((p) => p.t).join("").replace(/<think>[\s\S]*?<\/think>\s*/g, ""), "answer"); return; }
+  const cc = ev.target.closest(".copy-code");
+  if (cc) { copyText(cc.parentElement.querySelector("pre")?.textContent || "", "code"); return; }
+});
+$("ai-output").addEventListener("click", (ev) => {
+  const b = ev.target.closest(".reacts button[data-e]"); if (!b) return;
   const mid = b.closest(".m.bot")?.dataset.mid; if (!mid) return;
   const key = mid + "|" + b.dataset.e;
   if (myReacts.has(key)) myReacts.delete(key); else myReacts.add(key);

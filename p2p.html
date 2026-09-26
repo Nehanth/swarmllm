@@ -316,6 +316,10 @@
   .reacts button b:empty { display: none; margin: 0; }
   .reacts button.on { border-color: var(--border); background: var(--panel); }
   .reacts button.mine { border-color: var(--accent); }
+  .reacts .copy-ans { font-family: var(--mono); font-size: 10px; margin-left: 4px; color: var(--muted); }
+  .code-wrap { position: relative; }
+  .copy-code { position: absolute; top: 6px; right: 6px; font-family: var(--mono); font-size: 10px; padding: 2px 8px; border-radius: 100px; opacity: 0.6; }
+  .code-wrap:hover .copy-code { opacity: 1; }
   #typing-note { font-family: var(--mono); font-size: 10.5px; color: var(--muted); font-style: italic; }
   #typing-note:empty { display: none; }
   #queue-note { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--accent); }
