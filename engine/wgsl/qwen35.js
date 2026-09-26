@@ -1,6 +1,56 @@
 // WGSL for the hybrid Qwen 3.5/3.8 engine: Gated-DeltaNet recurrence (single and
 // multi-column, with speculative snapshot slots), gated attention glue, fused pre-pass,
 // and the logits argmax. Base kernels come from ./base.js; GEMVs from ./coop.js.
+// Register-resident dn_delta_mc (docs/deltanet-prefill-spec.md, RG=1): thread j keeps column j
+// of the head's state S in 128 registers for the whole pass (loaded once, stored once) instead of
+// two read-modify-write sweeps of global memory per column; q/k of each column are staged in
+// workgroup memory. Same operations in the same order as the kernel it replaces, so S, the
+// outputs and the snapshots are bit-identical (measured on the GB10 in isolation: 1.24x at 1
+// column, 2.03x at 16). Every private-array index is a literal (codegen-unrolled): a loop over a
+// constant bound does not unroll on every backend and spills the array. Requires dState = 128.
+function dnDeltaRegsWGSL() {
+  const rows = Array.from({ length: 128 }, (_, i) => i);
+  const load = rows.map((i) => `s[${i}u] = dlm_s[Sb + ${i * 128}u + j];`).join(" ");
+  const store = rows.map((i) => `dlm_s[Sb + ${i * 128}u + j] = s[${i}u];`).join(" ");
+  const shadow = rows.map((i) => `dlm_shadow[so + ${i * 128}u] = s[${i}u];`).join(" ");
+  const loop1 = rows.map((i) => `{ let sd = s[${i}u] * decay; s[${i}u] = sd; vh += sd * dlr_k[${i}u]; sq += sd * dlr_q[${i}u]; kq += dlr_k[${i}u] * dlr_q[${i}u]; }`).join("\n      ");
+  const loop2 = rows.map((i) => `s[${i}u] += dlr_k[${i}u] * d;`).join(" ");
+  return `
+var<workgroup> dlr_k: array<f32, 128>;
+var<workgroup> dlr_q: array<f32, 128>;
+@compute @workgroup_size(128)
+fn dn_delta_mc(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wg.x; let j = lid.x;
+  let kh = h % dlm_dn.nKH;
+  let kOff = kh * 128u; let vOff = h * 128u; let Sb = h * 16384u;
+  let scale = inverseSqrt(f32(dlm_dn.dState));   // a uniform read, as before (a literal changes rounding)
+  let nCols = max(frame.nCols, 1u);
+  let sSize = dlm_dn.nVH * 16384u;
+  var s: array<f32, 128>;
+  ${load}
+  for (var col: u32 = 0u; col < nCols; col++) {
+    let qo = col * dlm_mc.s0 + kOff;
+    let ko = col * dlm_mc.s0 + dlm_dn.keyDim + kOff;
+    let vo = col * dlm_mc.s0 + 2u * dlm_dn.keyDim + vOff;
+    workgroupBarrier();                          // the previous column is done reading k/q
+    dlr_k[j] = dlm_c[ko + j]; dlr_q[j] = dlm_c[qo + j];
+    workgroupBarrier();
+    let decay = dlm_decay[col * dlm_mc.s1 + h];
+    var vh: f32 = 0.0; var sq: f32 = 0.0; var kq: f32 = 0.0;
+      ${loop1}
+    let d = (dlm_c[vo + j] - vh) * dlm_beta[col * dlm_mc.s1 + h];
+    ${loop2}
+    dlm_o[col * dlm_mc.s2 + vOff + j] = (sq + d * kq) * scale;
+    let dlSB = frame.snap & 0xffu;               // snapshot slot base + 1 (0 = off); bit 31: replay rollback, no state snapshots
+    if (dlSB != 0u && (frame.snap & 0x80000000u) == 0u && dlSB + col < ((frame.snap >> 8u) & 0xffu)) {
+      let so = (dlSB - 1u + col) * sSize + Sb + j;
+      ${shadow}
+    }
+  }
+  ${store}
+}`;
+}
+
 export const WGSL2 = /* wgsl */ `
 struct DN {
   convDim: u32, dState: u32, nKH: u32, nVH: u32,
@@ -288,48 +338,7 @@ fn dn_l2_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(1) @binding(5) var<uniform> dlm_mc: MC;          // s0 conv stride, s1 gate stride, s2 out stride
 @group(1) @binding(6) var<uniform> dlm_dn: DN;
 @group(1) @binding(7) var<storage, read_write> dlm_shadow: array<f32>;   // [7][nVH*dState*dState]
-@compute @workgroup_size(128)
-fn dn_delta_mc(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  let h = wg.x; let j = lid.x; let dS = dlm_dn.dState;
-  if (h >= dlm_dn.nVH || j >= dS) { return; }
-  let kh = h % dlm_dn.nKH;
-  let kOff = kh * dS; let vOff = h * dS; let Sb = h * dS * dS;
-  let scale = inverseSqrt(f32(dS));
-  let nCols = max(frame.nCols, 1u);
-  let sSize = dlm_dn.nVH * dS * dS;
-  for (var col: u32 = 0u; col < nCols; col++) {
-    let qo = col * dlm_mc.s0 + kOff;
-    let ko = col * dlm_mc.s0 + dlm_dn.keyDim + kOff;
-    let vo = col * dlm_mc.s0 + 2u * dlm_dn.keyDim + vOff;
-    let decay = dlm_decay[col * dlm_mc.s1 + h];
-    var vhat: f32 = 0.0;
-    var sq: f32 = 0.0;
-    var kq: f32 = 0.0;
-    for (var i: u32 = 0u; i < dS; i++) {
-      let idx = Sb + i * dS + j;
-      let sdec = dlm_s[idx] * decay;
-      dlm_s[idx] = sdec;
-      let ki = dlm_c[ko + i];
-      let qi = dlm_c[qo + i];
-      vhat += sdec * ki;
-      sq += sdec * qi;
-      kq += ki * qi;
-    }
-    let d = (dlm_c[vo + j] - vhat) * dlm_beta[col * dlm_mc.s1 + h];
-    for (var i: u32 = 0u; i < dS; i++) {
-      let idx = Sb + i * dS + j;
-      dlm_s[idx] += dlm_c[ko + i] * d;
-    }
-    dlm_o[col * dlm_mc.s2 + vOff + j] = (sq + d * kq) * scale;
-    let dlSB = frame.snap & 0xffu;     // snapshot slot base + 1 (0 = off)
-    // bit 31: replay rollback (the engine keeps one pre-verify state and re-runs this kernel
-    // on rejection), so no per-column state snapshots; the conv snapshots stay (they are tiny)
-    if (dlSB != 0u && (frame.snap & 0x80000000u) == 0u && dlSB + col < ((frame.snap >> 8u) & 0xffu)) {
-      let slot = dlSB - 1u + col;
-      for (var i: u32 = 0u; i < dS; i++) { dlm_shadow[slot * sSize + Sb + i * dS + j] = dlm_s[Sb + i * dS + j]; }
-    }
-  }
-}
+${dnDeltaRegsWGSL()}
 
 // --- argmax over n floats (single workgroup): out = [index, bitcast(value)] ---
 @group(1) @binding(0) var<storage, read> am_x: array<f32>;

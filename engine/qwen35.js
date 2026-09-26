@@ -51,6 +51,7 @@ export class Qwen35Engine {
     const nKH = M["qwen35.ssm.group_count"];
     const nVH = M["qwen35.ssm.time_step_rank"];
     const dInner = M["qwen35.ssm.inner_size"];
+    if (dState !== 128) throw new Error(`dn_delta_mc keeps a 128-row state column in registers; this model has dState ${dState}`);
     const keyDim = dState * nKH;
     const convDim = keyDim * 2 + dInner;
     // workers parse the header without the vocab; the embedding's row count says the same thing
