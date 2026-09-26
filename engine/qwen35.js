@@ -41,8 +41,14 @@ export class Qwen35Engine {
   }
   // Read the state back to the CPU: { sig, pos, parts: [ArrayBuffer] }. One part at a time through
   // one staging buffer, so a long context never needs one giant mapping.
-  async exportState() {
-    const parts = this._stateParts();
+  async exportState() { return this._readParts(this._stateParts(), this.pos); }
+  // A GPU slot read back the same way (for spilling a session to disk without switching to it).
+  async exportSlot(name) {
+    const sl = this.slots?.get(name);
+    if (!sl) throw new Error("no saved slot " + name);
+    return this._readParts(this._stateParts(sl.pos).map((p, i) => ({ buf: sl.bufs[i], bytes: p.bytes })), sl.pos);
+  }
+  async _readParts(parts, pos) {
     const most = Math.max(4, ...parts.map((p) => p.bytes));
     const stage = this.device.createBuffer({ size: most, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const out = [];
@@ -57,7 +63,7 @@ export class Qwen35Engine {
         stage.unmap();
       }
     } finally { stage.destroy(); }
-    return { sig: this.stateSignature(), pos: this.pos, parts: out };
+    return { sig: this.stateSignature(), pos, parts: out };
   }
   // Load a state from exportState (same model, same layers, same KV format).
   importState(st) {
